@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  check-js-rejected:
+    name: Verify JS backend rejected
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nim
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
+      - name: Verify JS backend fails with clear error
+        run: |
+          output=$(nim js --path:src -c tests/test_softlink.nim 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q "JavaScript backend does not support"
+
   test:
     strategy:
       fail-fast: false
