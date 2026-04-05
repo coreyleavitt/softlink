@@ -10,8 +10,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: macos-latest
+            cc: clang
+          - os: windows-latest
+            cc: gcc
+            name: windows-mingw
+          - os: windows-latest
+            cc: vcc
+            name: windows-msvc
     runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.name || matrix.os }})
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +40,37 @@ jobs:
           unzip -q nim.zip
           echo "$PWD/nim-2.2.0/bin" >> "$GITHUB_PATH"
 
-      - name: Run tests
+      - name: Set up MSVC
+        if: matrix.cc == 'vcc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build test library (MSVC)
+        if: matrix.cc == 'vcc'
+        shell: cmd
+        run: cl /LD /Fe:tests\testlib.dll tests\testlib.c
+
+      - name: Build test library (GCC/Clang)
+        if: matrix.cc != 'vcc'
         shell: bash
-        run: nimble test -y
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            gcc -shared -o tests/testlib.dll tests/testlib.c
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c
+          else
+            gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c
+          fi
+
+      - name: Run tests (MSVC)
+        if: matrix.cc == 'vcc'
+        shell: cmd
+        run: nim c -r --cc:vcc --path:src --passC:/I. tests\test_softlink.nim
+
+      - name: Run tests (GCC/Clang)
+        if: matrix.cc != 'vcc'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            export LD_LIBRARY_PATH=./tests
+          fi
+          nim c -r --path:src --passC:-I. tests/test_softlink.nim
