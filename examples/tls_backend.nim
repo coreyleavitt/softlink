@@ -21,26 +21,26 @@ type
 # --- mbedTLS bindings ---
 
 dynlib "libmbedtls.so(.21|.16|.14|)":
-  proc mbedtls_ssl_init(ssl: ptr MbedSslContext) {.cdecl.}
-  proc mbedtls_ssl_free(ssl: ptr MbedSslContext) {.cdecl.}
-  proc mbedtls_ssl_setup(ssl: ptr MbedSslContext, conf: ptr MbedSslConfig): cint {.cdecl.}
-  proc mbedtls_ssl_handshake(ssl: ptr MbedSslContext): cint {.cdecl.}
-  proc mbedtls_ssl_write(ssl: ptr MbedSslContext, buf: ptr byte, len: csize_t): cint {.cdecl.}
-  proc mbedtls_ssl_read(ssl: ptr MbedSslContext, buf: ptr byte, len: csize_t): cint {.cdecl.}
-  proc mbedtls_ssl_close_notify(ssl: ptr MbedSslContext): cint {.cdecl.}
+  proc mbedtls_ssl_init(ssl: ptr MbedSslContext) {.cdecl, header: "mbedtls/ssl.h".}
+  proc mbedtls_ssl_free(ssl: ptr MbedSslContext) {.cdecl, header: "mbedtls/ssl.h".}
+  proc mbedtls_ssl_setup(ssl: ptr MbedSslContext, conf: ptr MbedSslConfig): cint {.cdecl, header: "mbedtls/ssl.h".}
+  proc mbedtls_ssl_handshake(ssl: ptr MbedSslContext): cint {.cdecl, header: "mbedtls/ssl.h".}
+  proc mbedtls_ssl_write(ssl: ptr MbedSslContext, buf: ptr byte, len: csize_t): cint {.cdecl, header: "mbedtls/ssl.h".}
+  proc mbedtls_ssl_read(ssl: ptr MbedSslContext, buf: ptr byte, len: csize_t): cint {.cdecl, header: "mbedtls/ssl.h".}
+  proc mbedtls_ssl_close_notify(ssl: ptr MbedSslContext): cint {.cdecl, header: "mbedtls/ssl.h".}
 
 # --- wolfSSL bindings ---
 
 dynlib "libwolfssl.so(.42|.35|)":
-  proc wolfSSL_Init(): cint {.cdecl.}
-  proc wolfSSL_Cleanup(): cint {.cdecl.}
-  proc wolfSSL_CTX_new(meth: pointer): ptr WolfSslCtx {.cdecl.}
-  proc wolfSSL_new(ctx: ptr WolfSslCtx): ptr WolfSslSession {.cdecl.}
-  proc wolfSSL_connect(ssl: ptr WolfSslSession): cint {.cdecl.}
-  proc wolfSSL_write(ssl: ptr WolfSslSession, data: pointer, sz: cint): cint {.cdecl.}
-  proc wolfSSL_read(ssl: ptr WolfSslSession, data: pointer, sz: cint): cint {.cdecl.}
-  proc wolfSSL_free(ssl: ptr WolfSslSession) {.cdecl.}
-  proc wolfSSL_CTX_free(ctx: ptr WolfSslCtx) {.cdecl.}
+  proc wolfSSL_Init(): cint {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_Cleanup(): cint {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_CTX_new(meth: pointer): ptr WolfSslCtx {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_new(ctx: ptr WolfSslCtx): ptr WolfSslSession {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_connect(ssl: ptr WolfSslSession): cint {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_write(ssl: ptr WolfSslSession, data: pointer, sz: cint): cint {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_read(ssl: ptr WolfSslSession, data: pointer, sz: cint): cint {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_free(ssl: ptr WolfSslSession) {.cdecl, header: "wolfssl/ssl.h".}
+  proc wolfSSL_CTX_free(ctx: ptr WolfSslCtx) {.cdecl, header: "wolfssl/ssl.h".}
 
 # --- Runtime backend selection ---
 

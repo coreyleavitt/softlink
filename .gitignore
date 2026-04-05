@@ -1,6 +1,7 @@
 # Compiled binaries
 tests/test_softlink
 tests/test_nimport
+tests/libtestlib.so
 
 # Nim cache
 nimcache/

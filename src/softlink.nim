@@ -106,6 +106,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ptrName: NimNode
     formalParams: NimNode
     callConv: string
+    headerFile: string
     isOptional: bool
     hasReturn: bool
 
@@ -127,9 +128,10 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       error("duplicate proc '" & nameStr & "' in dynlib block", stmt)
     seenNames.incl(nameStr)
 
-    # Pragma validation: extract calling convention and optional flag
+    # Pragma validation: extract calling convention, optional flag, and header
     var callConv = ""
     var isOptional = false
+    var headerFile = ""
     let pragmas = stmt[4]
     if pragmas.kind == nnkPragma:
       for pragma in pragmas:
@@ -142,6 +144,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           callConv = pragmaName
         elif pragmaName == "optional":
           isOptional = true
+        elif pragmaName == "header":
+          if pragma.kind == nnkExprColonExpr:
+            headerFile = $pragma[1]
+          else:
+            error("header pragma requires a value (e.g., {.header: \"foo.h\".})", stmt)
         elif pragmaName != "":
           error("dynlib does not support pragma '" & pragmaName &
                 "' on proc '" & nameStr & "'", stmt)
@@ -149,10 +156,14 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     if callConv == "":
       error("proc '" & nameStr &
             "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
+    if headerFile == "":
+      error("proc '" & nameStr &
+            "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
 
     procs.add(ProcInfo(name: procName, nameStr: nameStr, ptrName: ptrName,
                         formalParams: formalParams, callConv: callConv,
-                        isOptional: isOptional, hasReturn: hasReturn))
+                        headerFile: headerFile, isOptional: isOptional,
+                        hasReturn: hasReturn))
 
     # Build proc type for the var
     var procTy = newNimNode(nnkProcTy)
@@ -167,6 +178,59 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newEmptyNode()
       )
     ))
+
+  # Compile-time header verification via _Static_assert + _Generic.
+  # Compares each symbol's type from the C header against Nim's generated
+  # function pointer type. No linking required — pure compile-time check.
+  block:
+    var headers: HashSet[string]
+    var includeCode = ""
+    for p in procs:
+      if p.headerFile notin headers:
+        headers.incl(p.headerFile)
+        includeCode.add("#include \"" & p.headerFile & "\"\n")
+
+    # Emit #include directives
+    result.add(newNimNode(nnkPragma).add(
+      newNimNode(nnkExprColonExpr).add(
+        ident("emit"),
+        newStrLitNode("/*INCLUDESECTION*/\n" & includeCode)
+      )
+    ))
+
+    # Emit _Static_assert checks inside a dummy proc so they appear after
+    # the function pointer vars in the generated C code.
+    var verifyBody = newStmtList()
+    for p in procs:
+      var emitArray = newNimNode(nnkBracket)
+      emitArray.add(newStrLitNode(
+        "_Static_assert(\n" &
+        "  _Generic(&" & p.nameStr & ",\n" &
+        "    __typeof__("
+      ))
+      emitArray.add(p.ptrName)  # Nim resolves this to the actual C variable name
+      emitArray.add(newStrLitNode(
+        "): 1,\n" &
+        "    default: 0\n" &
+        "  ),\n" &
+        "  \"softlink: " & p.nameStr & " signature mismatch vs " &
+        p.headerFile & "\"\n" &
+        ");\n"
+      ))
+      verifyBody.add(newNimNode(nnkPragma).add(
+        newNimNode(nnkExprColonExpr).add(
+          ident("emit"),
+          emitArray
+        )
+      ))
+
+    let verifyProcName = ident("softlinkVerify" & baseName)
+    var verifyProc = newProc(
+      name = verifyProcName,
+      body = verifyBody,
+    )
+    verifyProc.addPragma(ident("used"))
+    result.add(verifyProc)
 
   # loadXxx*(): LoadResult
   block:

@@ -37,7 +37,8 @@ The library name is derived from the pattern string: `"libmbedtls.so(.16|)"` bec
 
 - **Required by default, optional per-symbol**: required symbols cause load failure if missing (all-or-nothing for required). Optional symbols (`{.optional.}` pragma) are silently skipped, with `xxxAvailable*(): bool` checks generated.
 - **Explicit calling convention required**: the macro requires `{.cdecl.}`, `{.stdcall.}`, etc. — no default. Supports `cdecl`, `stdcall`, `fastcall`, `syscall`, `noconv`.
-- **Pragma allowlist**: only calling conventions + `optional` are accepted. Unsupported pragmas (e.g., `varargs`) produce compile-time errors.
+- **Required `header` pragma**: every proc must specify `{.header: "foo.h".}`. The macro emits `_Static_assert` + `_Generic` checks that verify each symbol's type against the C header at compile time — no `.so` needed, only the header files.
+- **Pragma allowlist**: only calling conventions + `optional` + `header` are accepted. Unsupported pragmas (e.g., `varargs`) produce compile-time errors.
 - **No thread safety guarantees**: `loadLib` is not thread-safe on all platforms.
 
 ## Testing

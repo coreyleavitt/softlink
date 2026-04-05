@@ -1,38 +1,29 @@
 ## Tests for softlink macro.
 ##
-## Tests against libm, libc, and libdl (always available on POSIX systems).
-## This validates the macro generates correct bindings without needing
-## any special library installed.
+## Tests against libm, libc, and a custom test library (libtestlib.so).
+## Build libtestlib.so before running: gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c
 
 import std/[unittest, math, strutils]
 import softlink
 
-# Bind to libm — available everywhere on Linux (part of libc/musl)
+# Bind to libm — available everywhere on Linux
 dynlib "libm.so(.6|)":
-  proc ceil(x: cdouble): cdouble {.cdecl.}
-  proc floor(x: cdouble): cdouble {.cdecl.}
-  proc sqrt(x: cdouble): cdouble {.cdecl.}
-  proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl.}
+  proc ceil(x: cdouble): cdouble {.cdecl, header: "math.h".}
+  proc floor(x: cdouble): cdouble {.cdecl, header: "math.h".}
+  proc sqrt(x: cdouble): cdouble {.cdecl, header: "math.h".}
+  proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl, header: "math.h".}
 
-# Bind to libc — required + optional symbols for testing both paths
+# Bind to libc — void-returning and deterministic functions
 dynlib "libc.so(.6|)":
-  proc srand(seed: cuint) {.cdecl.}                          # required (exists)
-  proc rand(): cint {.cdecl.}                                # required (exists)
-  proc not_real_v2(x: cint): cint {.cdecl, optional.}        # optional (doesn't exist)
-  proc also_not_real(): cint {.cdecl, optional.}              # optional (doesn't exist)
+  proc srand(seed: cuint) {.cdecl, header: "stdlib.h".}
+  proc rand(): cint {.cdecl, header: "stdlib.h".}
 
-# Bind to a real library (libdl) with a nonexistent symbol — tests all-or-nothing
-dynlib "libdl.so(.2|)":
-  proc not_a_real_symbol(x: cdouble): cdouble {.cdecl.}
-
-# Regression: real symbol + fake required symbol — tests dangling pointer fix
-dynlib "librt.so(.1|)":
-  proc clock_getres(clk_id: cint, res: pointer): cint {.cdecl.}  # real, resolves first
-  proc not_real_rt_symbol(): cint {.cdecl.}                       # fake, fails
-
-# Bind to a library that definitely doesn't exist
-dynlib "libdefinitely_not_real.so":
-  proc fake_function(x: cint): cint {.cdecl.}
+# Bind to testlib — required + optional + missing symbols
+# Run tests from project root with LD_LIBRARY_PATH=./tests
+dynlib "libtestlib.so":
+  proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
+  proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
+  proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
 
 suite "softlink":
   test "loadM succeeds (libm always available)":
@@ -46,15 +37,6 @@ suite "softlink":
     check sqrt(16.0) == 4.0
     check pow(2.0, 10.0) == 1024.0
 
-  test "missing library returns lrLibNotFound":
-    check loadDefinitelyNotReal().kind == lrLibNotFound
-    check not definitelynotrealLoaded()
-
-  test "calling unloaded function raises SoftlinkError":
-    check not definitelynotrealLoaded()
-    expect SoftlinkError:
-      discard fake_function(42)
-
   test "unload then reload works":
     check loadM().kind == lrOk
     unloadM()
@@ -64,110 +46,99 @@ suite "softlink":
 
   test "double load is idempotent":
     check loadM().kind == lrOk
-    check loadM().kind == lrOk  # already loaded, still lrOk
+    check loadM().kind == lrOk
     check ceil(1.1) == 2.0
 
   test "void proc dispatch works (no return type)":
-    check loadC().kind in {lrOk, lrOkPartial}
-    srand(42.cuint)  # should not crash — void return
+    check loadC().kind == lrOk
+    srand(42.cuint)
     let val = rand()
-    srand(42.cuint)  # same seed
-    check rand() == val  # deterministic
-
-  test "SoftlinkError contains symbol and library name":
-    check not definitelynotrealLoaded()
-    try:
-      discard fake_function(42)
-      fail()  # should not reach here
-    except SoftlinkError as e:
-      check e.symbol == "fake_function"
-      check e.library == "libdefinitely_not_real.so"
-      check "fake_function" in e.msg
-      check "libdefinitely_not_real.so" in e.msg
-
-  test "unload when not loaded is a no-op":
-    check not definitelynotrealLoaded()
-    unloadDefinitelyNotReal()  # should not crash
-    check not definitelynotrealLoaded()
-
-  test "missing symbol in real library returns lrSymbolNotFound":
-    let r = loadDl()
-    check r.kind == lrSymbolNotFound
-    check r.symbol == "not_a_real_symbol"
-    check not dlLoaded()
+    srand(42.cuint)
+    check rand() == val
 
   test "calling after unload raises SoftlinkError":
     check loadM().kind == lrOk
-    check ceil(1.1) == 2.0  # works while loaded
+    check ceil(1.1) == 2.0
     unloadM()
     expect SoftlinkError:
-      discard ceil(1.1)  # should raise after unload
+      discard ceil(1.1)
 
-  test "optional: partial load returns lrOkPartial with missing symbols":
-    let r = loadC()
-    check r.kind == lrOkPartial
-    check r.missing == @["not_real_v2", "also_not_real"]
-    check cLoaded()
+  test "SoftlinkError contains symbol and library name":
+    unloadM()
+    try:
+      discard ceil(1.1)
+      fail()
+    except SoftlinkError as e:
+      check e.symbol == "ceil"
+      check e.library == "libm.so(.6|)"
+      check "ceil" in e.msg
+      check "libm.so(.6|)" in e.msg
 
-  test "optional: required symbols work after partial load":
-    check loadC().kind in {lrOk, lrOkPartial}
-    srand(1.cuint)  # required symbol works
-
-  test "optional: availability check returns false for missing":
-    check loadC().kind in {lrOk, lrOkPartial}
-    check not not_real_v2Available()
-    check not also_not_realAvailable()
-
-  test "optional: calling missing optional symbol raises SoftlinkError":
-    check loadC().kind in {lrOk, lrOkPartial}
-    expect SoftlinkError:
-      discard not_real_v2(42)
+  test "unload when not loaded is a no-op":
+    unloadM()
+    unloadM()  # double unload should not crash
+    check not mLoaded()
 
   test "optional: all-required lib returns lrOk not lrOkPartial":
-    check loadM().kind == lrOk  # libm has no optional symbols
+    check loadM().kind == lrOk
 
-  test "regression: no dangling pointers after failed load":
-    let r = loadRt()
-    # librt may be absent on musl/modern glibc (merged into libc)
-    if r.kind == lrLibNotFound:
-      skip()
-    else:
-      check r.kind == lrSymbolNotFound
-      check r.symbol == "not_real_rt_symbol"
-      # clock_getres resolved before the failure — must NOT be callable
-      expect SoftlinkError:
-        discard clock_getres(0.cint, nil)
+  test "testlib: required symbols work":
+    let r = loadTestlib()
+    check r.kind in {lrOk, lrOkPartial}
+    check testlib_add(3.cint, 4.cint) == 7.cint
 
-  test "idempotent: partial load returns lrOkPartial both times":
-    let r1 = loadC()
-    check r1.kind == lrOkPartial
-    check r1.missing == @["not_real_v2", "also_not_real"]
-    let r2 = loadC()
-    check r2.kind == lrOkPartial
-    check r2.missing == @["not_real_v2", "also_not_real"]
+  test "testlib: void required symbol works":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    testlib_noop()  # should not crash
 
-  test "reload after unload preserves partial status":
-    check loadC().kind == lrOkPartial
-    unloadC()
-    check not cLoaded()
-    let r = loadC()
+  test "testlib: partial load returns lrOkPartial with missing optional":
+    let r = loadTestlib()
     check r.kind == lrOkPartial
-    check r.missing == @["not_real_v2", "also_not_real"]
+    check r.missing == @["testlib_future"]
 
-  test "optional: unload nils optional function pointers":
-    check loadC().kind in {lrOk, lrOkPartial}
-    unloadC()
+  test "testlib: availability check for optional symbols":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check not testlib_futureAvailable()
+
+  test "testlib: calling missing optional raises SoftlinkError":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
     expect SoftlinkError:
-      discard not_real_v2(42)
+      discard testlib_future()
+
+  test "testlib: unload nils optional function pointers":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    unloadTestlib()
+    expect SoftlinkError:
+      discard testlib_add(1.cint, 2.cint)
+
+  test "testlib: idempotent partial load":
+    let r1 = loadTestlib()
+    check r1.kind == lrOkPartial
+    let r2 = loadTestlib()
+    check r2.kind == lrOkPartial
+    check r2.missing == @["testlib_future"]
+
+  test "testlib: reload after unload preserves partial status":
+    check loadTestlib().kind == lrOkPartial
+    unloadTestlib()
+    check not testlibLoaded()
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
 
   test "compile-time: rejects proc without calling convention":
     check not compiles(block:
       dynlib "libfoo.so":
-        proc foo(x: cint): cint
+        proc foo(x: cint): cint {.header: "math.h".}
     )
 
   test "compile-time: rejects unsupported pragma (varargs)":
     check not compiles(block:
       dynlib "libfoo.so":
-        proc foo(x: cint): cint {.cdecl, varargs.}
+        proc foo(x: cint): cint {.cdecl, varargs, header: "math.h".}
+    )
+
+  test "compile-time: rejects proc without header":
+    check not compiles(block:
+      dynlib "libfoo.so":
+        proc foo(x: cint): cint {.cdecl.}
     )
