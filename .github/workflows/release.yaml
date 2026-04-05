@@ -142,7 +142,9 @@ jobs:
           ref: ${{ needs.prepare-version.outputs.commit_sha }}
 
       - name: Run tests
-        run: nimble test -y
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          nimble test -y
 
   release:
     name: Create release
