@@ -1,102 +1,94 @@
 ## Tests for softlink macro.
 ##
-## Tests against system math/C libraries and a custom test library.
+## Tests against system math/C libraries (Linux) and a custom test library (all platforms).
 ## Build the test library before running (see nimble test task).
 
 import std/[unittest, math, strutils]
 import softlink
 
-# Platform-specific library patterns
+# System library tests — Linux only (library names produce consistent identifiers)
+when defined(linux):
+  dynlib "libm.so(.6|)":
+    proc ceil(x: cdouble): cdouble {.cdecl, header: "math.h".}
+    proc floor(x: cdouble): cdouble {.cdecl, header: "math.h".}
+    proc sqrt(x: cdouble): cdouble {.cdecl, header: "math.h".}
+    proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl, header: "math.h".}
+
+  dynlib "libc.so(.6|)":
+    proc srand(seed: cuint) {.cdecl, header: "stdlib.h".}
+    proc rand(): cint {.cdecl, header: "stdlib.h".}
+
+# Test library — cross-platform (built from tests/testlib.c)
 when defined(windows):
-  const
-    MathLib = "ucrtbase.dll"
-    CLib = "msvcrt.dll"
-    TestLib = "testlib.dll"
+  const TestLib = "testlib.dll"
 elif defined(macosx):
-  const
-    MathLib = "libm.dylib"
-    CLib = "libSystem.B.dylib"
-    TestLib = "libtestlib.dylib"
+  const TestLib = "libtestlib.dylib"
 else:
-  const
-    MathLib = "libm.so(.6|)"
-    CLib = "libc.so(.6|)"
-    TestLib = "libtestlib.so"
+  const TestLib = "libtestlib.so"
 
-# Bind to math library
-dynlib MathLib:
-  proc ceil(x: cdouble): cdouble {.cdecl, header: "math.h".}
-  proc floor(x: cdouble): cdouble {.cdecl, header: "math.h".}
-  proc sqrt(x: cdouble): cdouble {.cdecl, header: "math.h".}
-  proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl, header: "math.h".}
-
-# Bind to C library — void-returning and deterministic functions
-dynlib CLib:
-  proc srand(seed: cuint) {.cdecl, header: "stdlib.h".}
-  proc rand(): cint {.cdecl, header: "stdlib.h".}
-
-# Bind to testlib — required + optional + missing symbols
 dynlib TestLib:
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
 
 suite "softlink":
-  test "loadM succeeds (math library available)":
-    check loadM().kind == lrOk
-    check mLoaded()
+  # System library tests — Linux only
+  when defined(linux):
+    test "loadM succeeds (libm always available)":
+      check loadM().kind == lrOk
+      check mLoaded()
 
-  test "math functions work through bindings":
-    check loadM().kind == lrOk
-    check ceil(2.3) == 3.0
-    check floor(2.7) == 2.0
-    check sqrt(16.0) == 4.0
-    check pow(2.0, 10.0) == 1024.0
+    test "math functions work through bindings":
+      check loadM().kind == lrOk
+      check ceil(2.3) == 3.0
+      check floor(2.7) == 2.0
+      check sqrt(16.0) == 4.0
+      check pow(2.0, 10.0) == 1024.0
 
-  test "unload then reload works":
-    check loadM().kind == lrOk
-    unloadM()
-    check not mLoaded()
-    check loadM().kind == lrOk
-    check ceil(1.1) == 2.0
+    test "unload then reload works":
+      check loadM().kind == lrOk
+      unloadM()
+      check not mLoaded()
+      check loadM().kind == lrOk
+      check ceil(1.1) == 2.0
 
-  test "double load is idempotent":
-    check loadM().kind == lrOk
-    check loadM().kind == lrOk
-    check ceil(1.1) == 2.0
+    test "double load is idempotent":
+      check loadM().kind == lrOk
+      check loadM().kind == lrOk
+      check ceil(1.1) == 2.0
 
-  test "void proc dispatch works (no return type)":
-    check loadC().kind == lrOk
-    srand(42.cuint)
-    let val = rand()
-    srand(42.cuint)
-    check rand() == val
+    test "void proc dispatch works (no return type)":
+      check loadC().kind == lrOk
+      srand(42.cuint)
+      let val = rand()
+      srand(42.cuint)
+      check rand() == val
 
-  test "calling after unload raises SoftlinkError":
-    check loadM().kind == lrOk
-    check ceil(1.1) == 2.0
-    unloadM()
-    expect SoftlinkError:
-      discard ceil(1.1)
+    test "calling after unload raises SoftlinkError":
+      check loadM().kind == lrOk
+      check ceil(1.1) == 2.0
+      unloadM()
+      expect SoftlinkError:
+        discard ceil(1.1)
 
-  test "SoftlinkError contains symbol and library name":
-    unloadM()
-    try:
-      discard ceil(1.1)
-      fail()
-    except SoftlinkError as e:
-      check e.symbol == "ceil"
-      check e.library == MathLib
-      check "ceil" in e.msg
+    test "SoftlinkError contains symbol and library name":
+      unloadM()
+      try:
+        discard ceil(1.1)
+        fail()
+      except SoftlinkError as e:
+        check e.symbol == "ceil"
+        check "ceil" in e.msg
 
-  test "unload when not loaded is a no-op":
-    unloadM()
-    unloadM()
-    check not mLoaded()
+    test "unload when not loaded is a no-op":
+      unloadM()
+      unloadM()
+      check not mLoaded()
 
-  test "optional: all-required lib returns lrOk not lrOkPartial":
-    check loadM().kind == lrOk
+    test "optional: all-required lib returns lrOk not lrOkPartial":
+      check loadM().kind == lrOk
 
+  # Cross-platform tests using testlib
   test "testlib: required symbols work":
     let r = loadTestlib()
     check r.kind in {lrOk, lrOkPartial}
@@ -120,7 +112,7 @@ suite "softlink":
     expect SoftlinkError:
       discard testlib_future()
 
-  test "testlib: unload nils optional function pointers":
+  test "testlib: unload nils function pointers":
     check loadTestlib().kind in {lrOk, lrOkPartial}
     unloadTestlib()
     expect SoftlinkError:
@@ -140,6 +132,22 @@ suite "softlink":
     let r = loadTestlib()
     check r.kind == lrOkPartial
 
+  test "testlib: unload then call raises SoftlinkError":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    unloadTestlib()
+    expect SoftlinkError:
+      discard testlib_add(1.cint, 2.cint)
+
+  test "testlib: SoftlinkError has library name":
+    unloadTestlib()
+    try:
+      discard testlib_add(1.cint, 2.cint)
+      fail()
+    except SoftlinkError as e:
+      check e.symbol == "testlib_add"
+      check e.library == TestLib
+
+  # Compile-time validation tests
   test "compile-time: rejects proc without calling convention":
     check not compiles(block:
       dynlib "libfoo.so":
