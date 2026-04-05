@@ -5,6 +5,9 @@
 ## `{.importc, dynlib.}` (type-safe but fatal on missing) and `std/dynlib`
 ## (optional but loses type safety).
 
+when defined(js):
+  {.error: "softlink requires a native backend (C, C++, or Objective-C). The JavaScript backend does not support dynamic library loading.".}
+
 import std/[macros, sets, strutils]
 import std/dynlib as stdDynlib
 # Exported because macro-generated code resolves these identifiers at the call site.
@@ -179,9 +182,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       )
     ))
 
-  # Compile-time header verification via _Static_assert + _Generic.
-  # Compares each symbol's type from the C header against Nim's generated
-  # function pointer type. No linking required — pure compile-time check.
+  # Compile-time header verification. Compares each symbol's type from
+  # the C header against Nim's generated function pointer type.
+  # Three-tier fallback for maximum compiler compatibility:
+  #   1. C23 typeof (standard)
+  #   2. __typeof__ (GCC/Clang extension, also MSVC 2022+)
+  #   3. C++ decltype + std::is_same (for --backend:cpp)
+  # No linking required — pure compile-time check.
   block:
     var headers: HashSet[string]
     var includeCode = ""
@@ -190,32 +197,62 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         headers.incl(p.headerFile)
         includeCode.add("#include \"" & p.headerFile & "\"\n")
 
-    # Emit #include directives
+    # Emit #include directives + C++ type_traits if needed
     result.add(newNimNode(nnkPragma).add(
       newNimNode(nnkExprColonExpr).add(
         ident("emit"),
-        newStrLitNode("/*INCLUDESECTION*/\n" & includeCode)
+        newStrLitNode("/*INCLUDESECTION*/\n" & includeCode &
+          "#if defined(__cplusplus)\n" &
+          "#include <type_traits>\n" &
+          "#endif\n")
       )
     ))
 
-    # Emit _Static_assert checks inside a dummy proc so they appear after
-    # the function pointer vars in the generated C code.
+    # Emit per-proc verification inside a dummy proc so they appear
+    # after the function pointer vars in the generated C code.
     var verifyBody = newStmtList()
     for p in procs:
       var emitArray = newNimNode(nnkBracket)
       emitArray.add(newStrLitNode(
+        "#if defined(__cplusplus)\n" &
+        "/* C++ path: static_assert + std::is_same + decltype */\n" &
+        "static_assert(\n" &
+        "  (std::is_same<decltype(&" & p.nameStr & "), decltype("
+      ))
+      emitArray.add(p.ptrName)
+      emitArray.add(newStrLitNode(
+        ")>::value),\n" &
+        "  \"softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
+        ");\n" &
+        "#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n" &
+        "/* C23 path: typeof (fully standard) */\n" &
         "_Static_assert(\n" &
         "  _Generic(&" & p.nameStr & ",\n" &
-        "    __typeof__("
+        "    typeof("
       ))
-      emitArray.add(p.ptrName)  # Nim resolves this to the actual C variable name
+      emitArray.add(p.ptrName)
       emitArray.add(newStrLitNode(
         "): 1,\n" &
         "    default: 0\n" &
         "  ),\n" &
-        "  \"softlink: " & p.nameStr & " signature mismatch vs " &
-        p.headerFile & "\"\n" &
-        ");\n"
+        "  \"softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
+        ");\n" &
+        "#elif defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)\n" &
+        "/* C11 + extensions: __typeof__ */\n" &
+        "_Static_assert(\n" &
+        "  _Generic(&" & p.nameStr & ",\n" &
+        "    __typeof__("
+      ))
+      emitArray.add(p.ptrName)
+      emitArray.add(newStrLitNode(
+        "): 1,\n" &
+        "    default: 0\n" &
+        "  ),\n" &
+        "  \"softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
+        ");\n" &
+        "#else\n" &
+        "#error \"softlink: header verification requires C23 typeof, GNU __typeof__, or C++ decltype. Your compiler supports none of these.\"\n" &
+        "#endif\n"
       ))
       verifyBody.add(newNimNode(nnkPragma).add(
         newNimNode(nnkExprColonExpr).add(
