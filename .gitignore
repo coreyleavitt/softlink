@@ -1,0 +1,6 @@
+# Compiled binaries
+tests/test_softlink
+tests/test_nimport
+
+# Nim cache
+nimcache/
