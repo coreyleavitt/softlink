@@ -9,9 +9,8 @@ softlink is a Nim library that provides a `dynlib` macro for type-safe, runtime-
 ## Build & Test Commands
 
 ```bash
-nimble build            # Build the library
 nimble test             # Run all tests (compiles and runs tests/test_softlink.nim)
-nim c -r tests/test_softlink.nim  # Run tests directly
+nim c -r --path:src tests/test_softlink.nim  # Run tests directly
 ```
 
 The nimble file requires Nim >= 2.0.0.
@@ -26,7 +25,7 @@ Given input like `dynlib "libfoo.so(.2|)": proc bar(x: cint): cint {.cdecl.}`, t
 
 1. **A module-level `LibHandle` var** — stores the loaded library handle
 2. **A module-level function pointer var per proc** — typed `proc(...) {.cdecl.}`, initially nil
-3. **`loadFoo*(): LoadResult`** — calls `loadLibPattern`, resolves all symbols via `symAddr` + cast. Returns `lrOk` if all symbols resolve, `lrOkPartial` (with `missing: seq[string]`) if only optional symbols are missing, `lrLibNotFound` if the library is missing, or `lrSymbolNotFound` (with `symbol: string`) if a required symbol can't be resolved. Idempotent (returns `lrOk` immediately if already loaded).
+3. **`loadFoo*(): LoadResult`** — calls `loadLibPattern`, resolves all symbols via `symAddr` + cast. Returns `lrOk` if all symbols resolve, `lrOkPartial` (with `missing: seq[string]`) if only optional symbols are missing, `lrLibNotFound` if the library is missing, or `lrSymbolNotFound` (with `symbol: string`) if a required symbol can't be resolved. Idempotent (returns the cached `LoadResult` immediately if already loaded).
 4. **`unloadFoo*()`** — unloads library, nils all pointers. No-op if not loaded.
 5. **`fooLoaded*(): bool`** — checks if handle is non-nil.
 6. **Wrapper procs** — same signature as declared. Check function pointer for nil (raise `SoftlinkError` if so), then dispatch through the pointer.
@@ -43,4 +42,4 @@ The library name is derived from the pattern string: `"libmbedtls.so(.16|)"` bec
 
 ## Testing
 
-Tests bind against `libm.so` (always available on POSIX) to validate the macro without external dependencies. Tests cover: successful load, math function dispatch, graceful failure on missing library, `SoftlinkError` on unloaded call, unload/reload cycle, and idempotent double-load.
+Tests bind against system libraries (libm, libc, libdl, librt) in Docker. See `tests/test_softlink.nim` for full coverage (22 tests covering load, unload, reload, idempotent caching, optional symbols, dangling pointer regression, compile-time validation, and more).

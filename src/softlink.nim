@@ -5,8 +5,9 @@
 ## `{.importc, dynlib.}` (type-safe but fatal on missing) and `std/dynlib`
 ## (optional but loses type safety).
 
-import std/[macros, sequtils, sets, strutils]
+import std/[macros, sets, strutils]
 import std/dynlib as stdDynlib
+# Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
        stdDynlib.unloadLib
 
@@ -14,7 +15,7 @@ type
   SoftlinkError* = ref object of CatchableError
     ## Raised when calling a function from a library that hasn't been loaded.
     symbol*: string
-    library*: string
+    library*: string  ## The raw dynlib pattern string (e.g., ``"libm.so(.6|)"``)
 
   LoadResultKind* = enum
     lrOk             ## All symbols resolved (required + optional)
@@ -31,13 +32,17 @@ type
     of lrLibNotFound, lrOk:
       discard
 
+# Exported because macro-generated wrapper procs call this by ident at the call site.
 proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
   raise SoftlinkError(
     msg: library & ": library not loaded, cannot call: " & symbol,
     library: library, symbol: symbol)
 
 func libNameToIdent(libPattern: string): string =
-  ## Convert "libmbedtls.so(.16|.14|)" → "Mbedtls"
+  ## Derive an identifier base name from a library pattern string.
+  ## Strips "lib" prefix, truncates at first dot, removes non-alphanumeric
+  ## characters (underscores, hyphens, etc.), and capitalizes.
+  ## Examples: "libmbedtls.so(.16|)" → "Mbedtls", "libfoo_bar.so" → "Foobar"
   var name = libPattern
   if name.startsWith("lib"): name = name[3 .. ^1]
   let dotIdx = name.find('.')
@@ -51,12 +56,23 @@ func libNameToIdent(libPattern: string): string =
   clean
 
 macro dynlib*(libPattern: static[string], body: untyped): untyped =
+  ## Generate type-safe, runtime-optional bindings for a dynamic library.
+  ## The generated ``loadXxx``/``unloadXxx`` procs are **not thread-safe**.
+  ## Wrapper proc calls must also not race with ``unloadXxx`` — the loaded
+  ## state and function pointer dispatch are not atomic.
+  ## Callers must synchronize externally if using from multiple threads.
   let baseName = libNameToIdent(libPattern)
+  if baseName.len == 0:
+    error("cannot derive identifier from dynlib pattern '" & libPattern & "'", body)
+  if not baseName[0].isAlphaAscii:
+    error("dynlib pattern '" & libPattern & "' produces invalid identifier '" &
+          baseName & "' (must start with a letter)", body)
   let baseNameLower = baseName.toLowerAscii()
   let loadProcName = ident("load" & baseName)
   let unloadProcName = ident("unload" & baseName)
   let loadedProcName = ident(baseNameLower & "Loaded")
   let handleName = ident("softlinkHandle" & baseName)
+  let cachedResultName = ident("softlinkResult" & baseName)
   let libPatternLit = newStrLitNode(libPattern)
 
   result = newStmtList()
@@ -66,6 +82,17 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     newNimNode(nnkIdentDefs).add(
       handleName,
       ident("LibHandle"),
+      newEmptyNode()
+    )
+  ))
+
+  # var cachedResult: LoadResult — zero-initializes to lrOk, but the
+  # idempotent guard checks the handle (nil before first load), so
+  # this value is never returned to callers before loadXxx runs.
+  result.add(newNimNode(nnkVarSection).add(
+    newNimNode(nnkIdentDefs).add(
+      cachedResultName,
+      ident("LoadResult"),
       newEmptyNode()
     )
   ))
@@ -143,19 +170,16 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
   # loadXxx*(): LoadResult
   block:
-    let hasOptional = procs.anyIt(it.isOptional)
+    var hasOptional = false
+    for p in procs:
+      if p.isOptional: hasOptional = true; break
     var loadBody = newStmtList()
     let missingName = ident("softlinkMissing")
 
-    # if not handle.isNil: return LoadResult(kind: lrOk)
+    # if not handle.isNil: return cachedResult
     loadBody.add(newIfStmt((
       prefix(newCall(ident("isNil"), handleName), "not"),
-      newStmtList(newNimNode(nnkReturnStmt).add(
-        newNimNode(nnkObjConstr).add(
-          ident("LoadResult"),
-          newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
-        )
-      ))
+      newStmtList(newNimNode(nnkReturnStmt).add(cachedResultName))
     )))
 
     # handle = loadLibPattern(pattern)
@@ -172,7 +196,44 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       ))
     )))
 
-    # var missing: seq[string] (only if there are optional procs)
+    # Collect temp sym names for deferred assignment
+    type SymInfo = object
+      ptrName: NimNode
+      tempSym: NimNode
+      procTy: NimNode
+      isOptional: bool
+
+    var syms: seq[SymInfo]
+
+    # Phase 1: Resolve all REQUIRED symbols into temp vars
+    for p in procs:
+      if p.isOptional: continue
+      let symName = newStrLitNode(p.nameStr)
+      let tempSym = genSym(nskLet, "sym")
+
+      var procTy = newNimNode(nnkProcTy)
+      procTy.add(p.formalParams.copy())
+      procTy.add(newNimNode(nnkPragma).add(ident(p.callConv)))
+
+      # let sym = handle.symAddr("name")
+      loadBody.add(newLetStmt(tempSym, newCall(ident("symAddr"), handleName, symName)))
+
+      # if sym.isNil: unload + nil handle + return lrSymbolNotFound
+      var cleanupBlock = newStmtList()
+      cleanupBlock.add(newCall(ident("unloadLib"), handleName))
+      cleanupBlock.add(newAssignment(handleName, newNilLit()))
+      cleanupBlock.add(newNimNode(nnkReturnStmt).add(
+        newNimNode(nnkObjConstr).add(
+          ident("LoadResult"),
+          newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrSymbolNotFound")),
+          newNimNode(nnkExprColonExpr).add(ident("symbol"), symName)
+        )
+      ))
+      loadBody.add(newIfStmt((newCall(ident("isNil"), tempSym), cleanupBlock)))
+
+      syms.add(SymInfo(ptrName: p.ptrName, tempSym: tempSym, procTy: procTy, isOptional: false))
+
+    # Phase 2: Resolve all OPTIONAL symbols into temp vars
     if hasOptional:
       loadBody.add(newNimNode(nnkVarSection).add(
         newNimNode(nnkIdentDefs).add(
@@ -182,12 +243,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         )
       ))
 
-    # For each proc: resolve symbol
     for p in procs:
+      if not p.isOptional: continue
       let symName = newStrLitNode(p.nameStr)
       let tempSym = genSym(nskLet, "sym")
 
-      # Build proc type for cast
       var procTy = newNimNode(nnkProcTy)
       procTy.add(p.formalParams.copy())
       procTy.add(newNimNode(nnkPragma).add(ident(p.callConv)))
@@ -195,57 +255,62 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # let sym = handle.symAddr("name")
       loadBody.add(newLetStmt(tempSym, newCall(ident("symAddr"), handleName, symName)))
 
-      if p.isOptional:
-        # if sym.isNil: missing.add(name) else: fpXxx = cast[ProcType](sym)
-        var ifElse = newNimNode(nnkIfStmt)
-        ifElse.add(newNimNode(nnkElifBranch).add(
-          newCall(ident("isNil"), tempSym),
-          newStmtList(newCall(newDotExpr(missingName, ident("add")), symName))
-        ))
-        ifElse.add(newNimNode(nnkElse).add(
-          newStmtList(newAssignment(p.ptrName, newNimNode(nnkCast).add(procTy, tempSym)))
-        ))
-        loadBody.add(ifElse)
-      else:
-        # if sym.isNil: cleanup and return LoadResult(kind: lrSymbolNotFound, symbol: name)
-        var cleanupBlock = newStmtList()
-        cleanupBlock.add(newCall(ident("unloadLib"), handleName))
-        cleanupBlock.add(newAssignment(handleName, newNilLit()))
-        cleanupBlock.add(newNimNode(nnkReturnStmt).add(
-          newNimNode(nnkObjConstr).add(
-            ident("LoadResult"),
-            newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrSymbolNotFound")),
-            newNimNode(nnkExprColonExpr).add(ident("symbol"), symName)
-          )
-        ))
-        loadBody.add(newIfStmt((newCall(ident("isNil"), tempSym), cleanupBlock)))
-
-        # fpXxx = cast[ProcType](sym)
-        loadBody.add(newAssignment(p.ptrName, newNimNode(nnkCast).add(procTy, tempSym)))
-
-    # return: lrOkPartial if missing, lrOk otherwise
-    if hasOptional:
-      # if missing.len > 0: return LoadResult(kind: lrOkPartial, missing: missing)
+      # if sym.isNil: missing.add(name)
       loadBody.add(newIfStmt((
+        newCall(ident("isNil"), tempSym),
+        newStmtList(newCall(newDotExpr(missingName, ident("add")), symName))
+      )))
+
+      syms.add(SymInfo(ptrName: p.ptrName, tempSym: tempSym, procTy: procTy, isOptional: true))
+
+    # Phase 3: Assign all resolved pointers
+    for s in syms:
+      if s.isOptional:
+        # if not sym.isNil: fp = cast[ProcType](sym)
+        loadBody.add(newIfStmt((
+          prefix(newCall(ident("isNil"), s.tempSym), "not"),
+          newStmtList(newAssignment(s.ptrName, newNimNode(nnkCast).add(s.procTy, s.tempSym)))
+        )))
+      else:
+        # Required: guaranteed non-nil by Phase 1 early-return on failure
+        loadBody.add(newAssignment(s.ptrName, newNimNode(nnkCast).add(s.procTy, s.tempSym)))
+
+    # Cache and return result
+    if hasOptional:
+      # if missing.len > 0: cache lrOkPartial else: cache lrOk
+      var cacheIfElse = newNimNode(nnkIfStmt)
+      cacheIfElse.add(newNimNode(nnkElifBranch).add(
         newNimNode(nnkInfix).add(ident(">"),
           newDotExpr(missingName, ident("len")),
           newIntLitNode(0)),
-        newStmtList(newNimNode(nnkReturnStmt).add(
+        newStmtList(newAssignment(cachedResultName,
           newNimNode(nnkObjConstr).add(
             ident("LoadResult"),
             newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOkPartial")),
             newNimNode(nnkExprColonExpr).add(ident("missing"), missingName)
           )
         ))
-      )))
+      ))
+      cacheIfElse.add(newNimNode(nnkElse).add(
+        newStmtList(newAssignment(cachedResultName,
+          newNimNode(nnkObjConstr).add(
+            ident("LoadResult"),
+            newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
+          )
+        ))
+      ))
+      loadBody.add(cacheIfElse)
+    else:
+      # cache lrOk
+      loadBody.add(newAssignment(cachedResultName,
+        newNimNode(nnkObjConstr).add(
+          ident("LoadResult"),
+          newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
+        )
+      ))
 
-    # return LoadResult(kind: lrOk)
-    loadBody.add(newNimNode(nnkReturnStmt).add(
-      newNimNode(nnkObjConstr).add(
-        ident("LoadResult"),
-        newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
-      )
-    ))
+    # return cachedResult
+    loadBody.add(newNimNode(nnkReturnStmt).add(cachedResultName))
 
     result.add(newProc(
       name = postfix(loadProcName, "*"),
@@ -261,6 +326,14 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ifBody.add(newAssignment(handleName, newNilLit()))
     for p in procs:
       ifBody.add(newAssignment(p.ptrName, newNilLit()))
+    # Reset cached result. The value doesn't matter because the idempotent
+    # guard in loadXxx checks the handle (now nil), so it will recompute.
+    ifBody.add(newAssignment(cachedResultName,
+      newNimNode(nnkObjConstr).add(
+        ident("LoadResult"),
+        newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
+      )
+    ))
     unloadBody.add(newIfStmt((
       prefix(newCall(ident("isNil"), handleName), "not"),
       ifBody
