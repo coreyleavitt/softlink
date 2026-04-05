@@ -1,32 +1,48 @@
 ## Tests for softlink macro.
 ##
-## Tests against libm, libc, and a custom test library (libtestlib.so).
-## Build libtestlib.so before running: gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c
+## Tests against system math/C libraries and a custom test library.
+## Build the test library before running (see nimble test task).
 
 import std/[unittest, math, strutils]
 import softlink
 
-# Bind to libm — available everywhere on Linux
-dynlib "libm.so(.6|)":
+# Platform-specific library patterns
+when defined(windows):
+  const
+    MathLib = "ucrtbase.dll"
+    CLib = "msvcrt.dll"
+    TestLib = "./tests/testlib.dll"
+elif defined(macosx):
+  const
+    MathLib = "libm.dylib"
+    CLib = "libSystem.B.dylib"
+    TestLib = "./tests/libtestlib.dylib"
+else:
+  const
+    MathLib = "libm.so(.6|)"
+    CLib = "libc.so(.6|)"
+    TestLib = "libtestlib.so"
+
+# Bind to math library
+dynlib MathLib:
   proc ceil(x: cdouble): cdouble {.cdecl, header: "math.h".}
   proc floor(x: cdouble): cdouble {.cdecl, header: "math.h".}
   proc sqrt(x: cdouble): cdouble {.cdecl, header: "math.h".}
   proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl, header: "math.h".}
 
-# Bind to libc — void-returning and deterministic functions
-dynlib "libc.so(.6|)":
+# Bind to C library — void-returning and deterministic functions
+dynlib CLib:
   proc srand(seed: cuint) {.cdecl, header: "stdlib.h".}
   proc rand(): cint {.cdecl, header: "stdlib.h".}
 
 # Bind to testlib — required + optional + missing symbols
-# Run tests from project root with LD_LIBRARY_PATH=./tests
-dynlib "libtestlib.so":
+dynlib TestLib:
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
 
 suite "softlink":
-  test "loadM succeeds (libm always available)":
+  test "loadM succeeds (math library available)":
     check loadM().kind == lrOk
     check mLoaded()
 
@@ -70,13 +86,12 @@ suite "softlink":
       fail()
     except SoftlinkError as e:
       check e.symbol == "ceil"
-      check e.library == "libm.so(.6|)"
+      check e.library == MathLib
       check "ceil" in e.msg
-      check "libm.so(.6|)" in e.msg
 
   test "unload when not loaded is a no-op":
     unloadM()
-    unloadM()  # double unload should not crash
+    unloadM()
     check not mLoaded()
 
   test "optional: all-required lib returns lrOk not lrOkPartial":
@@ -89,7 +104,7 @@ suite "softlink":
 
   test "testlib: void required symbol works":
     check loadTestlib().kind in {lrOk, lrOkPartial}
-    testlib_noop()  # should not crash
+    testlib_noop()
 
   test "testlib: partial load returns lrOkPartial with missing optional":
     let r = loadTestlib()

@@ -7,13 +7,28 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    container:
-      image: nimlang/nim:2.2.0
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run tests
+      - name: Install Nim (POSIX)
+        if: runner.os != 'Windows'
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          nimble test -y
+          curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
+      - name: Install Nim (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -L https://nim-lang.org/download/nim-2.2.0_x64.zip -o nim.zip
+          unzip -q nim.zip
+          echo "$PWD/nim-2.2.0/bin" >> "$GITHUB_PATH"
+
+      - name: Run tests
+        shell: bash
+        run: nimble test -y

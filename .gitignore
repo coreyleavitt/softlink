@@ -2,6 +2,8 @@
 tests/test_softlink
 tests/test_nimport
 tests/libtestlib.so
+tests/libtestlib.dylib
+tests/testlib.dll
 
 # Nim cache
 nimcache/
