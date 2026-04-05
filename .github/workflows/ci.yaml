@@ -47,8 +47,8 @@ jobs:
 
       - name: Build test library (MSVC)
         if: matrix.cc == 'vcc'
-        shell: bash
-        run: cl //LD //Fe:tests/testlib.dll tests/testlib.c
+        shell: cmd
+        run: cl /LD /Fe:tests\testlib.dll tests\testlib.c
 
       - name: Build test library (GCC/Clang)
         if: matrix.cc != 'vcc'
@@ -64,10 +64,10 @@ jobs:
 
       - name: Run tests (MSVC)
         if: matrix.cc == 'vcc'
-        shell: bash
+        shell: cmd
         run: |
-          export PATH="./tests:$PATH"
-          nim c -r --cc:vcc --path:src "--passC:/I." tests/test_softlink.nim
+          set PATH=tests;%CD%\nim-2.2.0\bin;%PATH%
+          nim c -r --cc:vcc --path:src --passC:/I. tests\test_softlink.nim
 
       - name: Run tests (GCC/Clang)
         if: matrix.cc != 'vcc'
