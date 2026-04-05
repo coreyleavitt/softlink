@@ -48,7 +48,7 @@ jobs:
       - name: Build test library (MSVC)
         if: matrix.cc == 'vcc'
         shell: cmd
-        run: cl /LD /Fe:tests\testlib.dll tests\testlib.c
+        run: cl /LD /DTESTLIB_BUILDING /Fe:tests\testlib.dll tests\testlib.c
 
       - name: Build test library (GCC/Clang)
         if: matrix.cc != 'vcc'
