@@ -26,6 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up MSVC
+        if: matrix.cc == 'vcc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Install Nim AFTER MSVC setup so PATH isn't clobbered
       - name: Install Nim (POSIX)
         if: runner.os != 'Windows'
         run: |
@@ -39,10 +44,6 @@ jobs:
           curl -L https://nim-lang.org/download/nim-2.2.0_x64.zip -o nim.zip
           unzip -q nim.zip
           echo "$PWD/nim-2.2.0/bin" >> "$GITHUB_PATH"
-
-      - name: Set up MSVC
-        if: matrix.cc == 'vcc'
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build test library (MSVC)
         if: matrix.cc == 'vcc'
@@ -64,7 +65,9 @@ jobs:
       - name: Run tests (MSVC)
         if: matrix.cc == 'vcc'
         shell: cmd
-        run: nim c -r --cc:vcc --path:src --passC:/I. tests\test_softlink.nim
+        run: |
+          set PATH=tests;%PATH%
+          nim c -r --cc:vcc --path:src --passC:/I. tests\test_softlink.nim
 
       - name: Run tests (GCC/Clang)
         if: matrix.cc != 'vcc'
@@ -72,5 +75,9 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             export LD_LIBRARY_PATH=./tests
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            export DYLD_LIBRARY_PATH=./tests
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="./tests:$PATH"
           fi
           nim c -r --path:src --passC:-I. tests/test_softlink.nim

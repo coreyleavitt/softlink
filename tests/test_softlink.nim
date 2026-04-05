@@ -11,12 +11,12 @@ when defined(windows):
   const
     MathLib = "ucrtbase.dll"
     CLib = "msvcrt.dll"
-    TestLib = "./tests/testlib.dll"
+    TestLib = "testlib.dll"
 elif defined(macosx):
   const
     MathLib = "libm.dylib"
     CLib = "libSystem.B.dylib"
-    TestLib = "./tests/libtestlib.dylib"
+    TestLib = "libtestlib.dylib"
 else:
   const
     MathLib = "libm.so(.6|)"
