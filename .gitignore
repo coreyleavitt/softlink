@@ -5,5 +5,8 @@ tests/libtestlib.so
 tests/libtestlib.dylib
 tests/testlib.dll
 
+# Blog drafts
+docs/
+
 # Nim cache
 nimcache/
