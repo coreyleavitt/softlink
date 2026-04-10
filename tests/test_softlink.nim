@@ -283,21 +283,20 @@ when defined(linux):
       check usesCeil() == 2.0
 
   suite "softlink — callback pointers":
-    test "xxxPtr returns raw pointer for callback use":
+    test "xxxPtr returns typed function pointer for callback use":
       check loadM().kind == lrOk
-      let p = ceilPtr()
-      check p != nil
-      # Call through the raw pointer to verify it works
-      let fn = cast[proc(x: cdouble): cdouble {.cdecl.}](p)
+      let fn = ceilPtr()
+      check fn != nil
+      # Call directly — no cast needed, already typed
       check fn(2.3) == 3.0
 
     test "xxxPtr returns nil when not loaded":
       unloadM()
       check ceilPtr() == nil
 
-    test "xxxPtr is compatible with pointer params (no raises annotation)":
-      # This compiles only if xxxPtr returns plain pointer without {.raises.}
-      proc takesCallback(cb: pointer) {.raises: [].} =
-        discard cb
+    test "xxxPtr type is compatible with matching proc params":
+      # xxxPtr returns the proc type with {.cdecl, raises: [].}
+      proc takesCallback(cb: proc(x: cdouble): cdouble {.cdecl, raises: [].}): cdouble {.raises: [].} =
+        cb(1.1)
       check loadM().kind == lrOk
-      takesCallback(ceilPtr())
+      check takesCallback(ceilPtr()) == 2.0

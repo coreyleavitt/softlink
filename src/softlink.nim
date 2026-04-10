@@ -571,16 +571,24 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
       ))
 
-    # xxxPtr*(): pointer — raw function pointer for C callback passing.
+    # xxxPtr*(): proc type — typed function pointer for C callback passing.
     # Returns the dlsym'd pointer directly (nil if not loaded). No nil
     # check — the load function is the single enforcement point.
+    # Return type matches the function pointer variable's type (cdecl + raises: [])
+    # so callers get type safety without the wrapper's SoftlinkError raises.
     let ptrAccessorName = ident(p.nameStr & "Ptr")
+    var ptrReturnType = newNimNode(nnkProcTy)
+    ptrReturnType.add(p.formalParams.copy())
+    ptrReturnType.add(newNimNode(nnkPragma).add(
+      ident(p.callConv),
+      newNimNode(nnkExprColonExpr).add(
+        ident("raises"), newNimNode(nnkBracket)
+      )
+    ))
     var ptrAccessorProc = newProc(
       name = postfix(ptrAccessorName, "*"),
-      params = [ident("pointer")],
-      body = newStmtList(
-        newNimNode(nnkCast).add(ident("pointer"), p.ptrName)
-      ),
+      params = [ptrReturnType],
+      body = newStmtList(p.ptrName),
     )
     ptrAccessorProc.addPragma(newNimNode(nnkExprColonExpr).add(
       ident("raises"),
