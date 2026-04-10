@@ -18,4 +18,7 @@ TESTLIB_API void testlib_noop(void);
 /* Optional symbol — in header but NOT in .so/.dll (simulates newer API version) */
 TESTLIB_API int testlib_future(void);
 
+/* Symbol for lrLibNotFound testing — declared in header, bound to a non-existent library */
+TESTLIB_API int testlib_notreal(void);
+
 #endif

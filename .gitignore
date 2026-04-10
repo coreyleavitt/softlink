@@ -5,6 +5,10 @@ tests/libtestlib.so
 tests/libtestlib.dylib
 tests/testlib.dll
 
+# Example binaries
+examples/struct_verification
+examples/tls_backend
+
 # Blog drafts
 docs/
 

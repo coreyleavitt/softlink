@@ -13,10 +13,12 @@ when defined(linux):
     proc floor(x: cdouble): cdouble {.cdecl, header: "math.h".}
     proc sqrt(x: cdouble): cdouble {.cdecl, header: "math.h".}
     proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl, header: "math.h".}
+    proc round(x: cdouble): cdouble {.cdecl, header: "<math.h>".}  # angle-bracket syntax
 
   dynlib "libc.so(.6|)":
     proc srand(seed: cuint) {.cdecl, header: "stdlib.h".}
     proc rand(): cint {.cdecl, header: "stdlib.h".}
+
 
 # Test library — cross-platform (built from tests/testlib.c)
 when defined(windows):
@@ -165,3 +167,117 @@ suite "softlink":
       dynlib "libfoo.so":
         proc foo(x: cint): cint {.cdecl.}
     )
+
+# Missing library — for lrLibNotFound test
+dynlib "libdefinitely_not_real.so":
+  proc testlib_notreal(): cint {.cdecl, header: "tests/testlib.h".}
+
+# dyntype — compile-time struct layout verification
+dyntype "tests/testlib_types.h":
+  type TestlibPoint {.ctype: "testlib_point_t".} = object
+    x: cint
+    y: cint
+
+  type TestlibTaggedValue {.ctype: "testlib_tagged_value_t".} = object
+    value: cdouble
+    flags: cint
+
+  type TestlibRect {.ctype: "testlib_rect_t".} = object
+    origin: TestlibPoint
+    width: cint
+    height: cint
+
+  type TestlibPointExported* {.ctype: "testlib_point_t".} = object
+    x: cint
+    y: cint
+
+suite "dyntype":
+  test "verified type is defined and usable":
+    var p: TestlibPoint
+    p.x = 10
+    p.y = 20
+    check p.x == 10
+    check p.y == 20
+
+  test "multiple types verified in one block":
+    var tv: TestlibTaggedValue
+    tv.value = 3.14
+    tv.flags = 42
+    check tv.value == 3.14
+    check tv.flags == 42
+
+  test "nested struct verified":
+    var r: TestlibRect
+    r.origin.x = 1
+    r.origin.y = 2
+    r.width = 100
+    r.height = 200
+    check r.origin.x == 1
+    check r.width == 100
+
+  test "compile-time: rejects type without ctype":
+    check not compiles(block:
+      dyntype "tests/testlib_types.h":
+        type BadType = object
+          x: cint
+    )
+
+  test "compile-time: rejects non-type in body":
+    check not compiles(block:
+      dyntype "tests/testlib_types.h":
+        proc foo() = discard
+    )
+
+  test "compile-time: rejects empty header":
+    check not compiles(block:
+      dyntype "":
+        type BadType {.ctype: "foo_t".} = object
+          x: cint
+    )
+
+  test "compile-time: rejects unsupported pragma on type":
+    check not compiles(block:
+      dyntype "tests/testlib_types.h":
+        type BadType {.ctype: "testlib_point_t", deprecated.} = object
+          x: cint
+          y: cint
+    )
+
+  test "exported type verified":
+    var p: TestlibPointExported
+    p.x = 42
+    check p.x == 42
+
+  test "compile-time: rejects duplicate type name":
+    check not compiles(block:
+      dyntype "tests/testlib_types.h":
+        type Dup {.ctype: "testlib_point_t".} = object
+          x: cint
+          y: cint
+        type Dup {.ctype: "testlib_point_t".} = object
+          x: cint
+          y: cint
+    )
+
+  # NOTE: sizeof mismatch (e.g., wrong number of fields) is caught by
+  # _Static_assert at C compile time, not Nim compile time. Can't test
+  # with compiles(). Verified manually in Docker — see task #7.
+
+suite "softlink — error paths":
+  test "lrLibNotFound for missing library":
+    check loadDefinitelyNotReal().kind == lrLibNotFound
+
+when defined(linux):
+  suite "softlink — angle-bracket includes":
+    test "angle-bracket header syntax works":
+      check loadM().kind == lrOk
+      check round(2.7) == 3.0
+
+  suite "softlink — effect tracking":
+    test "wrapper procs have {.raises: [SoftlinkError].}":
+      # This proc compiles only if ceil's raises list is [SoftlinkError],
+      # not the conservative [Exception]
+      proc usesCeil(): cdouble {.raises: [SoftlinkError].} =
+        ceil(1.1)
+      check loadM().kind == lrOk
+      check usesCeil() == 2.0

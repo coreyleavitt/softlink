@@ -1,9 +1,10 @@
 ## softlink — Type-safe optional dynamic library bindings for Nim.
 ##
 ## Provides a `dynlib` macro that generates runtime-loadable FFI bindings
-## from type-safe proc definitions. Solves the Nim ecosystem gap between
-## `{.importc, dynlib.}` (type-safe but fatal on missing) and `std/dynlib`
-## (optional but loses type safety).
+## from type-safe proc definitions, and a `dyntype` macro for compile-time
+## struct layout verification against C headers. Solves the Nim ecosystem
+## gap between `{.importc, dynlib.}` (type-safe but fatal on missing) and
+## `std/dynlib` (optional but loses type safety).
 
 when defined(js):
   {.error: "softlink requires a native backend (C, C++, or Objective-C). The JavaScript backend does not support dynamic library loading.".}
@@ -40,6 +41,15 @@ proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
   raise SoftlinkError(
     msg: library & ": library not loaded, cannot call: " & symbol,
     library: library, symbol: symbol)
+
+func toIncludeDirective(header: string): string =
+  ## Convert a header path to a C #include directive.
+  ## Supports angle-bracket syntax: ``"<mbedtls/ssl.h>"`` → ``#include <mbedtls/ssl.h>``
+  ## and quoted syntax: ``"mbedtls/ssl.h"`` → ``#include "mbedtls/ssl.h"``
+  if header.len >= 2 and header[0] == '<' and header[^1] == '>':
+    "#include " & header & "\n"
+  else:
+    "#include \"" & header & "\"\n"
 
 func libNameToIdent(libPattern: string): string =
   ## Derive an identifier base name from a library pattern string.
@@ -149,7 +159,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           isOptional = true
         elif pragmaName == "header":
           if pragma.kind == nnkExprColonExpr:
-            headerFile = $pragma[1]
+            headerFile = pragma[1].strVal
           else:
             error("header pragma requires a value (e.g., {.header: \"foo.h\".})", stmt)
         elif pragmaName != "":
@@ -168,10 +178,16 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
                         headerFile: headerFile, isOptional: isOptional,
                         hasReturn: hasReturn))
 
-    # Build proc type for the var
+    # Build proc type for the var — C functions can't raise Nim exceptions
     var procTy = newNimNode(nnkProcTy)
     procTy.add(formalParams.copy())
-    procTy.add(newNimNode(nnkPragma).add(ident(callConv)))
+    procTy.add(newNimNode(nnkPragma).add(
+      ident(callConv),
+      newNimNode(nnkExprColonExpr).add(
+        ident("raises"),
+        newNimNode(nnkBracket)
+      )
+    ))
 
     # var fpXxx: proc(...) {.callConv.}
     result.add(newNimNode(nnkVarSection).add(
@@ -195,7 +211,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     for p in procs:
       if p.headerFile notin headers:
         headers.incl(p.headerFile)
-        includeCode.add("#include \"" & p.headerFile & "\"\n")
+        includeCode.add(toIncludeDirective(p.headerFile))
 
     # Emit #include directives + C++ type_traits if needed
     result.add(newNimNode(nnkPragma).add(
@@ -208,13 +224,20 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       )
     ))
 
-    # Emit per-proc verification inside a dummy proc so they appear
-    # after the function pointer vars in the generated C code.
+    # Emit per-proc verification inside a dummy proc to ensure the
+    # assertions appear after function pointer var declarations in
+    # the generated C code (file-scope emit can't reference these vars).
+    # NOTE: {.used.} alone is not sufficient — Nim's dead code elimination
+    # drops the proc entirely. {.exportc.} forces Nim to emit the proc.
+    # {.codegenDecl: "static ...".} makes it file-local in C — no linker
+    # collisions, no binary bloat. _Static_assert is evaluated at C
+    # compilation time (during gcc -c), before LTO runs at link time —
+    # the assertions cannot be eliminated by link-time optimization.
     var verifyBody = newStmtList()
     for p in procs:
       var emitArray = newNimNode(nnkBracket)
       emitArray.add(newStrLitNode(
-        "#if defined(__cplusplus)\n" &
+        "\n#if defined(__cplusplus)\n" &
         "/* C++ path: static_assert + std::is_same + decltype */\n" &
         "static_assert(\n" &
         "  (std::is_same<decltype(&" & p.nameStr & "), decltype("
@@ -222,7 +245,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       emitArray.add(p.ptrName)
       emitArray.add(newStrLitNode(
         ")>::value),\n" &
-        "  \"softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
+        "  \"softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
         ");\n" &
         "#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n" &
         "/* C23 path: typeof (fully standard) */\n" &
@@ -235,7 +258,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         "): 1,\n" &
         "    default: 0\n" &
         "  ),\n" &
-        "  \"softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
+        "  \"softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
         ");\n" &
         "#elif defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)\n" &
         "/* C11 + extensions: __typeof__ */\n" &
@@ -248,7 +271,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         "): 1,\n" &
         "    default: 0\n" &
         "  ),\n" &
-        "  \"softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
+        "  \"softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
         ");\n" &
         "#else\n" &
         "#error \"softlink: header verification requires C23 typeof, GNU __typeof__, or C++ decltype. Your compiler supports none of these.\"\n" &
@@ -266,7 +289,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       name = verifyProcName,
       body = verifyBody,
     )
-    verifyProc.addPragma(ident("used"))
+    verifyProc.addPragma(ident("exportc"))
+    verifyProc.addPragma(newNimNode(nnkExprColonExpr).add(
+      ident("codegenDecl"),
+      newStrLitNode("static $# $#$#")
+    ))
     result.add(verifyProc)
 
   # loadXxx*(): LoadResult
@@ -314,7 +341,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
       var procTy = newNimNode(nnkProcTy)
       procTy.add(p.formalParams.copy())
-      procTy.add(newNimNode(nnkPragma).add(ident(p.callConv)))
+      procTy.add(newNimNode(nnkPragma).add(
+        ident(p.callConv),
+        newNimNode(nnkExprColonExpr).add(
+          ident("raises"), newNimNode(nnkBracket)
+        )
+      ))
 
       # let sym = handle.symAddr("name")
       loadBody.add(newLetStmt(tempSym, newCall(ident("symAddr"), handleName, symName)))
@@ -351,7 +383,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
       var procTy = newNimNode(nnkProcTy)
       procTy.add(p.formalParams.copy())
-      procTy.add(newNimNode(nnkPragma).add(ident(p.callConv)))
+      procTy.add(newNimNode(nnkPragma).add(
+        ident(p.callConv),
+        newNimNode(nnkExprColonExpr).add(
+          ident("raises"), newNimNode(nnkBracket)
+        )
+      ))
 
       # let sym = handle.symAddr("name")
       loadBody.add(newLetStmt(tempSym, newCall(ident("symAddr"), handleName, symName)))
@@ -479,11 +516,16 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     for i in 0 ..< p.formalParams.len:
       params.add(p.formalParams[i].copy())
 
-    result.add(newProc(
+    var wrapperProc = newProc(
       name = postfix(p.name.copy(), "*"),
       params = params,
       body = wrapperBody,
+    )
+    wrapperProc.addPragma(newNimNode(nnkExprColonExpr).add(
+      ident("raises"),
+      newNimNode(nnkBracket).add(ident("SoftlinkError"))
     ))
+    result.add(wrapperProc)
 
     # xxxAvailable*(): bool for optional symbols
     if p.isOptional:
@@ -493,3 +535,102 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         params = [ident("bool")],
         body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
       ))
+
+macro dyntype*(headerFile: static[string], body: untyped): untyped =
+  ## Verify Nim struct layouts match C header struct definitions at compile time.
+  ## Emits ``_Static_assert(sizeof(NimType) == sizeof(CType))`` for each type.
+  if headerFile.len == 0:
+    error("dyntype requires a header file path", body)
+
+  result = newStmtList()
+
+  type TypeInfo = object
+    nimName: NimNode
+    ctype: string
+
+  var types: seq[TypeInfo]
+  var seenNames: HashSet[string]
+
+  for stmt in body:
+    if stmt.kind != nnkTypeSection:
+      error("dyntype body must contain only type definitions", stmt)
+
+    # Extract type info and strip ctype pragma before passing through
+    let cleanStmt = stmt.copy()
+    for i, typeDef in cleanStmt:
+      # Unwrap PragmaExpr and nnkPostfix (exported types: type Foo* = ...)
+      var rawName = if typeDef[0].kind == nnkPragmaExpr: typeDef[0][0]
+                    else: typeDef[0]
+      let nimName = if rawName.kind == nnkPostfix: rawName[1]
+                    else: rawName
+      let nameStr = $nimName
+
+      # Duplicate detection
+      if nameStr in seenNames:
+        error("duplicate type '" & nameStr & "' in dyntype block", typeDef)
+      seenNames.incl(nameStr)
+
+      var ctype = ""
+
+      # Check pragmas for ctype
+      if typeDef[0].kind == nnkPragmaExpr:
+        let pragmas = typeDef[0][1]
+        for pragma in pragmas:
+          if pragma.kind == nnkExprColonExpr and $pragma[0] == "ctype":
+            ctype = pragma[1].strVal
+          else:
+            let pname = if pragma.kind == nnkIdent: $pragma
+                        elif pragma.kind == nnkExprColonExpr: $pragma[0]
+                        else: ""
+            if pname != "":
+              error("dyntype does not support pragma '" & pname &
+                    "' on type '" & $nimName & "'", pragma)
+
+        # Strip the ctype pragma — replace PragmaExpr with rawName
+        # (preserves nnkPostfix for exported types)
+        cleanStmt[i][0] = rawName
+
+      if ctype == "":
+        error("type '" & $nimName &
+              "' must specify a ctype pragma (e.g., {.ctype: \"my_struct_t\".})", typeDef)
+
+      types.add(TypeInfo(nimName: nimName, ctype: ctype))
+
+    result.add(cleanStmt)
+
+  # Emit #include
+  result.add(newNimNode(nnkPragma).add(
+    newNimNode(nnkExprColonExpr).add(
+      ident("emit"),
+      newStrLitNode("/*INCLUDESECTION*/\n" & toIncludeDirective(headerFile))
+    )
+  ))
+
+  # Emit sizeof verification at file scope per type
+  for t in types:
+    var emitArray = newNimNode(nnkBracket)
+    emitArray.add(newStrLitNode(
+      "\n#if defined(__cplusplus)\n" &
+      "static_assert(sizeof("
+    ))
+    emitArray.add(t.nimName)
+    emitArray.add(newStrLitNode(
+      ") == sizeof(" & t.ctype & "),\n" &
+      "  \"softlink dyntype: " & $t.nimName & " size mismatch vs " & headerFile &
+      " (" & t.ctype & ")\");\n" &
+      "#else\n" &
+      "_Static_assert(sizeof("
+    ))
+    emitArray.add(t.nimName)
+    emitArray.add(newStrLitNode(
+      ") == sizeof(" & t.ctype & "),\n" &
+      "  \"softlink dyntype: " & $t.nimName & " size mismatch vs " & headerFile &
+      " (" & t.ctype & ")\");\n" &
+      "#endif\n"
+    ))
+    result.add(newNimNode(nnkPragma).add(
+      newNimNode(nnkExprColonExpr).add(
+        ident("emit"),
+        emitArray
+      )
+    ))
