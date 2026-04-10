@@ -235,48 +235,83 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # the assertions cannot be eliminated by link-time optimization.
     var verifyBody = newStmtList()
     for p in procs:
+      # Generate dummy variables for each param — Nim emits typed C locals.
+      # These are passed to the C function call, enabling const-tolerant
+      # param checking (int* implicitly converts to const int* in C).
+      var dummyVars: seq[NimNode]
+      for i in 1 ..< p.formalParams.len:
+        let identDefs = p.formalParams[i]
+        let paramType = identDefs[^2]  # type is second-to-last
+        for j in 0 ..< identDefs.len - 2:  # one var per name
+          let dummyName = genSym(nskVar, "softlinkP")
+          var varSection = newNimNode(nnkVarSection).add(
+            newNimNode(nnkIdentDefs).add(dummyName, paramType.copy(), newEmptyNode())
+          )
+          # Add {.used, noinit.} pragmas
+          let pragmaExpr = newNimNode(nnkPragmaExpr).add(dummyName, newNimNode(nnkPragma).add(
+            ident("used"), ident("noinit")
+          ))
+          varSection[0][0] = pragmaExpr
+          verifyBody.add(varSection)
+          dummyVars.add(dummyName)
+
+      # Build the call expression arguments for emit: "symbol(p1, p2, ...)"
+      # Each dummy var is a Nim node resolved to its C name via emit array.
+      let errMsg = "softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile
+
+      # Helper: build the call args portion of emit array
+      # Result: [symName, "(", p1, ", ", p2, ", ", ..., ")"]
+      proc buildCallArgs(emitArr: var NimNode, symName: string, vars: seq[NimNode]) =
+        emitArr.add(newStrLitNode(symName & "("))
+        for i, v in vars:
+          if i > 0: emitArr.add(newStrLitNode(", "))
+          emitArr.add(v)
+        emitArr.add(newStrLitNode(")"))
+
       var emitArray = newNimNode(nnkBracket)
+
+      # --- C++ path: static_assert + std::is_same + decltype ---
       emitArray.add(newStrLitNode(
-        "\n#if defined(__cplusplus)\n" &
-        "/* C++ path: static_assert + std::is_same + decltype */\n" &
-        "static_assert(\n" &
-        "  (std::is_same<decltype(&" & p.nameStr & "), decltype("
-      ))
-      emitArray.add(p.ptrName)
+        "\n#if defined(__cplusplus)\nstatic_assert(\n  std::is_same<decltype("))
+      buildCallArgs(emitArray, p.nameStr, dummyVars)
+      emitArray.add(newStrLitNode("), "))
+      if p.hasReturn:
+        emitArray.add(p.formalParams[0].copy())  # return type node
+      else:
+        emitArray.add(newStrLitNode("void"))
       emitArray.add(newStrLitNode(
-        ")>::value),\n" &
-        "  \"softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
-        ");\n" &
-        "#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n" &
-        "/* C23 path: typeof (fully standard) */\n" &
-        "_Static_assert(\n" &
-        "  _Generic(&" & p.nameStr & ",\n" &
-        "    typeof("
-      ))
-      emitArray.add(p.ptrName)
+        ">::value,\n  \"" & errMsg & "\"\n);\n"))
+
+      # --- GCC/Clang path: __builtin_types_compatible_p + __typeof__ ---
       emitArray.add(newStrLitNode(
-        "): 1,\n" &
-        "    default: 0\n" &
-        "  ),\n" &
-        "  \"softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
-        ");\n" &
-        "#elif defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)\n" &
-        "/* C11 + extensions: __typeof__ */\n" &
-        "_Static_assert(\n" &
-        "  _Generic(&" & p.nameStr & ",\n" &
-        "    __typeof__("
-      ))
-      emitArray.add(p.ptrName)
+        "#elif defined(__GNUC__)\n_Static_assert(\n  __builtin_types_compatible_p(\n    __typeof__("))
+      buildCallArgs(emitArray, p.nameStr, dummyVars)
+      emitArray.add(newStrLitNode("),\n    "))
+      if p.hasReturn:
+        emitArray.add(p.formalParams[0].copy())
+      else:
+        emitArray.add(newStrLitNode("void"))
       emitArray.add(newStrLitNode(
-        "): 1,\n" &
-        "    default: 0\n" &
-        "  ),\n" &
-        "  \"softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile & "\"\n" &
-        ");\n" &
-        "#else\n" &
-        "#error \"softlink: header verification requires C23 typeof, GNU __typeof__, or C++ decltype. Your compiler supports none of these.\"\n" &
-        "#endif\n"
-      ))
+        "),\n  \"" & errMsg & "\"\n);\n"))
+
+      # --- MSVC C path: call + __typeof__ pointer trick ---
+      emitArray.add(newStrLitNode(
+        "#elif defined(_MSC_VER)\n"))
+      buildCallArgs(emitArray, p.nameStr, dummyVars)
+      emitArray.add(newStrLitNode(";\n_Static_assert(\n  _Generic((__typeof__("))
+      buildCallArgs(emitArray, p.nameStr, dummyVars)
+      emitArray.add(newStrLitNode(")*)0,\n    "))
+      if p.hasReturn:
+        emitArray.add(p.formalParams[0].copy())
+      else:
+        emitArray.add(newStrLitNode("void"))
+      emitArray.add(newStrLitNode(
+        "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
+
+      # --- Fallback ---
+      emitArray.add(newStrLitNode(
+        "#else\n#error \"softlink: header verification requires GCC, Clang, MSVC, or a C++ compiler.\"\n#endif\n"))
+
       verifyBody.add(newNimNode(nnkPragma).add(
         newNimNode(nnkExprColonExpr).add(
           ident("emit"),
@@ -535,6 +570,23 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         params = [ident("bool")],
         body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
       ))
+
+    # xxxPtr*(): pointer — raw function pointer for C callback passing.
+    # Returns the dlsym'd pointer directly (nil if not loaded). No nil
+    # check — the load function is the single enforcement point.
+    let ptrAccessorName = ident(p.nameStr & "Ptr")
+    var ptrAccessorProc = newProc(
+      name = postfix(ptrAccessorName, "*"),
+      params = [ident("pointer")],
+      body = newStmtList(
+        newNimNode(nnkCast).add(ident("pointer"), p.ptrName)
+      ),
+    )
+    ptrAccessorProc.addPragma(newNimNode(nnkExprColonExpr).add(
+      ident("raises"),
+      newNimNode(nnkBracket)
+    ))
+    result.add(ptrAccessorProc)
 
 macro dyntype*(headerFile: static[string], body: untyped): untyped =
   ## Verify Nim struct layouts match C header struct definitions at compile time.

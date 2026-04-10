@@ -281,3 +281,23 @@ when defined(linux):
         ceil(1.1)
       check loadM().kind == lrOk
       check usesCeil() == 2.0
+
+  suite "softlink — callback pointers":
+    test "xxxPtr returns raw pointer for callback use":
+      check loadM().kind == lrOk
+      let p = ceilPtr()
+      check p != nil
+      # Call through the raw pointer to verify it works
+      let fn = cast[proc(x: cdouble): cdouble {.cdecl.}](p)
+      check fn(2.3) == 3.0
+
+    test "xxxPtr returns nil when not loaded":
+      unloadM()
+      check ceilPtr() == nil
+
+    test "xxxPtr is compatible with pointer params (no raises annotation)":
+      # This compiles only if xxxPtr returns plain pointer without {.raises.}
+      proc takesCallback(cb: pointer) {.raises: [].} =
+        discard cb
+      check loadM().kind == lrOk
+      takesCallback(ceilPtr())

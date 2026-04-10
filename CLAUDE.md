@@ -37,7 +37,7 @@ The library name is derived from the pattern string: `"libmbedtls.so(.16|)"` bec
 
 - **Required by default, optional per-symbol**: required symbols cause load failure if missing (all-or-nothing for required). Optional symbols (`{.optional.}` pragma) are silently skipped, with `xxxAvailable*(): bool` checks generated.
 - **Explicit calling convention required**: the macro requires `{.cdecl.}`, `{.stdcall.}`, etc. — no default. Supports `cdecl`, `stdcall`, `fastcall`, `syscall`, `noconv`.
-- **Required `header` pragma**: every proc must specify `{.header: "foo.h".}`. The macro emits `_Static_assert` + `_Generic` checks that verify each symbol's type against the C header at compile time — no `.so` needed, only the header files.
+- **Required `header` pragma**: every proc must specify `{.header: "foo.h".}` (or `{.header: "<foo.h>".}` for angle-bracket includes). The macro emits call-based `_Static_assert` checks that verify each symbol's signature against the C header at compile time — const-tolerant, no `.so` needed, only the header files. Three-tier fallback: C++ `decltype`+`is_same`, GCC/Clang `__builtin_types_compatible_p`+`__typeof__`, MSVC `_Generic`+`__typeof__` pointer trick.
 - **Pragma allowlist**: only calling conventions + `optional` + `header` are accepted. Unsupported pragmas (e.g., `varargs`) produce compile-time errors.
 - **No thread safety guarantees**: `loadLib` is not thread-safe on all platforms.
 
@@ -58,4 +58,4 @@ Key design decisions for `dyntype`:
 
 ## Testing
 
-Tests bind against system libraries (libm, libc) and a custom test library (testlib) in Docker. See `tests/test_softlink.nim` for full coverage (34 tests covering load, unload, reload, idempotent caching, optional symbols, dangling pointer regression, compile-time validation, and struct layout verification).
+Tests bind against system libraries (libm, libc) and a custom test library (testlib) in Docker. See `tests/test_softlink.nim` for full coverage (37 tests covering load, unload, reload, idempotent caching, optional symbols, dangling pointer regression, compile-time validation, and struct layout verification).

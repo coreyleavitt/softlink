@@ -173,15 +173,15 @@ Every proc requires a `header` pragma pointing to the C header that declares it.
 
 ### How header verification works
 
-The macro generates a verification function containing compile-time assertions for each declared symbol. It uses a three-tier fallback to support all major compilers and Nim backends:
+The macro generates a verification function containing compile-time assertions for each declared symbol. It calls the C function with dummy arguments matching your Nim types, then verifies the return type — catching wrong parameter types, wrong parameter count, wrong return types, and misspelled symbols. The comparison is **const-tolerant**: Nim's `ptr T` (which generates `T*` in C) is accepted where the header declares `const T*`, since `const` differences are ABI-safe.
 
-1. **C++ backend** (`--backend:cpp`): `static_assert` with `std::is_same<decltype(&symbol), decltype(fp_var)>`
-2. **C23 compilers**: `_Static_assert` with `_Generic(&symbol, typeof(fp_var): 1, default: 0)`
-3. **C11 + extensions** (default): `_Static_assert` with `_Generic(&symbol, __typeof__(fp_var): 1, default: 0)`
+Three-tier fallback for compiler compatibility:
 
-Both sides of the comparison are derived automatically — `&symbol` gets its type from the `#include`d C header, and `fp_var` is Nim's generated function pointer with your declared signature. No manual type mapping is involved.
+1. **C++ backend** (`--backend:cpp`): `static_assert` with `std::is_same<decltype(symbol(args...)), return_type>`
+2. **GCC/Clang** (default): `_Static_assert` with `__builtin_types_compatible_p(__typeof__(symbol(args...)), return_type)`
+3. **MSVC C mode**: Call expression + `_Static_assert` with `_Generic` + `__typeof__` pointer trick
 
-**Compiler requirements:** Any compiler that supports C11 `_Generic` plus `__typeof__` (GCC, Clang, MSVC 2022+, TCC, ICC), or any C++ compiler with C++11 `decltype`. If your compiler supports none of these, compilation will fail with an explicit error message.
+**Compiler requirements:** GCC, Clang, MSVC 2022+, or any C++ compiler with C++11 `decltype`. If your compiler supports none of these, compilation will fail with an explicit error message.
 
 ## Struct Layout Verification (`dyntype`)
 
