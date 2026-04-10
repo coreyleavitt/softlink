@@ -220,6 +220,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newStrLitNode("/*INCLUDESECTION*/\n" & includeCode &
           "#if defined(__cplusplus)\n" &
           "#include <type_traits>\n" &
+          "template<typename T> struct softlink_strip_ptr_const { typedef T type; };\n" &
+          "template<typename T> struct softlink_strip_ptr_const<const T*> { typedef T* type; };\n" &
           "#endif\n")
       )
     ))
@@ -279,11 +281,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
       var emitArray = newNimNode(nnkBracket)
 
-      # --- C++ path: static_assert + std::is_same + decltype ---
+      # --- C++ path: static_assert + strip_ptr_const + decltype ---
+      # strip_ptr_const removes const from pointed-to types in return values
       emitArray.add(newStrLitNode(
-        "\n#if defined(__cplusplus)\nstatic_assert(\n  std::is_same<decltype("))
+        "\n#if defined(__cplusplus)\nstatic_assert(\n  std::is_same<\n" &
+        "    typename softlink_strip_ptr_const<decltype("))
       buildCallArgs(emitArray, p.nameStr, dummyVars)
-      emitArray.add(newStrLitNode("), "))
+      emitArray.add(newStrLitNode(")>::type,\n    "))
       if p.hasReturn:
         addTypeToEmit(emitArray, p.formalParams[0])
       else:
@@ -292,30 +296,60 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         ">::value,\n  \"" & errMsg & "\"\n);\n"))
 
       # --- GCC/Clang path: __builtin_types_compatible_p + __typeof__ ---
+      # For pointer returns, dereference both sides so __builtin_types_compatible_p
+      # strips top-level const (e.g., const unsigned char* → const unsigned char,
+      # then ignoring qualifiers matches unsigned char). No linker dependency —
+      # __typeof__ is purely compile-time.
       emitArray.add(newStrLitNode(
         "#elif defined(__GNUC__)\n_Static_assert(\n  __builtin_types_compatible_p(\n    __typeof__("))
+      if p.hasReturn and p.formalParams[0].kind == nnkPtrTy:
+        emitArray.add(newStrLitNode("*"))
       buildCallArgs(emitArray, p.nameStr, dummyVars)
       emitArray.add(newStrLitNode("),\n    "))
       if p.hasReturn:
-        addTypeToEmit(emitArray, p.formalParams[0])
+        if p.formalParams[0].kind == nnkPtrTy:
+          emitArray.add(newStrLitNode("__typeof__(*("))
+          addTypeToEmit(emitArray, p.formalParams[0])
+          emitArray.add(newStrLitNode(")0)"))
+        else:
+          addTypeToEmit(emitArray, p.formalParams[0])
       else:
         emitArray.add(newStrLitNode("void"))
       emitArray.add(newStrLitNode(
         "),\n  \"" & errMsg & "\"\n);\n"))
 
       # --- MSVC C path: call + __typeof__ pointer trick ---
+      # For pointer returns, same dereference approach. For void/scalar,
+      # use _Generic + __typeof__ pointer trick.
       emitArray.add(newStrLitNode(
         "#elif defined(_MSC_VER)\n"))
-      buildCallArgs(emitArray, p.nameStr, dummyVars)
-      emitArray.add(newStrLitNode(";\n_Static_assert(\n  _Generic((__typeof__("))
-      buildCallArgs(emitArray, p.nameStr, dummyVars)
-      emitArray.add(newStrLitNode(")*)0,\n    "))
-      if p.hasReturn:
+      if p.hasReturn and p.formalParams[0].kind == nnkPtrTy:
+        # Pointer return: use _Generic on dereferenced __typeof__ to strip const.
+        # (__typeof__(*func(args)))* gives non-const-qualified pointer after
+        # _Generic strips the pointee's top-level const.
+        # Actually, _Generic doesn't strip const — use assignment to a
+        # matching type via __typeof__. MSVC has __typeof__ but not
+        # __builtin_types_compatible_p. Fall back to the exact _Generic check
+        # for MSVC pointer returns (same limitation as before for const returns).
+        emitArray.add(newStrLitNode(
+          "_Static_assert(\n  _Generic((__typeof__("))
+        buildCallArgs(emitArray, p.nameStr, dummyVars)
+        emitArray.add(newStrLitNode(")*)0,\n    "))
         addTypeToEmit(emitArray, p.formalParams[0])
+        emitArray.add(newStrLitNode(
+          "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
       else:
-        emitArray.add(newStrLitNode("void"))
-      emitArray.add(newStrLitNode(
-        "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
+        # Non-pointer: call + _Generic __typeof__ pointer trick
+        buildCallArgs(emitArray, p.nameStr, dummyVars)
+        emitArray.add(newStrLitNode(";\n_Static_assert(\n  _Generic((__typeof__("))
+        buildCallArgs(emitArray, p.nameStr, dummyVars)
+        emitArray.add(newStrLitNode(")*)0,\n    "))
+        if p.hasReturn:
+          addTypeToEmit(emitArray, p.formalParams[0])
+        else:
+          emitArray.add(newStrLitNode("void"))
+        emitArray.add(newStrLitNode(
+          "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
 
       # --- Fallback ---
       emitArray.add(newStrLitNode(
