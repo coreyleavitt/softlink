@@ -268,6 +268,15 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           emitArr.add(v)
         emitArr.add(newStrLitNode(")"))
 
+      # Helper: add a type node to emit array, handling compound nodes
+      # like nnkPtrTy that the C emitter can't render directly.
+      proc addTypeToEmit(emitArr: var NimNode, typeNode: NimNode) =
+        if typeNode.kind == nnkPtrTy:
+          addTypeToEmit(emitArr, typeNode[0])
+          emitArr.add(newStrLitNode("*"))
+        else:
+          emitArr.add(typeNode.copy())
+
       var emitArray = newNimNode(nnkBracket)
 
       # --- C++ path: static_assert + std::is_same + decltype ---
@@ -276,7 +285,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       buildCallArgs(emitArray, p.nameStr, dummyVars)
       emitArray.add(newStrLitNode("), "))
       if p.hasReturn:
-        emitArray.add(p.formalParams[0].copy())  # return type node
+        addTypeToEmit(emitArray, p.formalParams[0])
       else:
         emitArray.add(newStrLitNode("void"))
       emitArray.add(newStrLitNode(
@@ -288,7 +297,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       buildCallArgs(emitArray, p.nameStr, dummyVars)
       emitArray.add(newStrLitNode("),\n    "))
       if p.hasReturn:
-        emitArray.add(p.formalParams[0].copy())
+        addTypeToEmit(emitArray, p.formalParams[0])
       else:
         emitArray.add(newStrLitNode("void"))
       emitArray.add(newStrLitNode(
@@ -302,7 +311,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       buildCallArgs(emitArray, p.nameStr, dummyVars)
       emitArray.add(newStrLitNode(")*)0,\n    "))
       if p.hasReturn:
-        emitArray.add(p.formalParams[0].copy())
+        addTypeToEmit(emitArray, p.formalParams[0])
       else:
         emitArray.add(newStrLitNode("void"))
       emitArray.add(newStrLitNode(
