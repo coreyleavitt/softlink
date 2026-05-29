@@ -220,8 +220,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newStrLitNode("/*INCLUDESECTION*/\n" & includeCode &
           "#if defined(__cplusplus)\n" &
           "#include <type_traits>\n" &
+          "#ifndef SOFTLINK_STRIP_PTR_CONST_DEFINED\n" &
+          "#define SOFTLINK_STRIP_PTR_CONST_DEFINED 1\n" &
           "template<typename T> struct softlink_strip_ptr_const { typedef T type; };\n" &
           "template<typename T> struct softlink_strip_ptr_const<const T*> { typedef T* type; };\n" &
+          "#endif\n" &
           "#endif\n")
       )
     ))
@@ -300,14 +303,28 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # strips top-level const (e.g., const unsigned char* → const unsigned char,
       # then ignoring qualifiers matches unsigned char). No linker dependency —
       # __typeof__ is purely compile-time.
+      #
+      # "Pointer return" here covers both `ptr T` (nnkPtrTy in Nim AST) and
+      # Nim's pointer-typed aliases that aren't structurally nnkPtrTy but
+      # emit as pointer types in C (`cstring` → `char*`, `cstringArray` →
+      # `char**`, `pointer` → `void*`). Without the alias check, a proc
+      # returning `cstring` against a C function declared `const char *`
+      # (e.g., libc's `strerror`, libz3's `Z3_string`) is rejected as a
+      # signature mismatch even though it's a perfectly valid binding —
+      # see #11.
+      let retIsPointerLike =
+        p.hasReturn and (
+          p.formalParams[0].kind == nnkPtrTy or
+          (p.formalParams[0].kind in {nnkIdent, nnkSym} and
+           $p.formalParams[0] in ["cstring", "cstringArray", "pointer"]))
       emitArray.add(newStrLitNode(
         "#elif defined(__GNUC__)\n_Static_assert(\n  __builtin_types_compatible_p(\n    __typeof__("))
-      if p.hasReturn and p.formalParams[0].kind == nnkPtrTy:
+      if retIsPointerLike:
         emitArray.add(newStrLitNode("*"))
       buildCallArgs(emitArray, p.nameStr, dummyVars)
       emitArray.add(newStrLitNode("),\n    "))
       if p.hasReturn:
-        if p.formalParams[0].kind == nnkPtrTy:
+        if retIsPointerLike:
           emitArray.add(newStrLitNode("__typeof__(*("))
           addTypeToEmit(emitArray, p.formalParams[0])
           emitArray.add(newStrLitNode(")0)"))
@@ -320,10 +337,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
       # --- MSVC C path: call + __typeof__ pointer trick ---
       # For pointer returns, same dereference approach. For void/scalar,
-      # use _Generic + __typeof__ pointer trick.
+      # use _Generic + __typeof__ pointer trick. `retIsPointerLike` (set
+      # above for the GCC path) classifies cstring/cstringArray/pointer
+      # alongside nnkPtrTy — same #11 fix applies here.
       emitArray.add(newStrLitNode(
         "#elif defined(_MSC_VER)\n"))
-      if p.hasReturn and p.formalParams[0].kind == nnkPtrTy:
+      if retIsPointerLike:
         # Pointer return: use _Generic on dereferenced __typeof__ to strip const.
         # (__typeof__(*func(args)))* gives non-const-qualified pointer after
         # _Generic strips the pointee's top-level const.
@@ -368,9 +387,27 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       body = verifyBody,
     )
     verifyProc.addPragma(ident("exportc"))
+    # codegenDecl chooses the storage-class qualifier for the verify proc:
+    #
+    # - **C backend** (`nim c`): `static` gives the function internal
+    #   linkage (file scope, no symbol exported, no linker collisions
+    #   when the same dynlib block appears in multiple TUs).
+    #
+    # - **C++ backend** (`nim cpp`): `static` cannot appear inside a
+    #   linkage specification per C++ [dcl.link]/4. Because Nim's
+    #   `{.exportc.}` emits `extern "C" ...` under cpp, combining with
+    #   `static` produces `extern "C" static void ...` which g++/clang++
+    #   reject. `inline` is the C++ equivalent: ODR-relaxed (multiple
+    #   definitions across TUs are merged) and compatible with
+    #   `extern "C"`. The verify proc only contains compile-time
+    #   `_Static_assert` / `static_assert`s, so no runtime overhead
+    #   distinguishes the two. See #12.
+    let codegenTemplate =
+      when defined(cpp): "inline $# $#$#"
+      else: "static $# $#$#"
     verifyProc.addPragma(newNimNode(nnkExprColonExpr).add(
       ident("codegenDecl"),
-      newStrLitNode("static $# $#$#")
+      newStrLitNode(codegenTemplate)
     ))
     result.add(verifyProc)
 

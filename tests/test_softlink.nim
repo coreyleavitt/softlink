@@ -32,6 +32,13 @@ dynlib TestLib:
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
+  # Regression: #11 — const-qualified pointer returns must verify
+  # against cstring without "signature mismatch" errors under any
+  # backend. testlib_const_string returns `const char *`; binding
+  # as `cstring` should be accepted.
+  proc testlib_const_string(): cstring {.cdecl, header: "tests/testlib.h".}
+  proc testlib_const_lookup(key: cint): cstring {.cdecl, header: "tests/testlib.h".}
+  proc testlib_mutable_string(): cstring {.cdecl, header: "tests/testlib.h".}
 
 suite "softlink":
   # System library tests — Linux only
@@ -113,6 +120,27 @@ suite "softlink":
     check loadTestlib().kind in {lrOk, lrOkPartial}
     expect SoftlinkError:
       discard testlib_future()
+
+  # Regression: #11 — const-qualified pointer returns must bind to
+  # cstring without a "signature mismatch vs testlib.h" error under
+  # any backend. Before the fix, the GCC pathway compared
+  # `const char *` to `char *` directly and rejected as incompatible.
+  # The fix dereferences both sides so `__builtin_types_compatible_p`
+  # sees `const char` vs `char` — top-level qualifiers ignored,
+  # types match.
+  test "testlib: const char* return binds to cstring (#11)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check $testlib_const_string() == "hello from testlib"
+
+  test "testlib: const char* return with arg (#11)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check $testlib_const_lookup(0.cint) == "zero"
+    check $testlib_const_lookup(2.cint) == "two"
+    check $testlib_const_lookup(99.cint) == "out-of-range"
+
+  test "testlib: non-const char* return still works (#11 regression baseline)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check $testlib_mutable_string() == "mutable"
 
   test "testlib: unload nils function pointers":
     check loadTestlib().kind in {lrOk, lrOkPartial}
