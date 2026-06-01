@@ -1,10 +1,13 @@
 ## softlink — Type-safe optional dynamic library bindings for Nim.
 ##
 ## Provides a `dynlib` macro that generates runtime-loadable FFI bindings
-## from type-safe proc definitions, and a `dyntype` macro for compile-time
-## struct layout verification against C headers. Solves the Nim ecosystem
-## gap between `{.importc, dynlib.}` (type-safe but fatal on missing) and
-## `std/dynlib` (optional but loses type safety).
+## from type-safe proc definitions, a `dyntype` macro for compile-time struct
+## layout verification against C headers, and a `verifyProcs` macro that emits
+## the same proc-signature verification standalone (for statically-linked
+## `{.importc.}` bindings that want softlink's `_Static_assert` checking
+## without runtime loading). Solves the Nim ecosystem gap between
+## `{.importc, dynlib.}` (type-safe but fatal on missing) and `std/dynlib`
+## (optional but loses type safety).
 
 when defined(js):
   {.error: "softlink requires a native backend (C, C++, or Objective-C). The JavaScript backend does not support dynamic library loading.".}
@@ -68,52 +71,8 @@ func libNameToIdent(libPattern: string): string =
     clean[0] = clean[0].toUpperAscii()
   clean
 
-macro dynlib*(libPattern: static[string], body: untyped): untyped =
-  ## Generate type-safe, runtime-optional bindings for a dynamic library.
-  ## The generated ``loadXxx``/``unloadXxx`` procs are **not thread-safe**.
-  ## Wrapper proc calls must also not race with ``unloadXxx`` — the loaded
-  ## state and function pointer dispatch are not atomic.
-  ## Callers must synchronize externally if using from multiple threads.
-  let baseName = libNameToIdent(libPattern)
-  if baseName.len == 0:
-    error("cannot derive identifier from dynlib pattern '" & libPattern & "'", body)
-  if not baseName[0].isAlphaAscii:
-    error("dynlib pattern '" & libPattern & "' produces invalid identifier '" &
-          baseName & "' (must start with a letter)", body)
-  let baseNameLower = baseName.toLowerAscii()
-  let loadProcName = ident("load" & baseName)
-  let unloadProcName = ident("unload" & baseName)
-  let loadedProcName = ident(baseNameLower & "Loaded")
-  let handleName = ident("softlinkHandle" & baseName)
-  let cachedResultName = ident("softlinkResult" & baseName)
-  let libPatternLit = newStrLitNode(libPattern)
-
-  result = newStmtList()
-
-  # var handle: LibHandle
-  result.add(newNimNode(nnkVarSection).add(
-    newNimNode(nnkIdentDefs).add(
-      handleName,
-      ident("LibHandle"),
-      newEmptyNode()
-    )
-  ))
-
-  # var cachedResult: LoadResult — zero-initializes to lrOk, but the
-  # idempotent guard checks the handle (nil before first load), so
-  # this value is never returned to callers before loadXxx runs.
-  result.add(newNimNode(nnkVarSection).add(
-    newNimNode(nnkIdentDefs).add(
-      cachedResultName,
-      ident("LoadResult"),
-      newEmptyNode()
-    )
-  ))
-
-  # Collect proc info and generate pointer vars
-  const callingConventions = ["cdecl", "stdcall", "fastcall", "syscall", "noconv"]
-
-  type ProcInfo = object
+type
+  SoftlinkProc* = object
     name: NimNode
     nameStr: string
     ptrName: NimNode
@@ -123,81 +82,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     isOptional: bool
     hasReturn: bool
 
-  var procs: seq[ProcInfo]
-  var seenNames: HashSet[string]
-
-  for stmt in body:
-    if stmt.kind != nnkProcDef:
-      error("dynlib body must contain only proc declarations", stmt)
-
-    let procName = stmt[0]
-    let nameStr = $procName
-    let ptrName = ident("softlinkFp" & baseName & nameStr)
-    let formalParams = stmt[3]
-    let hasReturn = formalParams[0].kind != nnkEmpty
-
-    # Duplicate detection
-    if nameStr in seenNames:
-      error("duplicate proc '" & nameStr & "' in dynlib block", stmt)
-    seenNames.incl(nameStr)
-
-    # Pragma validation: extract calling convention, optional flag, and header
-    var callConv = ""
-    var isOptional = false
-    var headerFile = ""
-    let pragmas = stmt[4]
-    if pragmas.kind == nnkPragma:
-      for pragma in pragmas:
-        let pragmaName = if pragma.kind == nnkIdent: $pragma
-                         elif pragma.kind == nnkExprColonExpr: $pragma[0]
-                         else: ""
-        if pragmaName in callingConventions:
-          if callConv != "":
-            error("proc '" & nameStr & "' has multiple calling conventions", stmt)
-          callConv = pragmaName
-        elif pragmaName == "optional":
-          isOptional = true
-        elif pragmaName == "header":
-          if pragma.kind == nnkExprColonExpr:
-            headerFile = pragma[1].strVal
-          else:
-            error("header pragma requires a value (e.g., {.header: \"foo.h\".})", stmt)
-        elif pragmaName != "":
-          error("dynlib does not support pragma '" & pragmaName &
-                "' on proc '" & nameStr & "'", stmt)
-
-    if callConv == "":
-      error("proc '" & nameStr &
-            "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
-    if headerFile == "":
-      error("proc '" & nameStr &
-            "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
-
-    procs.add(ProcInfo(name: procName, nameStr: nameStr, ptrName: ptrName,
-                        formalParams: formalParams, callConv: callConv,
-                        headerFile: headerFile, isOptional: isOptional,
-                        hasReturn: hasReturn))
-
-    # Build proc type for the var — C functions can't raise Nim exceptions
-    var procTy = newNimNode(nnkProcTy)
-    procTy.add(formalParams.copy())
-    procTy.add(newNimNode(nnkPragma).add(
-      ident(callConv),
-      newNimNode(nnkExprColonExpr).add(
-        ident("raises"),
-        newNimNode(nnkBracket)
-      )
-    ))
-
-    # var fpXxx: proc(...) {.callConv.}
-    result.add(newNimNode(nnkVarSection).add(
-      newNimNode(nnkIdentDefs).add(
-        ptrName,
-        procTy,
-        newEmptyNode()
-      )
-    ))
-
+proc genVerifyBlock(procs: seq[SoftlinkProc], tag: string): seq[NimNode] =
+  ## Generate the compile-time C header signature verification nodes
+  ## (include section + a file-local _Static_assert proc). Shared by
+  ## `dynlib` and `verifyProcs`.
+  var nodes: seq[NimNode] = @[]
   # Compile-time header verification. Compares each symbol's type from
   # the C header against Nim's generated function pointer type.
   # Three-tier fallback for maximum compiler compatibility:
@@ -214,7 +103,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         includeCode.add(toIncludeDirective(p.headerFile))
 
     # Emit #include directives + C++ type_traits if needed
-    result.add(newNimNode(nnkPragma).add(
+    nodes.add(newNimNode(nnkPragma).add(
       newNimNode(nnkExprColonExpr).add(
         ident("emit"),
         newStrLitNode("/*INCLUDESECTION*/\n" & includeCode &
@@ -262,7 +151,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
       # Build the call expression arguments for emit: "symbol(p1, p2, ...)"
       # Each dummy var is a Nim node resolved to its C name via emit array.
-      let errMsg = "softlink dynlib: " & p.nameStr & " signature mismatch vs " & p.headerFile
+      let errMsg = "softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile
 
       # Helper: build the call args portion of emit array
       # Result: [symName, "(", p1, ", ", p2, ", ", ..., ")"]
@@ -381,7 +270,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         )
       ))
 
-    let verifyProcName = ident("softlinkVerify" & baseName)
+    let verifyProcName = ident("softlinkVerify" & tag)
     var verifyProc = newProc(
       name = verifyProcName,
       body = verifyBody,
@@ -409,7 +298,132 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       ident("codegenDecl"),
       newStrLitNode(codegenTemplate)
     ))
-    result.add(verifyProc)
+    nodes.add(verifyProc)
+  return nodes
+
+macro dynlib*(libPattern: static[string], body: untyped): untyped =
+  ## Generate type-safe, runtime-optional bindings for a dynamic library.
+  ## The generated ``loadXxx``/``unloadXxx`` procs are **not thread-safe**.
+  ## Wrapper proc calls must also not race with ``unloadXxx`` — the loaded
+  ## state and function pointer dispatch are not atomic.
+  ## Callers must synchronize externally if using from multiple threads.
+  let baseName = libNameToIdent(libPattern)
+  if baseName.len == 0:
+    error("cannot derive identifier from dynlib pattern '" & libPattern & "'", body)
+  if not baseName[0].isAlphaAscii:
+    error("dynlib pattern '" & libPattern & "' produces invalid identifier '" &
+          baseName & "' (must start with a letter)", body)
+  let baseNameLower = baseName.toLowerAscii()
+  let loadProcName = ident("load" & baseName)
+  let unloadProcName = ident("unload" & baseName)
+  let loadedProcName = ident(baseNameLower & "Loaded")
+  let handleName = ident("softlinkHandle" & baseName)
+  let cachedResultName = ident("softlinkResult" & baseName)
+  let libPatternLit = newStrLitNode(libPattern)
+
+  result = newStmtList()
+
+  # var handle: LibHandle
+  result.add(newNimNode(nnkVarSection).add(
+    newNimNode(nnkIdentDefs).add(
+      handleName,
+      ident("LibHandle"),
+      newEmptyNode()
+    )
+  ))
+
+  # var cachedResult: LoadResult — zero-initializes to lrOk, but the
+  # idempotent guard checks the handle (nil before first load), so
+  # this value is never returned to callers before loadXxx runs.
+  result.add(newNimNode(nnkVarSection).add(
+    newNimNode(nnkIdentDefs).add(
+      cachedResultName,
+      ident("LoadResult"),
+      newEmptyNode()
+    )
+  ))
+
+  # Collect proc info and generate pointer vars
+  const callingConventions = ["cdecl", "stdcall", "fastcall", "syscall", "noconv"]
+
+
+  var procs: seq[SoftlinkProc]
+  var seenNames: HashSet[string]
+
+  for stmt in body:
+    if stmt.kind != nnkProcDef:
+      error("dynlib body must contain only proc declarations", stmt)
+
+    let procName = stmt[0]
+    let nameStr = $procName
+    let ptrName = ident("softlinkFp" & baseName & nameStr)
+    let formalParams = stmt[3]
+    let hasReturn = formalParams[0].kind != nnkEmpty
+
+    # Duplicate detection
+    if nameStr in seenNames:
+      error("duplicate proc '" & nameStr & "' in dynlib block", stmt)
+    seenNames.incl(nameStr)
+
+    # Pragma validation: extract calling convention, optional flag, and header
+    var callConv = ""
+    var isOptional = false
+    var headerFile = ""
+    let pragmas = stmt[4]
+    if pragmas.kind == nnkPragma:
+      for pragma in pragmas:
+        let pragmaName = if pragma.kind == nnkIdent: $pragma
+                         elif pragma.kind == nnkExprColonExpr: $pragma[0]
+                         else: ""
+        if pragmaName in callingConventions:
+          if callConv != "":
+            error("proc '" & nameStr & "' has multiple calling conventions", stmt)
+          callConv = pragmaName
+        elif pragmaName == "optional":
+          isOptional = true
+        elif pragmaName == "header":
+          if pragma.kind == nnkExprColonExpr:
+            headerFile = pragma[1].strVal
+          else:
+            error("header pragma requires a value (e.g., {.header: \"foo.h\".})", stmt)
+        elif pragmaName != "":
+          error("dynlib does not support pragma '" & pragmaName &
+                "' on proc '" & nameStr & "'", stmt)
+
+    if callConv == "":
+      error("proc '" & nameStr &
+            "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
+    if headerFile == "":
+      error("proc '" & nameStr &
+            "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
+
+    procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: ptrName,
+                        formalParams: formalParams, callConv: callConv,
+                        headerFile: headerFile, isOptional: isOptional,
+                        hasReturn: hasReturn))
+
+    # Build proc type for the var — C functions can't raise Nim exceptions
+    var procTy = newNimNode(nnkProcTy)
+    procTy.add(formalParams.copy())
+    procTy.add(newNimNode(nnkPragma).add(
+      ident(callConv),
+      newNimNode(nnkExprColonExpr).add(
+        ident("raises"),
+        newNimNode(nnkBracket)
+      )
+    ))
+
+    # var fpXxx: proc(...) {.callConv.}
+    result.add(newNimNode(nnkVarSection).add(
+      newNimNode(nnkIdentDefs).add(
+        ptrName,
+        procTy,
+        newEmptyNode()
+      )
+    ))
+
+  for verifyNode in genVerifyBlock(procs, baseName):
+    result.add(verifyNode)
 
   # loadXxx*(): LoadResult
   block:
@@ -675,6 +689,59 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       newNimNode(nnkBracket)
     ))
     result.add(ptrAccessorProc)
+
+proc collectVProcs(body: NimNode): seq[SoftlinkProc] =
+  ## Parse a block of proc declarations for verification. Each must carry a
+  ## calling convention and a {.header.} pragma (same rules as `dynlib`).
+  const callingConventions = ["cdecl", "stdcall", "fastcall", "syscall", "noconv"]
+  var seenNames: HashSet[string]
+  for stmt in body:
+    if stmt.kind != nnkProcDef:
+      error("verifyProcs body must contain only proc declarations", stmt)
+    let procName = stmt[0]
+    let nameStr = $procName
+    let formalParams = stmt[3]
+    let hasReturn = formalParams[0].kind != nnkEmpty
+    if nameStr in seenNames:
+      error("duplicate proc '" & nameStr & "' in verifyProcs block", stmt)
+    seenNames.incl(nameStr)
+    var callConv = ""
+    var headerFile = ""
+    let pragmas = stmt[4]
+    if pragmas.kind == nnkPragma:
+      for pragma in pragmas:
+        let pragmaName = if pragma.kind == nnkIdent: $pragma
+                         elif pragma.kind == nnkExprColonExpr: $pragma[0]
+                         else: ""
+        if pragmaName in callingConventions:
+          callConv = pragmaName
+        elif pragmaName == "header":
+          if pragma.kind == nnkExprColonExpr:
+            headerFile = pragma[1].strVal
+          else:
+            error("header pragma requires a value (e.g., {.header: \"foo.h\".})", stmt)
+    if callConv == "":
+      error("proc '" & nameStr & "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
+    if headerFile == "":
+      error("proc '" & nameStr & "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
+    result.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
+      formalParams: formalParams, callConv: callConv, headerFile: headerFile,
+      isOptional: false, hasReturn: hasReturn))
+
+macro verifyProcs*(body: untyped): untyped =
+  ## Emit ONLY compile-time C header signature verification for the given proc
+  ## declarations \u2014 no loading, no wrappers, no runtime footprint. Each proc
+  ## needs a calling convention and a {.header.} pragma, exactly like `dynlib`.
+  ##
+  ## Use this to give statically-linked `{.importc.}` bindings the same
+  ## `_Static_assert`-grade signature checking that `dynlib` performs for
+  ## dynamic ones. This is identity-coherent with softlink: it *verifies* FFI
+  ## signatures against headers; it does not perform static linking.
+  let procs = collectVProcs(body)
+  let tag = if procs.len > 0: procs[0].nameStr else: "anon"
+  result = newStmtList()
+  for n in genVerifyBlock(procs, tag):
+    result.add(n)
 
 macro dyntype*(headerFile: static[string], body: untyped): untyped =
   ## Verify Nim struct layouts match C header struct definitions at compile time.

@@ -40,6 +40,19 @@ dynlib TestLib:
   proc testlib_const_lookup(key: cint): cstring {.cdecl, header: "tests/testlib.h".}
   proc testlib_mutable_string(): cstring {.cdecl, header: "tests/testlib.h".}
 
+# verifyProcs: compile-time signature verification ONLY (no loading, no
+# wrappers). Correct signatures must compile; the const-return case (#11)
+# must also be accepted here, sharing dynlib's verification codegen.
+verifyProcs:
+  proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
+  proc testlib_const_string(): cstring {.cdecl, header: "tests/testlib.h".}
+
+suite "verifyProcs (static-binding header verification)":
+  test "correct signatures pass compile-time verification":
+    # Reaching here means the verifyProcs block above compiled — the
+    # _Static_assert(s) held against the C header. No symbols were loaded.
+    check true
+
 suite "softlink":
   # System library tests — Linux only
   when defined(linux):
