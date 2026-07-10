@@ -62,10 +62,15 @@ jobs:
           unzip -q nim.zip
           echo "$PWD/nim-2.2.0/bin" >> "$GITHUB_PATH"
 
+      # Fixtures mirror the nimble `test` task: testlib (explicit-pattern block),
+      # libmagic (bare logical name "magic"), and libvern.so.3 (Linux runtime-only
+      # versioned soname). Without these the dynlib "magic"/"vern" tests fail.
       - name: Build test library (MSVC)
         if: matrix.cc == 'vcc'
         shell: cmd
-        run: cl /LD /DTESTLIB_BUILDING /Fe:tests\testlib.dll tests\testlib.c
+        run: |
+          cl /LD /DTESTLIB_BUILDING /Fe:tests\testlib.dll tests\testlib.c
+          cl /LD /DTESTLIB_BUILDING /Fe:tests\libmagic.dll tests\testlib.c
 
       - name: Build test library (GCC/Clang)
         if: matrix.cc != 'vcc'
@@ -73,18 +78,25 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             gcc -shared -o tests/testlib.dll tests/testlib.c
+            gcc -shared -o tests/libmagic.dll tests/testlib.c
           elif [ "$RUNNER_OS" = "macOS" ]; then
             cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c
+            cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c
           else
             gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c
+            gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c
+            gcc -shared -fPIC -o tests/libvern.so.3 tests/testlib.c
           fi
 
+      # /std:clatest opens the C23 gate so MSVC exposes _Generic/__typeof__;
+      # -d:softlinkStrictVerify turns a would-be-skipped verify block into a hard
+      # #error, so this leg cannot go green unless the real check actually compiled.
       - name: Run tests (MSVC)
         if: matrix.cc == 'vcc'
         shell: cmd
         run: |
           set PATH=%CD%\tests;%CD%\nim-2.2.0\bin;%PATH%
-          nim c -r --cc:vcc --path:src --passC:/I. tests\test_softlink.nim
+          nim c -r --cc:vcc --path:src --passC:/I. --passC:/std:clatest -d:softlinkStrictVerify tests\test_softlink.nim
 
       - name: Run tests (GCC/Clang)
         if: matrix.cc != 'vcc'
@@ -97,4 +109,4 @@ jobs:
           elif [ "$RUNNER_OS" = "Windows" ]; then
             export PATH="./tests:$PATH"
           fi
-          nim c -r --path:src --passC:-I. tests/test_softlink.nim
+          nim c -r --path:src --passC:-I. -d:softlinkStrictVerify tests/test_softlink.nim
