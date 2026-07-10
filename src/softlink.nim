@@ -275,28 +275,38 @@ proc genVerifyBlock(procs: seq[SoftlinkProc], tag: string): seq[NimNode] =
       emitArray.add(newStrLitNode(
         "),\n  \"" & errMsg & "\"\n);\n"))
 
-      # --- MSVC C path: call + __typeof__ pointer trick ---
-      # For pointer returns, same dereference approach. For void/scalar,
-      # use _Generic + __typeof__ pointer trick. `retIsPointerLike` (set
-      # above for the GCC path) classifies cstring/cstringArray/pointer
-      # alongside nnkPtrTy — same #11 fix applies here.
+      # --- MSVC C path: _Generic + __typeof__ (C23 only) ---
+      # MSVC only exposes _Generic and __typeof__ in C23 mode (/std:clatest), so
+      # gate the whole branch on __STDC_VERSION__ >= C23. In default mode MSVC
+      # doesn't even recognize _Generic — it parses as a call and errors with
+      # C2059/C2275 — so without the gate every pointer-returning proc breaks the
+      # build. Gated, default-mode MSVC instead falls through to the graceful
+      # fallback below (no verification, but the build works). CI forces
+      # /std:clatest + -d:softlinkStrictVerify so the check is genuinely exercised
+      # there and can't be silently skipped (see the fallback). For pointer
+      # returns the same dereference trick as the GCC path strips pointee const;
+      # `retIsPointerLike` classifies cstring/cstringArray/pointer with nnkPtrTy.
       emitArray.add(newStrLitNode(
-        "#elif defined(_MSC_VER)\n"))
+        "#elif defined(_MSC_VER) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n"))
       if retIsPointerLike:
-        # Pointer return: use _Generic on dereferenced __typeof__ to strip const.
-        # (__typeof__(*func(args)))* gives non-const-qualified pointer after
-        # _Generic strips the pointee's top-level const.
-        # Actually, _Generic doesn't strip const — use assignment to a
-        # matching type via __typeof__. MSVC has __typeof__ but not
-        # __builtin_types_compatible_p. Fall back to the exact _Generic check
-        # for MSVC pointer returns (same limitation as before for const returns).
+        # Pointer return: dereference BOTH the return value and the declared
+        # return type inside _Generic. _Generic applies lvalue conversion to its
+        # controlling expression, which drops the pointee's top-level const —
+        # so `*(__typeof__(f()))0` (type `const char`) converts to `char` and
+        # matches the association `__typeof__(*(RET)0)` (`char`). This is the
+        # same const-tolerant trick the GCC path (`__builtin_types_compatible_p`
+        # on dereferenced operands) and the C++ path (`strip_ptr_const`) use, and
+        # it reuses the identical `__typeof__(*(RET)0)` construct emitted above.
+        # Before this, the branch compared `const char**` (from
+        # `(__typeof__(f())*)0`) against `char**` and rejected every
+        # `const char *`-returning proc — e.g. libz3's `Z3_string` (#11 on MSVC).
         emitArray.add(newStrLitNode(
-          "_Static_assert(\n  _Generic((__typeof__("))
+          "_Static_assert(\n  _Generic(*(__typeof__("))
         buildCallArgs(emitArray, p.nameStr, dummyVars)
-        emitArray.add(newStrLitNode(")*)0,\n    "))
+        emitArray.add(newStrLitNode("))0,\n    __typeof__(*("))
         addTypeToEmit(emitArray, p.formalParams[0])
         emitArray.add(newStrLitNode(
-          "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
+          ")0): 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
       else:
         # Non-pointer: call + _Generic __typeof__ pointer trick
         buildCallArgs(emitArray, p.nameStr, dummyVars)
@@ -310,9 +320,21 @@ proc genVerifyBlock(procs: seq[SoftlinkProc], tag: string): seq[NimNode] =
         emitArray.add(newStrLitNode(
           "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
 
-      # --- Fallback ---
-      emitArray.add(newStrLitNode(
-        "#else\n#error \"softlink: header verification requires GCC, Clang, MSVC, or a C++ compiler.\"\n#endif\n"))
+      # --- Fallback: graceful degradation ---
+      # Compile-time signature verification is best-effort: it must never break an
+      # otherwise-valid build. On a compiler/mode lacking the needed features —
+      # notably default-mode MSVC, where _Generic/__typeof__ are unavailable — emit
+      # nothing (the runtime FFI machinery is generated separately and is
+      # unaffected). Opt into a hard error with `-d:softlinkStrictVerify` so a
+      # silently-skipped check can't pass unnoticed; CI sets it (with the std flag
+      # that opens the MSVC gate above) to guarantee the check is exercised.
+      when defined(softlinkStrictVerify):
+        emitArray.add(newStrLitNode(
+          "#else\n#error \"softlink: signature verification unavailable here " &
+          "(need C++, GCC/Clang, or MSVC /std:clatest); remove -d:softlinkStrictVerify to skip\"\n#endif\n"))
+      else:
+        emitArray.add(newStrLitNode(
+          "#else\n/* softlink: signature verification skipped — unsupported compiler/mode */\n#endif\n"))
 
       verifyBody.add(newNimNode(nnkPragma).add(
         newNimNode(nnkExprColonExpr).add(
