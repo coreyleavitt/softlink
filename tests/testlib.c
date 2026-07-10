@@ -3,6 +3,8 @@
 
 TESTLIB_API int testlib_add(int a, int b) { return a + b; }
 TESTLIB_API void testlib_noop(void) {}
+TESTLIB_API int testlib_magic(void) { return 42; }
+TESTLIB_API int testlib_versioned(void) { return 7; }
 /* testlib_future: NOT implemented — simulates symbol added in future version */
 
 TESTLIB_API const char *testlib_const_string(void) {

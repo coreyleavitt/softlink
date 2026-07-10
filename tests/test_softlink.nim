@@ -4,7 +4,50 @@
 ## Build the test library before running (see nimble test task).
 
 import std/[unittest, math, strutils]
-import softlink
+import softlink {.all.}
+
+suite "deriveLibPattern — logical name → per-OS candidates":
+  test "Linux → bare .so first, then descending single-component majors":
+    check deriveLibPattern("z3", osLinux) == "libz3.so(|.7|.6|.5|.4|.3|.2|.1)"
+
+  test "bare name on Windows → both lib-prefixed and bare .dll":
+    check deriveLibPattern("z3", osWindows) == "(libz3|z3).dll"
+
+  test "macOS → bare .dylib first, then descending majors":
+    check deriveLibPattern("z3", osMacos) == "libz3(|.7|.6|.5|.4|.3|.2|.1).dylib"
+
+  test "leading 'lib' is stripped so libz3 and z3 agree":
+    check deriveLibPattern("libz3", osLinux) == deriveLibPattern("z3", osLinux)
+    check deriveLibPattern("libz3", osWindows) == deriveLibPattern("z3", osWindows)
+
+suite "isLogicalName — magic vs verbatim (escape hatch) routing":
+  test "bare stems are logical → magic derivation":
+    check isLogicalName("z3")
+    check isLogicalName("libz3")
+    check isLogicalName("mbedtls")
+
+  test "explicit patterns are not logical → used verbatim":
+    # Anything carrying an extension, alternation, or path separator is the
+    # author's exact loadLibPattern string and must pass through untouched.
+    check not isLogicalName("libz3.so(.4|)")
+    check not isLogicalName("libtestlib.so")
+    check not isLogicalName("libm.so(.6|)")
+    check not isLogicalName("/opt/z3/lib/libz3.so")
+    check not isLogicalName(r"C:\z3\libz3.dll")
+
+suite "logical-name ident derivation is OS-invariant (C1 regression)":
+  # The macro derives its load/unload/loaded proc names from libNameToIdent
+  # applied to the *logical name*, never to the OS-expanded pattern. Feeding the
+  # Windows-expanded pattern "(libz3|z3).dll" to libNameToIdent mangles it to
+  # "Libz3z3" — which would generate loadLibz3z3 on Windows while Linux/macOS
+  # generate loadZ3. Deriving from the logical name keeps idents identical
+  # across every target by construction.
+  test "logical name yields a stable, OS-independent base ident":
+    check libNameToIdent("z3") == "Z3"
+    check libNameToIdent("libz3") == "Z3"
+  test "the OS-expanded Windows pattern is the trap the macro must avoid":
+    check libNameToIdent(deriveLibPattern("z3", osWindows)) == "Libz3z3"
+    check libNameToIdent("z3") != libNameToIdent(deriveLibPattern("z3", osWindows))
 
 # System library tests — Linux only (library names produce consistent identifiers)
 when defined(linux):
@@ -341,3 +384,30 @@ when defined(linux):
         cb(1.1)
       check loadM().kind == lrOk
       check takesCallback(ceilPtr()) == 2.0
+
+
+# End-to-end magic: a bare logical name must resolve to the real on-disk
+# file via deriveLibPattern. testlib.c is compiled to libmagic.so (see the
+# nimble test task); "magic" must resolve to it.
+dynlib "magic":
+  proc testlib_magic(): cint {.cdecl, header: "tests/testlib.h".}
+
+suite "dynlib magic — bare logical name resolves and loads":
+  test "dynlib \"magic\" resolves to libmagic.so and calls its symbol":
+    check loadMagic().kind == lrOk
+    check testlib_magic() == 42
+
+
+# Runtime-only single-component soname: libvern.so.3 exists but NO bare
+# libvern.so (the Debian `libz3.so.4` situation). Magic must fall back to a
+# versioned major candidate. Linux-only — ELF soname convention.
+# (Multi-component sonames like openSUSE's libz3.so.4.15 are out of scope for
+# magic resolution — see deriveLibPattern's doc; they use the escape hatch.)
+when defined(linux):
+  dynlib "vern":
+    proc testlib_versioned(): cint {.cdecl, header: "tests/testlib.h".}
+
+  suite "dynlib magic — runtime-only versioned soname":
+    test "resolves libvern.so.3 with no bare libvern.so present":
+      check loadVern().kind == lrOk
+      check testlib_versioned() == 7

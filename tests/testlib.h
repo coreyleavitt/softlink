@@ -15,6 +15,15 @@
 TESTLIB_API int testlib_add(int a, int b);
 TESTLIB_API void testlib_noop(void);
 
+/* Symbol bound via a bare logical name ("magic") to exercise
+ * deriveLibPattern end-to-end. Compiled to libmagic.so/.dylib/.dll. */
+TESTLIB_API int testlib_magic(void);
+
+/* Symbol for the runtime-only versioned-soname test: compiled to
+ * libvern.so.3 with NO bare libvern.so, so magic must fall back to a
+ * versioned candidate. Linux-only (ELF soname convention). */
+TESTLIB_API int testlib_versioned(void);
+
 /* Optional symbol — in header but NOT in .so/.dll (simulates newer API version) */
 TESTLIB_API int testlib_future(void);
 

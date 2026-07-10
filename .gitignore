@@ -4,6 +4,11 @@ tests/test_nimport
 tests/libtestlib.so
 tests/libtestlib.dylib
 tests/testlib.dll
+# deriveLibPattern e2e fixtures (built by the test task)
+tests/libmagic.so
+tests/libmagic.dylib
+tests/libmagic.dll
+tests/libvern.so.3
 
 # Example binaries
 examples/struct_verification

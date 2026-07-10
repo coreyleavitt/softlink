@@ -4,14 +4,23 @@ All notable changes to softlink are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-09
+
 ### Added
+- `dynlib` now accepts a **bare logical library name** (e.g. `dynlib "z3":`) and derives the per-OS `loadLibPattern` candidates automatically — Linux `libz3.so(|.7|…)`, macOS `libz3(|.7|…).dylib`, Windows `(libz3|z3).dll`. Explicit patterns (any containing `.`, `(`, `/`, or `\`) still pass through verbatim as the escape hatch. Adds pure, per-OS-testable `deriveLibPattern`, `isLogicalName`, and the `LibOs` enum.
+- `verifyProcs` macro: standalone compile-time C header signature verification (no loading, no wrappers, no runtime footprint) for statically-linked `{.importc.}` bindings
 - `dyntype` macro for compile-time struct layout verification against C headers via `_Static_assert(sizeof)`
 - `ctype` pragma for mapping Nim types to C struct names in `dyntype` blocks
 - `lrLibNotFound` test coverage
 
 ### Fixed
+- `#11`: const-qualified pointer returns (e.g. C `const char *` bound as `cstring`) are no longer rejected as signature mismatches — verification dereferences both sides so top-level qualifiers are ignored
+- `#12`: cpp backend rejected `extern "C" static` on the verify proc — it now uses `inline` under `--backend:cpp` (ODR-relaxed, `extern "C"`-compatible)
 - Header verification (`dynlib`) was silently not emitted due to Nim dead code elimination — switched from `{.used.}` to `{.exportc, codegenDecl: "static ...".}` to force emission while keeping symbols file-local
 - Preprocessor directives in verify proc needed `\n` prefix to start at line boundaries in generated C
+
+### Notes
+- Bare-name resolution covers bare and single-component major sonames; multi-component runtime-only sonames (e.g. openSUSE `libz3.so.4.15`) should be pinned with the explicit-pattern escape hatch.
 
 ## [0.2.1] - 2026-04-05
 

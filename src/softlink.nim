@@ -72,6 +72,57 @@ func libNameToIdent(libPattern: string): string =
   clean
 
 type
+  LibOs* = enum
+    ## Target operating system for library-name derivation. Passed explicitly
+    ## (rather than read from `defined()`) so `deriveLibPattern` stays a pure,
+    ## per-OS-testable function.
+    osLinux, osMacos, osWindows
+
+func deriveLibPattern*(name: string, os: LibOs): string =
+  ## Derive the `loadLibPattern` candidate string for a bare logical library
+  ## `name` on the given `os` — e.g. ``"z3"`` → ``"libz3.so(|.7|…)"`` on Linux.
+  ## The rule is simply "list the plausible on-disk names for this OS"; the
+  ## loader tries them in order. A leading ``lib`` is stripped first, so ``"z3"``
+  ## and ``"libz3"`` derive identically.
+  ##
+  ## Covers bare (``libz3.so``) and single-component major sonames
+  ## (``libz3.so.4``). Multi-component runtime-only sonames (openSUSE
+  ## ``libz3.so.4.15`` with no bare/major symlink) are out of scope — pin those
+  ## with the explicit-pattern escape hatch instead of a bare logical name.
+  var stem = name
+  if stem.startsWith("lib"): stem = stem[3 .. ^1]
+  case os
+  # Bare ``.so`` first (dev installs carry the unversioned symlink); then
+  # descending *single-component* major sonames, since a runtime-only install
+  # often ships only ``libfoo.so.N`` with no bare symlink (e.g. Debian
+  # ``libz3.so.4``). NOTE: multi-component runtime-only sonames — e.g. openSUSE's
+  # ``libz3.so.4.15`` with no bare or single-major symlink — are deliberately
+  # NOT enumerated here: an unbounded minor sweep can't be future-proof and
+  # would bloat the candidate list. Such installs use the explicit-pattern
+  # escape hatch (``dynlib "libz3.so(.4.15|.4|)"``) or the OS loader path.
+  of osLinux: "lib" & stem & ".so(|.7|.6|.5|.4|.3|.2|.1)"
+  # macOS mirrors Linux: bare ``.dylib`` first, then descending majors
+  # (``libz3.4.dylib``), for runtime-only installs lacking the bare symlink.
+  of osMacos: "lib" & stem & "(|.7|.6|.5|.4|.3|.2|.1).dylib"
+  # Windows is the one platform where the ``lib`` prefix isn't universal
+  # (Z3 ships ``libz3.dll``; many projects ship ``z3.dll``). Try both.
+  of osWindows: "(lib" & stem & "|" & stem & ").dll"
+
+func isLogicalName*(spec: string): bool =
+  ## True when `spec` is a bare logical library name (a plain stem like
+  ## ``"z3"`` or ``"libz3"``) rather than an explicit `loadLibPattern` string.
+  ## Explicit patterns carry an extension, alternation, or path separator;
+  ## logical names carry none. `dynlib` derives per-OS candidates for logical
+  ## names and passes explicit patterns through verbatim (the escape hatch).
+  '.' notin spec and '(' notin spec and '/' notin spec and '\\' notin spec
+
+func currentLibOs(): LibOs =
+  ## The compile-time target OS as a `LibOs`, for use at macro-evaluation time.
+  when defined(windows): osWindows
+  elif defined(macosx): osMacos
+  else: osLinux
+
+type
   SoftlinkProc* = object
     name: NimNode
     nameStr: string
@@ -307,6 +358,19 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## Wrapper proc calls must also not race with ``unloadXxx`` — the loaded
   ## state and function pointer dispatch are not atomic.
   ## Callers must synchronize externally if using from multiple threads.
+  ##
+  ## `libPattern` may be a bare logical name (``"z3"``), in which case the
+  ## per-OS candidate names are derived automatically (see `deriveLibPattern`);
+  ## or an explicit `loadLibPattern` string (``"libz3.so(.4|)"``), used verbatim.
+  let resolvedPattern =
+    if libPattern.isLogicalName: deriveLibPattern(libPattern, currentLibOs())
+    else: libPattern
+  # Derive the ident base from the *logical* name (the macro argument), NOT the
+  # OS-expanded pattern: deriveLibPattern's Windows form "(libz3|z3).dll" would
+  # mangle through libNameToIdent to "Libz3z3", breaking cross-OS ident
+  # stability (loadLibz3z3 on Windows vs loadZ3 elsewhere). Using libPattern
+  # makes the generated idents identical across every target by construction.
+  # (For explicit patterns, resolvedPattern == libPattern, so this is a no-op.)
   let baseName = libNameToIdent(libPattern)
   if baseName.len == 0:
     error("cannot derive identifier from dynlib pattern '" & libPattern & "'", body)
@@ -319,7 +383,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   let loadedProcName = ident(baseNameLower & "Loaded")
   let handleName = ident("softlinkHandle" & baseName)
   let cachedResultName = ident("softlinkResult" & baseName)
-  let libPatternLit = newStrLitNode(libPattern)
+  let libPatternLit = newStrLitNode(resolvedPattern)
 
   result = newStmtList()
 
