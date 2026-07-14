@@ -25,8 +25,10 @@ task test, "Run tests":
   const dupFailCheck = "nim c --path:src tests/tfail_duplicate_dynlib.nim"
   const gateFailCheck = "nim c --path:src --passC:-I. tests/tfail_verifywhen_mismatch.nim"
   const contraFailCheck = "nim c --path:src tests/tfail_verifywhen_noverify.nim"
-  const hintCheck = "nim c --path:src tests/thint_noverify.nim"
-  const warnCheck = "nim c --path:src -d:softlinkStrictVerify tests/thint_noverify.nim"
+  # (--compileOnly: the diagnostics fire at macro expansion, so skipping the
+  # C compile+link keeps the check fast and leaves no stray binary behind.)
+  const hintCheck = "nim c --compileOnly --path:src tests/thint_noverify.nim"
+  const warnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify.nim"
   when defined(windows):
     exec "gcc -shared -o tests/testlib.dll tests/testlib.c"
     exec "gcc -shared -o tests/libmagic.dll tests/testlib.c"
