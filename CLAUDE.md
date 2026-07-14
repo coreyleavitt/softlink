@@ -35,10 +35,11 @@ The library name is derived from the pattern string: `"libmbedtls.so(.16|)"` bec
 
 ### Key design decisions
 
-- **Required by default, optional per-symbol**: required symbols cause load failure if missing (all-or-nothing for required). Optional symbols (`{.optional.}` pragma) are silently skipped, with `xxxAvailable*(): bool` checks generated.
+- **Required by default, optional per-symbol**: required symbols cause load failure if missing (all-or-nothing for required). Optional symbols (`{.optional.}` pragma) are silently skipped, with `xxxAvailable*(): bool` checks generated. `{.optional.}` is runtime-optional only — header verification still runs; `{.noverify.}` additionally skips the compile-time check (and lifts the `header` requirement) for symbols absent from installed headers.
+- **One dynlib block per library per module**: a second block deriving the same ident base is rejected at macro-expansion time via a `when declared(softlinkHandleX)` guard with a clear merge-the-blocks error (#14) — previously it leaked an opaque `redefinition of 'softlinkHandleX'` from softlink.nim. The guard is scope-accurate and doesn't fire across modules (state vars are unexported). Negative compile test: `tests/tfail_duplicate_dynlib.nim`, driven by the nimble test task (greps for the error message).
 - **Explicit calling convention required**: the macro requires `{.cdecl.}`, `{.stdcall.}`, etc. — no default. Supports `cdecl`, `stdcall`, `fastcall`, `syscall`, `noconv`.
-- **Required `header` pragma**: every proc must specify `{.header: "foo.h".}` (or `{.header: "<foo.h>".}` for angle-bracket includes). The macro emits call-based `_Static_assert` checks that verify each symbol's signature against the C header at compile time — const-tolerant, no `.so` needed, only the header files. Three-tier fallback: C++ `decltype`+`is_same`, GCC/Clang `__builtin_types_compatible_p`+`__typeof__`, MSVC `_Generic`+`__typeof__` pointer trick.
-- **Pragma allowlist**: only calling conventions + `optional` + `header` are accepted. Unsupported pragmas (e.g., `varargs`) produce compile-time errors.
+- **Required `header` pragma**: every proc must specify `{.header: "foo.h".}` (or `{.header: "<foo.h>".}` for angle-bracket includes), unless marked `{.noverify.}`. The macro emits call-based `_Static_assert` checks that verify each symbol's signature against the C header at compile time — const-tolerant, no `.so` needed, only the header files. Three-tier fallback: C++ `decltype`+`is_same`, GCC/Clang `__builtin_types_compatible_p`+`__typeof__`, MSVC `_Generic`+`__typeof__` pointer trick.
+- **Pragma allowlist**: only calling conventions + `optional` + `noverify` + `header` are accepted. Unsupported pragmas (e.g., `varargs`) produce compile-time errors.
 - **No thread safety guarantees**: `loadLib` is not thread-safe on all platforms.
 
 ### How the `dyntype` macro works

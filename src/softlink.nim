@@ -131,12 +131,23 @@ type
     callConv: string
     headerFile: string
     isOptional: bool
+    noVerify: bool
     hasReturn: bool
 
-proc genVerifyBlock(procs: seq[SoftlinkProc], tag: string): seq[NimNode] =
+proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes
   ## (include section + a file-local _Static_assert proc). Shared by
   ## `dynlib` and `verifyProcs`.
+  # {.noverify.} procs are excluded entirely — no _Static_assert AND no
+  # #include of their header. A noverify symbol typically doesn't exist in
+  # the installed headers (that's why verification is skipped), and its call
+  # expression would be an implicit-declaration error in C. See #14/Defect B:
+  # {.optional.} alone is runtime-optional but still compile-time verified.
+  var procs: seq[SoftlinkProc]
+  for p in allProcs:
+    if not p.noVerify: procs.add(p)
+  if procs.len == 0:
+    return @[]
   var nodes: seq[NimNode] = @[]
   # Compile-time header verification. Compares each symbol's type from
   # the C header against Nim's generated function pointer type.
@@ -409,6 +420,30 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
   result = newStmtList()
 
+  # Duplicate-block guard. Two dynlib blocks whose patterns derive the same
+  # ident base (e.g. `dynlib "m"` twice, or "libfoo.so" + "foo") would
+  # re-declare every module-scope state var and public proc, surfacing as an
+  # opaque "redefinition of 'softlinkHandleX'" pointing INTO softlink.nim.
+  # `declared()` is evaluated in the expansion scope at semantic time — before
+  # this block's own declarations below — so it fires exactly when a previous
+  # expansion in the same scope already claimed the names, and stays silent
+  # across modules (the state vars are not exported). See #14/Defect A.
+  block:
+    let dupMsg = "softlink: dynlib block for '" & libPattern &
+      "' collides with an earlier dynlib block in the same scope (both " &
+      "derive the identifier base '" & baseName & "' → load" & baseName &
+      ", softlinkHandle" & baseName & ", ...). Merge the procs into the " &
+      "earlier block; mark symbols that may be missing at runtime " &
+      "{.optional.}, adding {.noverify.} if a symbol is also absent from " &
+      "the installed C headers."
+    var errPragma = newNimNode(nnkPragma).add(
+      newNimNode(nnkExprColonExpr).add(ident("error"), newStrLitNode(dupMsg)))
+    errPragma.copyLineInfo(body)
+    result.add(newNimNode(nnkWhenStmt).add(
+      newNimNode(nnkElifBranch).add(
+        newCall(ident("declared"), handleName),
+        newStmtList(errPragma))))
+
   # var handle: LibHandle
   result.add(newNimNode(nnkVarSection).add(
     newNimNode(nnkIdentDefs).add(
@@ -451,9 +486,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       error("duplicate proc '" & nameStr & "' in dynlib block", stmt)
     seenNames.incl(nameStr)
 
-    # Pragma validation: extract calling convention, optional flag, and header
+    # Pragma validation: extract calling convention, optional flag, noverify
+    # flag, and header
     var callConv = ""
     var isOptional = false
+    var noVerify = false
     var headerFile = ""
     let pragmas = stmt[4]
     if pragmas.kind == nnkPragma:
@@ -467,6 +504,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           callConv = pragmaName
         elif pragmaName == "optional":
           isOptional = true
+        elif pragmaName == "noverify":
+          noVerify = true
         elif pragmaName == "header":
           if pragma.kind == nnkExprColonExpr:
             headerFile = pragma[1].strVal
@@ -479,14 +518,15 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     if callConv == "":
       error("proc '" & nameStr &
             "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
-    if headerFile == "":
+    if headerFile == "" and not noVerify:
       error("proc '" & nameStr &
-            "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
+            "' must specify a header pragma (e.g., {.header: \"foo.h\".}), " &
+            "or {.noverify.} to skip compile-time header verification", stmt)
 
     procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: ptrName,
                         formalParams: formalParams, callConv: callConv,
                         headerFile: headerFile, isOptional: isOptional,
-                        hasReturn: hasReturn))
+                        noVerify: noVerify, hasReturn: hasReturn))
 
     # Build proc type for the var — C functions can't raise Nim exceptions
     var procTy = newNimNode(nnkProcTy)

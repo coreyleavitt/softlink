@@ -7,6 +7,11 @@ TESTLIB_API int testlib_magic(void) { return 42; }
 TESTLIB_API int testlib_versioned(void) { return 7; }
 /* testlib_future: NOT implemented — simulates symbol added in future version */
 
+/* testlib_unheralded: in the .so but deliberately NOT declared in testlib.h —
+ * simulates a symbol newer than the installed headers. Bindings must use
+ * {.noverify.} (header verification would be an implicit-declaration error). */
+TESTLIB_API int testlib_unheralded(void) { return 99; }
+
 TESTLIB_API const char *testlib_const_string(void) {
   return "hello from testlib";
 }

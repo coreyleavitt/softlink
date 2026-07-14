@@ -82,6 +82,14 @@ dynlib TestLib:
   proc testlib_const_string(): cstring {.cdecl, header: "tests/testlib.h".}
   proc testlib_const_lookup(key: cint): cstring {.cdecl, header: "tests/testlib.h".}
   proc testlib_mutable_string(): cstring {.cdecl, header: "tests/testlib.h".}
+  # Defect B regression (#14): testlib_unheralded is in the .so but NOT in
+  # testlib.h. {.optional.} alone would still emit the header verification
+  # and fail with an implicit-declaration error; {.noverify.} skips it (and
+  # makes the header pragma unnecessary). Runtime resolution is unaffected.
+  proc testlib_unheralded(): cint {.cdecl, optional, noverify.}
+  # noverify symbol missing at runtime too — must degrade exactly like a
+  # plain optional symbol (lands in `missing`, Available() false, raises).
+  proc testlib_future_nv(): cint {.cdecl, optional, noverify.}
 
 # verifyProcs: compile-time signature verification ONLY (no loading, no
 # wrappers). Correct signatures must compile; the const-return case (#11)
@@ -166,7 +174,7 @@ suite "softlink":
   test "testlib: partial load returns lrOkPartial with missing optional":
     let r = loadTestlib()
     check r.kind == lrOkPartial
-    check r.missing == @["testlib_future"]
+    check r.missing == @["testlib_future", "testlib_future_nv"]
 
   test "testlib: availability check for optional symbols":
     check loadTestlib().kind in {lrOk, lrOkPartial}
@@ -176,6 +184,24 @@ suite "softlink":
     check loadTestlib().kind in {lrOk, lrOkPartial}
     expect SoftlinkError:
       discard testlib_future()
+
+  # Defect B regression (#14): a symbol newer than the installed headers.
+  # {.noverify.} skips the compile-time _Static_assert (and the #include of
+  # its header) so the block compiles, while runtime resolution still works.
+  # The negative side — {.optional.} WITHOUT {.noverify.} fails against a
+  # header lacking the symbol — is a C-compile-time failure (implicit
+  # declaration), not a Nim one, so it can't be pinned with compiles();
+  # verified manually in Docker.
+  test "noverify: symbol absent from header resolves at runtime (#14)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_unheraldedAvailable()
+    check testlib_unheralded() == 99.cint
+
+  test "noverify: symbol missing at runtime degrades like optional (#14)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check not testlib_future_nvAvailable()
+    expect SoftlinkError:
+      discard testlib_future_nv()
 
   # Regression: #11 — const-qualified pointer returns must bind to
   # cstring without a "signature mismatch vs testlib.h" error under
@@ -209,7 +235,7 @@ suite "softlink":
     check r1.kind == lrOkPartial
     let r2 = loadTestlib()
     check r2.kind == lrOkPartial
-    check r2.missing == @["testlib_future"]
+    check r2.missing == @["testlib_future", "testlib_future_nv"]
 
   test "testlib: reload after unload preserves partial status":
     check loadTestlib().kind == lrOkPartial
@@ -251,6 +277,13 @@ suite "softlink":
       dynlib "libfoo.so":
         proc foo(x: cint): cint {.cdecl.}
     )
+
+  # Defect A regression (#14) — duplicate dynlib blocks for the same library —
+  # cannot be tested with compiles() here: dynlib generates exported procs
+  # (loadFoo*), which are only legal at top level, so ANY dynlib inside a
+  # compiles(block:) fails for that unrelated reason. Instead the nimble test
+  # task compiles tests/tfail_duplicate_dynlib.nim expecting the clear
+  # "collides with an earlier dynlib block" error.
 
 # Missing library — for lrLibNotFound test
 dynlib "libdefinitely_not_real.so":

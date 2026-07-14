@@ -4,6 +4,14 @@ All notable changes to softlink are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-14
+
+### Added
+- `{.noverify.}` pragma (#14, Defect B): skips compile-time header verification for a single proc and lifts its `header` requirement. `{.optional.}` alone is runtime-optional only — the verify `_Static_assert` still ran, so an optional symbol absent from the installed headers was an implicit-declaration error. `{.optional, noverify.}` now binds symbols newer than the installed headers.
+
+### Fixed
+- `#14` (Defect A): two `dynlib` blocks deriving the same identifier base in one scope (e.g. `dynlib "m"` twice, or `"libfoo.so"` + `"foo"`) produced an opaque `redefinition of 'softlinkHandleM'` error pointing into softlink.nim. The macro now emits a `when declared()` guard that rejects the duplicate at the call site with a clear error directing you to merge the blocks (using `{.optional.}`/`{.noverify.}` for version-gated symbols).
+
 ## [0.5.0] - 2026-07-09
 
 ### Added
