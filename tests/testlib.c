@@ -12,6 +12,14 @@ TESTLIB_API int testlib_versioned(void) { return 7; }
  * {.noverify.} (header verification would be an implicit-declaration error). */
 TESTLIB_API int testlib_unheralded(void) { return 99; }
 
+TESTLIB_API int testlib_gated(void) { return 21; }
+
+/* testlib_gated_v2: in the .so but NOT in testlib.h — simulates a symbol
+ * added in "version 2" while the installed header is version 1. Bound with
+ * {.verifyWhen: "TESTLIB_VERSION >= 2".}: the condition is false, so the
+ * verification (which would be an implicit-declaration error) is skipped. */
+TESTLIB_API int testlib_gated_v2(void) { return 42; }
+
 TESTLIB_API const char *testlib_const_string(void) {
   return "hello from testlib";
 }

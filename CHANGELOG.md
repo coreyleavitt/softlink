@@ -4,6 +4,15 @@ All notable changes to softlink are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-14
+
+### Added
+- `{.verifyWhen: "C_PP_EXPR".}` pragma: per-proc **conditional** header verification. The `_Static_assert` chain (all three compiler tiers and the strict-mode fallback) is wrapped in `#if (EXPR) ... #endif`, so systems whose headers are new enough verify in full while older installs compile cleanly — "verify whenever possible". Gate on the library's version macro (e.g. `{.verifyWhen: "MBEDTLS_VERSION_NUMBER >= 0x03060000".}`). Supported in both `dynlib` and `verifyProcs`; requires `header`; combining with `{.noverify.}` is a compile-time error. This supersedes blanket `{.noverify.}` for version-gated symbols — `noverify` remains for symbols no header declares at any version.
+- Unverified-symbol visibility: a `dynlib` block containing `{.noverify.}` procs now emits a compile-time hint enumerating them (`softlink: dynlib "x": 2 symbols not header-verified ...`), upgraded to a warning under `-d:softlinkStrictVerify`, keeping trust points auditable.
+
+### Fixed
+- `verifyProcs` now validates pragmas like `dynlib` does: unknown pragmas (e.g. `varargs`) and the meaningless `{.noverify.}` are compile-time errors instead of being silently ignored.
+
 ## [0.6.0] - 2026-07-14
 
 ### Added

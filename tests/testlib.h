@@ -11,6 +11,10 @@
   #define TESTLIB_API
 #endif
 
+/* Version macro for {.verifyWhen.} tests — real bindings gate on macros
+ * like MBEDTLS_VERSION_NUMBER; TESTLIB_VERSION plays that role here. */
+#define TESTLIB_VERSION 1
+
 /* Required symbols — always in .so/.dll */
 TESTLIB_API int testlib_add(int a, int b);
 TESTLIB_API void testlib_noop(void);
@@ -26,6 +30,10 @@ TESTLIB_API int testlib_versioned(void);
 
 /* Optional symbol — in header but NOT in .so/.dll (simulates newer API version) */
 TESTLIB_API int testlib_future(void);
+
+/* Symbol for {.verifyWhen.} true-condition tests: declared here (so the
+ * gated _Static_assert has something to verify) and present in the .so. */
+TESTLIB_API int testlib_gated(void);
 
 /* Symbol for lrLibNotFound testing — declared in header, bound to a non-existent library */
 TESTLIB_API int testlib_notreal(void);

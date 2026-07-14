@@ -132,7 +132,27 @@ type
     headerFile: string
     isOptional: bool
     noVerify: bool
+    verifyWhen: string  ## C preprocessor expr gating verification; "" = always
     hasReturn: bool
+
+func pragmaKeyName(pragma: NimNode): string =
+  ## The identifying name of a proc pragma node: bare (`cdecl`) or
+  ## key:value (`header: "foo.h"`). "" for shapes we don't recognize.
+  if pragma.kind == nnkIdent: $pragma
+  elif pragma.kind == nnkExprColonExpr: $pragma[0]
+  else: ""
+
+proc parseVerifyWhenExpr(pragma, stmt: NimNode): string =
+  ## Extract and validate the {.verifyWhen: "EXPR".} condition — a non-empty
+  ## C preprocessor expression string. Shared by `dynlib` and `verifyProcs`.
+  if pragma.kind == nnkExprColonExpr and
+     pragma[1].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit} and
+     pragma[1].strVal.strip().len > 0:
+    pragma[1].strVal
+  else:
+    error("verifyWhen pragma requires a non-empty C preprocessor " &
+          "expression (e.g., {.verifyWhen: \"FOO_VERSION >= 0x0300\".})", stmt)
+    ""
 
 proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes
@@ -234,6 +254,15 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
           emitArr.add(typeNode.copy())
 
       var emitArray = newNimNode(nnkBracket)
+
+      # {.verifyWhen: "EXPR".}: gate this proc's entire verification (all
+      # three compiler tiers AND the strict-mode #error fallback) on a C
+      # preprocessor expression — verify on systems whose headers are new
+      # enough, compile cleanly on older ones. When the condition is false,
+      # skipping is legitimate, so strict mode must not fire either.
+      if p.verifyWhen.len > 0:
+        emitArray.add(newStrLitNode(
+          "\n#if (" & p.verifyWhen & ") /* softlink verifyWhen */"))
 
       # --- C++ path: static_assert + strip_ptr_const + decltype ---
       # strip_ptr_const removes const from pointed-to types in return values
@@ -347,6 +376,9 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
         emitArray.add(newStrLitNode(
           "#else\n/* softlink: signature verification skipped — unsupported compiler/mode */\n#endif\n"))
 
+      if p.verifyWhen.len > 0:
+        emitArray.add(newStrLitNode("#endif /* softlink verifyWhen */\n"))
+
       verifyBody.add(newNimNode(nnkPragma).add(
         newNimNode(nnkExprColonExpr).add(
           ident("emit"),
@@ -395,6 +427,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## `libPattern` may be a bare logical name (``"z3"``), in which case the
   ## per-OS candidate names are derived automatically (see `deriveLibPattern`);
   ## or an explicit `loadLibPattern` string (``"libz3.so(.4|)"``), used verbatim.
+  ##
+  ## Per-proc pragmas: a calling convention (required), ``header`` (required
+  ## unless ``noverify``), ``optional`` (symbol may be missing at runtime),
+  ## ``verifyWhen: "C_PP_EXPR"`` (verify only when the preprocessor condition
+  ## holds — for symbols newer than some installed headers), and ``noverify``
+  ## (skip verification — for symbols no header declares).
   let resolvedPattern =
     if libPattern.isLogicalName: deriveLibPattern(libPattern, currentLibOs())
     else: libPattern
@@ -491,13 +529,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     var callConv = ""
     var isOptional = false
     var noVerify = false
+    var verifyWhen = ""
     var headerFile = ""
     let pragmas = stmt[4]
     if pragmas.kind == nnkPragma:
       for pragma in pragmas:
-        let pragmaName = if pragma.kind == nnkIdent: $pragma
-                         elif pragma.kind == nnkExprColonExpr: $pragma[0]
-                         else: ""
+        let pragmaName = pragmaKeyName(pragma)
         if pragmaName in callingConventions:
           if callConv != "":
             error("proc '" & nameStr & "' has multiple calling conventions", stmt)
@@ -506,6 +543,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           isOptional = true
         elif pragmaName == "noverify":
           noVerify = true
+        elif pragmaName == "verifyWhen":
+          verifyWhen = parseVerifyWhenExpr(pragma, stmt)
         elif pragmaName == "header":
           if pragma.kind == nnkExprColonExpr:
             headerFile = pragma[1].strVal
@@ -518,6 +557,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     if callConv == "":
       error("proc '" & nameStr &
             "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
+    if noVerify and verifyWhen.len > 0:
+      error("proc '" & nameStr & "': {.verifyWhen.} contradicts {.noverify.} — " &
+            "one requests conditional verification, the other none. Use " &
+            "verifyWhen alone for symbols the header declares only in some " &
+            "versions, or noverify alone for symbols no header declares", stmt)
     if headerFile == "" and not noVerify:
       error("proc '" & nameStr &
             "' must specify a header pragma (e.g., {.header: \"foo.h\".}), " &
@@ -526,7 +570,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: ptrName,
                         formalParams: formalParams, callConv: callConv,
                         headerFile: headerFile, isOptional: isOptional,
-                        noVerify: noVerify, hasReturn: hasReturn))
+                        noVerify: noVerify, verifyWhen: verifyWhen,
+                        hasReturn: hasReturn))
 
     # Build proc type for the var — C functions can't raise Nim exceptions
     var procTy = newNimNode(nnkProcTy)
@@ -547,6 +592,25 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newEmptyNode()
       )
     ))
+
+  # Visibility for trust points: enumerate {.noverify.} symbols at compile
+  # time so audits don't depend on grepping source. A hint in normal builds,
+  # upgraded to a warning under -d:softlinkStrictVerify — audit mode wants
+  # loudness, but an explicit opt-out must not fail the build. verifyWhen
+  # procs get no diagnostic: their status is decided by the C preprocessor
+  # and the pragma documents itself at the declaration site.
+  block:
+    var unverified: seq[string]
+    for p in procs:
+      if p.noVerify: unverified.add(p.nameStr)
+    if unverified.len > 0:
+      let msg = "softlink: dynlib \"" & libPattern & "\": " &
+        $unverified.len & (if unverified.len == 1: " symbol" else: " symbols") &
+        " not header-verified ({.noverify.}): " & unverified.join(", ")
+      when defined(softlinkStrictVerify):
+        warning(msg, body)
+      else:
+        hint(msg, body)
 
   for verifyNode in genVerifyBlock(procs, baseName):
     result.add(verifyNode)
@@ -833,12 +897,11 @@ proc collectVProcs(body: NimNode): seq[SoftlinkProc] =
     seenNames.incl(nameStr)
     var callConv = ""
     var headerFile = ""
+    var verifyWhen = ""
     let pragmas = stmt[4]
     if pragmas.kind == nnkPragma:
       for pragma in pragmas:
-        let pragmaName = if pragma.kind == nnkIdent: $pragma
-                         elif pragma.kind == nnkExprColonExpr: $pragma[0]
-                         else: ""
+        let pragmaName = pragmaKeyName(pragma)
         if pragmaName in callingConventions:
           callConv = pragmaName
         elif pragmaName == "header":
@@ -846,13 +909,21 @@ proc collectVProcs(body: NimNode): seq[SoftlinkProc] =
             headerFile = pragma[1].strVal
           else:
             error("header pragma requires a value (e.g., {.header: \"foo.h\".})", stmt)
+        elif pragmaName == "verifyWhen":
+          verifyWhen = parseVerifyWhenExpr(pragma, stmt)
+        elif pragmaName == "noverify":
+          error("noverify is meaningless in verifyProcs — the block exists " &
+                "solely to verify; simply omit proc '" & nameStr & "'", stmt)
+        elif pragmaName != "":
+          error("verifyProcs does not support pragma '" & pragmaName &
+                "' on proc '" & nameStr & "'", stmt)
     if callConv == "":
       error("proc '" & nameStr & "' must specify a calling convention pragma (e.g., {.cdecl.})", stmt)
     if headerFile == "":
       error("proc '" & nameStr & "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
     result.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
       formalParams: formalParams, callConv: callConv, headerFile: headerFile,
-      isOptional: false, hasReturn: hasReturn))
+      isOptional: false, verifyWhen: verifyWhen, hasReturn: hasReturn))
 
 macro verifyProcs*(body: untyped): untyped =
   ## Emit ONLY compile-time C header signature verification for the given proc
@@ -912,9 +983,7 @@ macro dyntype*(headerFile: static[string], body: untyped): untyped =
           if pragma.kind == nnkExprColonExpr and $pragma[0] == "ctype":
             ctype = pragma[1].strVal
           else:
-            let pname = if pragma.kind == nnkIdent: $pragma
-                        elif pragma.kind == nnkExprColonExpr: $pragma[0]
-                        else: ""
+            let pname = pragmaKeyName(pragma)
             if pname != "":
               error("dyntype does not support pragma '" & pname &
                     "' on type '" & $nimName & "'", pragma)

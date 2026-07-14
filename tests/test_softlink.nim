@@ -90,6 +90,17 @@ dynlib TestLib:
   # noverify symbol missing at runtime too — must degrade exactly like a
   # plain optional symbol (lands in `missing`, Available() false, raises).
   proc testlib_future_nv(): cint {.cdecl, optional, noverify.}
+  # {.verifyWhen.}: verification gated on a C preprocessor expression.
+  # TESTLIB_VERSION is 1, so this condition holds and the _Static_assert
+  # runs — a wrong signature here must fail the C compile.
+  proc testlib_gated(): cint
+    {.cdecl, verifyWhen: "TESTLIB_VERSION >= 1", header: "tests/testlib.h".}
+  # The motivating scenario: symbol newer than the installed header (absent
+  # from testlib.h, present in the .so). Condition is false → verification
+  # skipped; unlike {.noverify.}, a system with version >= 2 headers would
+  # verify this signature.
+  proc testlib_gated_v2(): cint
+    {.cdecl, optional, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
 
 # verifyProcs: compile-time signature verification ONLY (no loading, no
 # wrappers). Correct signatures must compile; the const-return case (#11)
@@ -97,12 +108,36 @@ dynlib TestLib:
 verifyProcs:
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   proc testlib_const_string(): cstring {.cdecl, header: "tests/testlib.h".}
+  # verifyWhen in verifyProcs: identical semantics to dynlib. True condition →
+  # verified (testlib_gated is declared in testlib.h); false condition →
+  # skipped entirely, so a symbol absent from the header must NOT be an
+  # implicit-declaration error.
+  proc testlib_gated(): cint
+    {.cdecl, verifyWhen: "TESTLIB_VERSION >= 1", header: "tests/testlib.h".}
+  proc testlib_gated_v2(): cint
+    {.cdecl, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
 
 suite "verifyProcs (static-binding header verification)":
   test "correct signatures pass compile-time verification":
     # Reaching here means the verifyProcs block above compiled — the
     # _Static_assert(s) held against the C header. No symbols were loaded.
     check true
+
+  test "compile-time: verifyProcs rejects noverify and unknown pragmas":
+    # Positive control first: unlike dynlib, verifyProcs generates no exported
+    # procs, so it is legal below top level and compiles() is meaningful here.
+    check compiles(block:
+      verifyProcs:
+        proc vp_ok(): cint {.cdecl, header: "tests/testlib.h".}
+    )
+    check not compiles(block:
+      verifyProcs:
+        proc vp_bad(): cint {.cdecl, noverify, header: "tests/testlib.h".}
+    )
+    check not compiles(block:
+      verifyProcs:
+        proc vp_vararg(): cint {.cdecl, varargs, header: "tests/testlib.h".}
+    )
 
 suite "softlink":
   # System library tests — Linux only
@@ -196,6 +231,15 @@ suite "softlink":
     check loadTestlib().kind in {lrOk, lrOkPartial}
     check testlib_unheraldedAvailable()
     check testlib_unheralded() == 99.cint
+
+  test "verifyWhen: true condition — symbol verified and callable":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_gated() == 21.cint
+
+  test "verifyWhen: false condition — symbol newer than header binds and resolves":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_gated_v2Available()
+    check testlib_gated_v2() == 42.cint
 
   test "noverify: symbol missing at runtime degrades like optional (#14)":
     check loadTestlib().kind in {lrOk, lrOkPartial}
