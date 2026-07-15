@@ -286,6 +286,103 @@ func analyzePrototype(prototype: string): PrototypeAnalysis =
       result.hasVariadic = true
       break
 
+const builtinCTypeKeywords = [
+  ## RFC-0001 §3 A.1, slice A6: the C keywords a prototype can use without
+  ## needing any header to resolve them — base types, qualifiers, and
+  ## storage-adjacent keywords that are part of the C grammar itself
+  ## rather than something a header `typedef`s or declares as a struct/
+  ## enum tag. Deliberately excludes `size_t`/`ptrdiff_t`/etc. — those are
+  ## real typedefs from `<stddef.h>` and friends, not language keywords, so
+  ## a prototype using them genuinely does need a header (or at least the
+  ## standard one that defines them; softlink does not special-case the
+  ## standard library headers per RFC-0001 §3 A.1: "softlink does not
+  ## attempt full detection").
+  "void", "char", "short", "int", "long", "float", "double",
+  "signed", "unsigned", "const", "volatile", "restrict",
+  "_Bool", "_Complex", "_Imaginary"
+]
+
+func nonBuiltinIdentifiers(prototype: string): seq[string] =
+  ## RFC-0001 §3 A.1, slice A6: scan a vendored prototype for identifiers
+  ## that are neither the C builtin-type allowlist above nor (best-effort)
+  ## the function name / parameter names, returning them in first-seen
+  ## order with duplicates removed. A non-empty result means the prototype
+  ## references a typedef/struct/enum tag only a header could define —
+  ## exactly the case where dropping `{.header.}` is likely a mistake.
+  ##
+  ## Reuses the shared A1 tokenizer (`tokenizePrototype`) — "one primitive,
+  ## two consumers" per that proc's doc comment. Deliberately NOT a full
+  ## declarator parse (RFC: "softlink does not attempt full detection"):
+  ## - The return type is every depth-0 token before the first depth-0
+  ##   `(`, minus the trailing one (the function name itself — already
+  ##   validated elsewhere to match the proc's Nim name).
+  ## - Each top-level parameter is a comma-separated span at depth 1
+  ##   between the matching parens. Only that parameter's OWN depth-1
+  ##   tokens are considered; anything nested deeper (a function-pointer
+  ##   parameter's internal parameter list, e.g. the `cb`/`int` inside
+  ##   `void (*cb)(int)`) is out of scope and simply not classified —
+  ##   erring toward fewer false hints rather than more, on the
+  ##   documented assumption that this rare shape is not the common case
+  ##   this hint targets.
+  ## - Within a parameter's depth-1 tokens, a trailing identifier is
+  ##   treated as the parameter's NAME (not its type) whenever something
+  ##   else precedes it (`unsigned char y` → `y` is the name); a lone
+  ##   identifier with nothing else in the parameter is instead an
+  ##   unnamed, typedef'd-type parameter (`Z3_context` alone) and IS
+  ##   classified — C prototypes have no other way to write "a single
+  ##   bare identifier" in a parameter position.
+  let tokens = tokenizePrototype(prototype)
+  var parenIdx = -1
+  for idx, tok in tokens:
+    if tok.kind == ptkPunct and tok.text == "(" and tok.depth == 0:
+      parenIdx = idx
+      break
+  if parenIdx == -1:
+    return @[]  # malformed; parsePrototypePragma already reports this
+
+  var seen: HashSet[string]
+  template consider(tok: PrototypeToken) =
+    if tok.kind == ptkIdent and tok.text notin builtinCTypeKeywords and
+       tok.text notin seen:
+      seen.incl(tok.text)
+      result.add(tok.text)
+
+  # Return-type identifiers: depth-0 tokens before the paren, minus the
+  # trailing function-name token.
+  for i in 0 ..< parenIdx - 1:
+    consider(tokens[i])
+
+  # The matching close paren that returns to depth 0.
+  var closeIdx = -1
+  for idx in parenIdx + 1 ..< tokens.len:
+    if tokens[idx].kind == ptkPunct and tokens[idx].text == ")" and
+       tokens[idx].depth == 0:
+      closeIdx = idx
+      break
+  if closeIdx == -1:
+    return  # malformed; shouldn't happen once parsePrototypePragma passed
+
+  # Parameter spans: split the range between the parens on depth-1 commas.
+  var segStart = parenIdx + 1
+  var segments: seq[tuple[a, b: int]]
+  for idx in parenIdx + 1 ..< closeIdx:
+    if tokens[idx].kind == ptkPunct and tokens[idx].text == "," and
+       tokens[idx].depth == 1:
+      segments.add((segStart, idx))
+      segStart = idx + 1
+  segments.add((segStart, closeIdx))
+
+  for (a, b) in segments:
+    var depth1: seq[PrototypeToken]
+    for idx in a ..< b:
+      if tokens[idx].depth == 1: depth1.add(tokens[idx])
+    if depth1.len == 0:
+      continue
+    let dropTrailingName = depth1.len > 1 and depth1[^1].kind == ptkIdent
+    let stop = if dropTrailingName: depth1.len - 1 else: depth1.len
+    for i in 0 ..< stop:
+      consider(depth1[i])
+
 proc parsePrototypePragma(pragma, stmt: NimNode, nameStr: string): tuple[raw, name: string] =
   ## Extract and validate the `{.prototype: "<C prototype>".}` pragma
   ## (RFC-0001 §3 A.1): a non-empty string literal — triple-quoted/
@@ -450,6 +547,32 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
             "' must specify a header pragma (e.g., {.header: \"foo.h\".}) " &
             "or a prototype pragma (e.g., {.prototype: \"" & nameStr &
             "(...)\".})", stmt)
+
+  # RFC-0001 §3 A.1, slice A6: "`header` becomes optional when `prototype`
+  # is present iff the prototype uses only builtin C types. softlink does
+  # not attempt full detection, but when `header` is absent and the
+  # prototype contains identifiers outside a builtin-type allowlist ...
+  # it emits a hint ... so the failure mode is a softlink diagnostic first
+  # and a raw C error second." The lift itself stays unconditional (slice
+  # A1/A2 behavior, preserved) — this is diagnostic-only, never an error:
+  # a non-builtin identifier is *usually* a sign `{.header.}` was dropped
+  # by mistake, but the RFC never demotes that to a hard requirement, and
+  # cross-checking (`prototype` + `header` together) is a legitimate
+  # reason to still have no builtin-only prototype rejected. Shared by
+  # both modes — `dynlib` and `verifyProcs` disagree on nothing here.
+  # Same hint-normally/warning-under-strict convention as the {.noverify.}
+  # trust-point hint below (RFC design principle 2: "trust points are
+  # visible").
+  if result.headerFile == "" and result.prototype.len > 0:
+    let unresolved = nonBuiltinIdentifiers(result.prototype)
+    if unresolved.len > 0:
+      let msg = "softlink: " & macroName & ": proc '" & nameStr &
+        "': this prototype may need `header:` to resolve " &
+        unresolved.join(", ")
+      when defined(softlinkStrictVerify):
+        warning(msg, stmt)
+      else:
+        hint(msg, stmt)
 
 proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes

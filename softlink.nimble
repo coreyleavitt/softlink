@@ -80,10 +80,50 @@ task test, "Run tests":
       quit("softlink: RFC-0001 slice A4 expected a compile FAILURE (header " &
            "vs. prototype conflict on testlib_add) but the compile " &
            "SUCCEEDED: " & cmd)
+
+  proc expectNoEmptyInclude(dumpCmd: string) =
+    ## RFC-0001 slice A6: assert the generated C contains no `#include ""`
+    ## — the exact invalid directive the RFC calls out (§3 A.1: "the
+    ## verify TU's include-collection loop must skip empty headerFile
+    ## entries (today it would emit an invalid #include \"\")") — for an
+    ## all-prototype-only block (no {.header.} anywhere). NOT a blanket
+    ## "zero #include substring anywhere" check: every Nim-generated .c
+    ## file unconditionally #includes its own runtime headers
+    ## (`nimbase.h` et al.), and `genVerifyBlock` itself unconditionally
+    ## emits one further fixed scaffolding line, `#include <type_traits>`
+    ## (guarded by `#if defined(__cplusplus)`), needed by the C++ tier's
+    ## const-stripping helper for ANY proc going through that tier —
+    ## header-driven or not. Neither of those is "a header this BLOCK
+    ## asked to verify against" in the RFC's sense; the one thing that
+    ## must never appear is the malformed empty-string directive a
+    ## missing `headerFile != ""` guard would produce.
+    ##
+    ## This is an ABSENCE assertion, so (unlike every `grep -q` presence
+    ## check in this file) it can't just be `exec cmd | grep -q ...`: that
+    ## pattern makes the task FAIL when the string is absent, the opposite
+    ## polarity of what's wanted here. Same `gorgeEx` + Nim-side decision
+    ## shape as `expectCompileFailure` above — `dumpCmd` is an OS-
+    ## appropriate "dump these generated .c files to stdout" command
+    ## (`cat`/`type`), not a search tool, so there's no exit-code polarity
+    ## to fight in the first place.
+    let (output, _) = gorgeEx(dumpCmd)
+    if "#include \"\"" in output:
+      echo output
+      quit("softlink: RFC-0001 slice A6 expected NO invalid `#include \"\"` " &
+           "in the all-prototype-only verify TU, but found one")
   # (--compileOnly: the diagnostics fire at macro expansion, so skipping the
   # C compile+link keeps the check fast and leaves no stray binary behind.)
   const hintCheck = "nim c --compileOnly --path:src tests/thint_noverify.nim"
   const warnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify.nim"
+  # RFC-0001 slice A6: a {.prototype.}-only proc (no {.header.}) whose
+  # prototype references a non-builtin identifier (found via the shared
+  # A1 tokenizer) must emit a hint naming it — "this prototype may need
+  # `header:` to resolve <T>" — upgraded to a warning under
+  # -d:softlinkStrictVerify, same convention as the {.noverify.} hint above.
+  const nonBuiltinHintCheck =
+    "nim c --compileOnly --path:src tests/thint_prototype_nonbuiltin.nim"
+  const nonBuiltinWarnCheck = "nim c --compileOnly --path:src " &
+    "-d:softlinkStrictVerify tests/thint_prototype_nonbuiltin.nim"
   # RFC-0001 slice A2: a {.prototype.}-only proc (testlib_protoonly, no
   # {.header.}) must be verified for real against its vendored C prototype —
   # emitted as a file-scope `extern` declaration in the verify TU, ahead of
@@ -97,6 +137,16 @@ task test, "Run tests":
   const protoEmitDir = "tests/nimcache_protocheck"
   const protoEmitCheck = "nim c --compileOnly --nimcache:" & protoEmitDir &
     " --path:src --passC:-I. tests/test_softlink.nim"
+  # RFC-0001 slice A6: the empty-include skip. A verifyProcs block whose
+  # procs are ALL prototype-only (no {.header.} anywhere) must NOT emit
+  # the invalid `#include ""` a naive per-proc header loop would produce
+  # (see `expectNoEmptyInclude` above) while still emitting the vendored
+  # `extern` declaration — the skip must not silently disable verification
+  # too.
+  const protoOnlyDir = "tests/nimcache_protoonly"
+  const protoOnlyCheck = "nim c --compileOnly --nimcache:" & protoOnlyDir &
+    " --path:src tests/tcheck_protoonly_no_include.nim"
+  const protoOnlyDecl = "extern int softlink_a6_protoonly_check(int a, int b);"
   # RFC-0001 slice A5: {.prototype.} + {.verifyWhen.} composition — the gate
   # must wrap the emitted DECLARATION itself, not merely its assert (A.1:
   # "both the emitted declaration and its assert are gated by the #if").
@@ -142,6 +192,7 @@ task test, "Run tests":
   const protoGateFalseCheck = "grep -rFA5 '" & protoGateFalseAnchor & "' " &
     protoEmitDir & " | grep -Fq '" & protoGateFalseDecl & "'"
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
+  if dirExists(protoOnlyDir): rmDir(protoOnlyDir)
   when defined(windows):
     exec "gcc -shared -o tests/testlib.dll tests/testlib.c"
     exec "gcc -shared -o tests/libmagic.dll tests/testlib.c"
@@ -157,6 +208,8 @@ task test, "Run tests":
     expectCompileFailure(protoConflictCppCheck)
     exec hintCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Hint:\" >NUL"
     exec warnCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Warning:\" >NUL"
+    exec nonBuiltinHintCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Hint:\" >NUL"
+    exec nonBuiltinWarnCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Warning:\" >NUL"
     exec protoEmitCheck
     exec "findstr /s /m /c:\"extern int testlib_protoonly(void);\" " &
       protoEmitDir & "\\*.c >NUL"
@@ -174,6 +227,11 @@ task test, "Run tests":
     exec "findstr /s /m /c:\"" & protoGateFalseDecl & "\" " &
       protoEmitDir & "\\*.c >NUL"
     rmDir(protoEmitDir)
+    exec protoOnlyCheck
+    expectNoEmptyInclude("type " & protoOnlyDir & "\\*.c")
+    exec "findstr /s /m /c:\"" & protoOnlyDecl & "\" " &
+      protoOnlyDir & "\\*.c >NUL"
+    rmDir(protoOnlyDir)
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -188,11 +246,17 @@ task test, "Run tests":
     expectCompileFailure(protoConflictCppCheck)
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
+    exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
+    exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
     exec protoEmitCheck
     exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
     exec protoGateTrueCheck
     exec protoGateFalseCheck
     rmDir(protoEmitDir)
+    exec protoOnlyCheck
+    expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")
+    exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
+    rmDir(protoOnlyDir)
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -219,8 +283,14 @@ task test, "Run tests":
     exec protoConflictCCheck & " 2>&1 | grep -q 'conflicting types for'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
+    exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
+    exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
     exec protoEmitCheck
     exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
     exec protoGateTrueCheck
     exec protoGateFalseCheck
     rmDir(protoEmitDir)
+    exec protoOnlyCheck
+    expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")
+    exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
+    rmDir(protoOnlyDir)

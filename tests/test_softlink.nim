@@ -295,6 +295,41 @@ suite "prototype tokenizer/analyzer (RFC-0001 slice A1)":
     let a = analyzePrototype("int foo")
     check not a.ok
 
+suite "nonBuiltinIdentifiers — builtin-type classification (RFC-0001 slice A6)":
+  # Pure function over the shared A1 tokenizer. Excludes the function name
+  # (already validated elsewhere) and, best-effort, parameter names — see
+  # the doc comment on `nonBuiltinIdentifiers` for the exact scope limits
+  # (nested function-pointer-parameter internals are not classified).
+  test "all-builtin prototype: no non-builtin identifiers":
+    check nonBuiltinIdentifiers("int foo(int x, unsigned char y)").len == 0
+
+  test "'void' as the sole (no-args) parameter is builtin, not flagged":
+    check nonBuiltinIdentifiers("int foo(void)").len == 0
+
+  test "non-builtin return type is flagged, function name excluded":
+    check nonBuiltinIdentifiers("Foo_Type bar(void)") == @["Foo_Type"]
+
+  test "non-builtin named parameter type is flagged, parameter name excluded":
+    check nonBuiltinIdentifiers("int baz(Foo_Context c)") == @["Foo_Context"]
+
+  test "non-builtin unnamed parameter (bare typedef) is flagged":
+    check nonBuiltinIdentifiers("int qux(Foo_Context)") == @["Foo_Context"]
+
+  test "const-qualified pointer to a typedef: qualifier ignored, typedef flagged":
+    check nonBuiltinIdentifiers("const Foo_Context *get(void)") == @["Foo_Context"]
+
+  test "duplicate non-builtin identifiers reported once, first-seen order":
+    check nonBuiltinIdentifiers("int f(Foo_T a, Foo_T b)") == @["Foo_T"]
+
+  test "multiple distinct non-builtin identifiers preserve first-seen order":
+    check nonBuiltinIdentifiers("Foo_A f(Foo_B x, Foo_C y)") == @["Foo_A", "Foo_B", "Foo_C"]
+
+  test "nested function-pointer parameter internals are out of scope, not false-flagged":
+    # `void (*cb)(int)`'s own "cb"/"int" are nested past depth 1 and are
+    # deliberately not classified (RFC: "softlink does not attempt full
+    # detection") — only the sibling parameter's typedef is flagged.
+    check nonBuiltinIdentifiers("int reg(void (*cb)(int), Foo_Ctx c)") == @["Foo_Ctx"]
+
 suite "verifyProcs — prototype pragma (RFC-0001 slice A1)":
   test "positive: prototype + header coexist, name matches proc":
     check compiles(block:
