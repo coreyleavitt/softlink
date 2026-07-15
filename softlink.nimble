@@ -8,6 +8,54 @@ srcDir        = "src"
 # Dependencies
 requires "nim >= 2.0.0"
 
+import std/json
+
+proc validateProbeJson(path, expectKind, expectBaseName: string) =
+  ## RFC-0001 §4 B.1 nimble-task check: schema validation for one
+  ## `<Base>.probes.json` file written by `-d:softlinkDumpProbes=<dir>`.
+  ## Checks existence, valid JSON, every required top-level/per-proc key
+  ## present, AND no unexpected extra key (the guard against an accidental
+  ## source-text/repr field creeping back into the schema — see the RFC's
+  ## round-2 "no source text" note). OS-agnostic (plain JSON key
+  ## inspection, not compiler-diagnostic-wording), so the SAME call works
+  ## unchanged from all three OS branches below, unlike every grep/findstr
+  ## fixture check in this file.
+  if not fileExists(path):
+    quit("softlink: RFC-0001 slice B1 expected probe-facts file to exist: " & path)
+  let j = parseJson(readFile(path))
+  const topKeys = ["schemaVersion", "kind", "modulePath", "libPattern",
+                    "baseName", "procs"]
+  for key in topKeys:
+    if not j.hasKey(key):
+      quit("softlink: RFC-0001 slice B1: " & path &
+           " missing required top-level key '" & key & "'")
+  if j.len != topKeys.len:
+    quit("softlink: RFC-0001 slice B1: " & path &
+         " has unexpected top-level key(s) beyond the schema: " & $j)
+  if j["kind"].getStr != expectKind:
+    quit("softlink: RFC-0001 slice B1: " & path & " kind mismatch: expected '" &
+         expectKind & "', got '" & j["kind"].getStr & "'")
+  if j["baseName"].getStr != expectBaseName:
+    quit("softlink: RFC-0001 slice B1: " & path &
+         " baseName mismatch: expected '" & expectBaseName & "', got '" &
+         j["baseName"].getStr & "'")
+  if j["modulePath"].getStr.len == 0:
+    quit("softlink: RFC-0001 slice B1: " & path & " has an empty modulePath")
+  if j["procs"].kind != JArray or j["procs"].len == 0:
+    quit("softlink: RFC-0001 slice B1: " & path & " has no procs array (or it's empty)")
+  const procKeys = ["nimName", "cName", "header", "prototype", "verifyWhen",
+                     "optional", "noverify", "noverifyReason", "since"]
+  for p in j["procs"]:
+    for key in procKeys:
+      if not p.hasKey(key):
+        quit("softlink: RFC-0001 slice B1: " & path &
+             " has a proc entry missing required key '" & key & "': " & $p)
+    if p.len != procKeys.len:
+      quit("softlink: RFC-0001 slice B1: " & path &
+           " has a proc entry with unexpected extra key(s) — possible " &
+           "source-text leak: " & $p)
+  echo "softlink: RFC-0001 slice B1: validated " & path
+
 proc expectCompileFailure(cmd: string) =
   ## RFC-0001 slice A4: assert a compile FAILS by exit code alone. Every
   ## other tfail_* check in this file greps compiler/softlink output for a
@@ -260,6 +308,60 @@ task test, "Run tests":
     "extern void vp_proto_gated_false(double a, double b, double c);"
   const vpProtoGateFalseCheck = "grep -rFA5 '" & protoGateFalseAnchor & "' " &
     protoEmitDir & " | grep -Fq '" & vpProtoGateFalseDecl & "'"
+
+  # RFC-0001 slice B1: -d:softlinkDumpProbes=<dir> probe-facts dump.
+  # tests/tcheck_dump_probes.nim contains one dynlib block (base name
+  # "Dumpfoo") and one verifyProcs block (base name "VerifyTestlib_noop" —
+  # see the tag-reuse rationale on `dumpProbeFacts`'s call site in
+  # src/softlink.nim). Validation is schema/JSON-shaped, not compiler-
+  # diagnostic-wording-shaped, so — unlike every other check in this file —
+  # it needs no grep/findstr split: `runDumpProbesCheck` below is called
+  # verbatim, unchanged, from all three OS branches.
+  #
+  # `-d:softlinkDumpProbes` requires an ABSOLUTE directory (src/softlink.nim's
+  # `dumpProbeFacts` doc comment has the full explanation: `staticExec`'s
+  # subprocess cwd is tied to softlink.nim's own directory, not this
+  # process's), so the dir is built from `getCurrentDir()` — nimble tasks
+  # run in an unrestricted NimScript VM where `getCurrentDir()` genuinely
+  # works (unlike ordinary compile-time macro/VM code, where it fails with
+  # "cannot 'importc' variable at compile time; getcwd" — the exact
+  # asymmetry that makes the absolute-path requirement necessary in the
+  # first place).
+  let dumpProbesDir = getCurrentDir() & "/tests/nimcache_dumpprobes"
+  let dumpProbesCheck = "nim c --compileOnly --path:src -d:softlinkDumpProbes=" &
+    dumpProbesDir & " tests/tcheck_dump_probes.nim"
+  const dumpProbesNoDefineCheck =
+    "nim c --compileOnly --path:src tests/tcheck_dump_probes.nim"
+
+  proc runDumpProbesCheck() =
+    ## RFC-0001 slice B1: exercises BOTH macros' dump path, the "stale file
+    ## at the target path gets cleanly replaced" atomicity proxy (§4 B.1:
+    ## "a torn write must never be observable" — the race itself can't be
+    ## driven from a task, but a pre-existing garbage file at the target
+    ## path getting replaced by a fresh, valid document is something this
+    ## CAN check), and the no-define path (byte-identical behavior: no
+    ## dump directory at all — this slice is purely additive).
+    let dynlibFile = dumpProbesDir & "/Dumpfoo.probes.json"
+    let verifyFile = dumpProbesDir & "/VerifyTestlib_noop.probes.json"
+    if dirExists(dumpProbesDir): rmDir(dumpProbesDir)
+    # No-define control: compiling the SAME fixture without the define must
+    # create no dump directory whatsoever.
+    exec dumpProbesNoDefineCheck
+    if dirExists(dumpProbesDir):
+      quit("softlink: RFC-0001 slice B1 expected NO " & dumpProbesDir &
+           " directory without -d:softlinkDumpProbes — the dump must be " &
+           "inert when the define is absent")
+    # Stale-file replacement: a pre-existing, non-JSON file at the target
+    # path must be cleanly replaced by write-then-rename, not appended to
+    # or left corrupt.
+    mkDir(dumpProbesDir)
+    writeFile(dynlibFile, "not valid json, pre-existing garbage")
+    writeFile(verifyFile, "not valid json, pre-existing garbage")
+    exec dumpProbesCheck
+    validateProbeJson(dynlibFile, "dynlib", "Dumpfoo")
+    validateProbeJson(verifyFile, "verifyProcs", "VerifyTestlib_noop")
+    rmDir(dumpProbesDir)
+
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   if dirExists(protoOnlyDir): rmDir(protoOnlyDir)
   when defined(windows):
@@ -341,6 +443,7 @@ task test, "Run tests":
     exec "findstr /s /m /c:\"" & protoOnlyDecl & "\" " &
       protoOnlyDir & "\\*.c >NUL"
     rmDir(protoOnlyDir)
+    runDumpProbesCheck()
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -395,6 +498,7 @@ task test, "Run tests":
     expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")
     exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
+    runDumpProbesCheck()
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -455,6 +559,7 @@ task test, "Run tests":
     expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")
     exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
+    runDumpProbesCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
   ## `task test`'s `when defined(windows):` branch always builds the

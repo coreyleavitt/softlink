@@ -12,7 +12,7 @@
 when defined(js):
   {.error: "softlink requires a native backend (C, C++, or Objective-C). The JavaScript backend does not support dynamic library loading.".}
 
-import std/[macros, sets, strutils]
+import std/[macros, sets, strutils, os, json]
 import std/dynlib as stdDynlib
 # Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
@@ -888,6 +888,120 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
     nodes.add(verifyProc)
   return nodes
 
+const softlinkDumpProbes {.strdefine.} = ""
+  ## RFC-0001 §4 B.1: with `-d:softlinkDumpProbes=<dir>`, every `dynlib`
+  ## and `verifyProcs` block writes one probe-facts JSON file to `<dir>`
+  ## at macro-expansion time (see `dumpProbeFacts` below) — module path,
+  ## lib pattern, base name, and per-proc pragma facts, for the (future,
+  ## Stage B3) harvester to consume. This define is a **dedicated,
+  ## single-shot invocation**: run it to (re)generate probe files for a
+  ## harvest pass, not something to leave enabled in ordinary dev/CI
+  ## builds. Without it (the default — `softlinkDumpProbes == ""`),
+  ## `dynlib`/`verifyProcs` perform zero extra work and touch no
+  ## filesystem path beyond the compiler's own build products: this
+  ## slice is purely additive.
+
+proc probeFactsJson(p: SoftlinkProc): JsonNode =
+  ## One proc's pragma facts as a JSON object for the RFC-0001 §4 B.1
+  ## probe dump. Deliberately **facts only, no source text**: `prototype`
+  ## is dumped as-is because it IS a pragma fact (a string the user
+  ## wrote), not a `repr`/declaration reconstruction — the round-1 design
+  ## that reassembled proc bodies from `repr` was abandoned (RFC §4 B.1's
+  ## round-2 note): it couldn't reproduce pragma-clause semantics
+  ## (`optional` etc.) or supply the user's own type definitions from
+  ## outside the block.
+  ##
+  ## `cName` duplicates `nimName`: softlink has no `{.importc: "...".}`-
+  ## style rename axis today — the C symbol `symAddr`/the verify assert
+  ## look up IS the proc's Nim name (see `dynlib`'s `loadXxx` body and
+  ## `genVerifyBlock`, both keyed on `nameStr`). Both keys are still
+  ## emitted so the harvester's schema doesn't have to special-case their
+  ## current equality if that axis is ever added.
+  ##
+  ## `since` is always `""`: RFC-0001 §9 Stage C introduces the `since`
+  ## pragma; the key is reserved here (rather than left absent) so the
+  ## harvester's key set doesn't churn when Stage C lands.
+  %*{
+    "nimName": p.nameStr,
+    "cName": p.nameStr,
+    "header": p.headerFile,
+    "prototype": p.prototype,
+    "verifyWhen": p.verifyWhen,
+    "optional": p.isOptional,
+    "noverify": p.noVerify,
+    "noverifyReason": p.noVerifyReason,
+    "since": ""
+  }
+
+proc dumpProbeFacts(kind, modulePath, libPattern, baseName: string,
+                     procs: seq[SoftlinkProc], callNode: NimNode) =
+  ## RFC-0001 §4 B.1: write `<softlinkDumpProbes>/<baseName>.probes.json`.
+  ## No-op when the `-d:softlinkDumpProbes=<dir>` define is absent or was
+  ## given an empty value — the common case, and the entirety of this
+  ## slice's footprint when unused.
+  ##
+  ## Write-then-rename, because nimsuggest/`nim check` expand macros
+  ## speculatively and a torn write must never be observable by a
+  ## concurrent reader (RFC §4 B.1): `writeFile` runs fine from macro/VM
+  ## code, but `os.moveFile` does not — it FFI-imports `c_rename`, which
+  ## the compile-time VM refuses ("cannot 'importc' variable at compile
+  ## time"). `staticExec` (the documented fallback of last resort) shells
+  ## out for the rename step only, to the platform's own atomic-rename
+  ## command (POSIX `mv -f`, an atomic `rename()` within one directory;
+  ## Windows `move /Y`) — the part that could tear (the actual byte
+  ## content) is still a single `writeFile` to a `.tmp` sibling in the
+  ## SAME directory, so the rename is same-filesystem by construction.
+  ##
+  ## `softlinkDumpProbes` MUST be an absolute path (enforced below,
+  ## empirically discovered during this slice's TDD cycle): Nim ties
+  ## `staticExec`'s subprocess working directory to the directory of the
+  ## Nim FILE that lexically contains the `staticExec` call — this file,
+  ## softlink.nim — never to the invoking `nim c`'s actual process cwd.
+  ## `writeFile`/`createDir` above, by contrast, DO resolve relative paths
+  ## against the true process cwd (verified directly: a relative dir
+  ## produces `.tmp` files under the real invocation directory, while the
+  ## following `staticExec("mv ...")` with that SAME relative path fails
+  ## with "cannot stat ... No such file or directory", because its shell
+  ## subprocess cwd is softlink.nim's own directory instead). Requiring an
+  ## absolute `<dir>` sidesteps the mismatch entirely (absolute paths are
+  ## cwd-independent) rather than attempting to reconstruct the invoking
+  ## process's cwd from inside the VM, which has no accessible primitive
+  ## for it (`os.getCurrentDir`/`absolutePath` themselves fail at compile
+  ## time — "cannot 'importc' variable at compile time; getcwd"). This is
+  ## a fine constraint for the documented single-shot harvester
+  ## invocation this define targets (B.2/B.3 fully control the `-d:` value
+  ## they pass), not a hardship for a human typing it once.
+  if softlinkDumpProbes.len == 0: return
+  if not isAbsolute(softlinkDumpProbes):
+    error("softlink: -d:softlinkDumpProbes requires an ABSOLUTE directory " &
+          "path (got '" & softlinkDumpProbes & "') — its write-then-rename " &
+          "step shells out via staticExec, whose working directory Nim " &
+          "ties to the directory of the Nim file containing the call " &
+          "(softlink.nim itself), not the invoking `nim c`'s process cwd, " &
+          "so a relative path here resolves to the wrong location. Pass " &
+          "an absolute path, e.g. -d:softlinkDumpProbes=$(pwd)/probes on " &
+          "POSIX shells.", callNode)
+    return
+  createDir(softlinkDumpProbes)
+  var procsArr = newJArray()
+  for p in procs:
+    procsArr.add(probeFactsJson(p))
+  let doc = %*{
+    "schemaVersion": 1,
+    "kind": kind,
+    "modulePath": modulePath,
+    "libPattern": libPattern,
+    "baseName": baseName,
+    "procs": procsArr
+  }
+  let target = softlinkDumpProbes / (baseName & ".probes.json")
+  let tmp = target & ".tmp"
+  writeFile(tmp, doc.pretty)
+  when defined(windows):
+    discard staticExec("cmd /c move /Y " & quoteShell(tmp) & " " & quoteShell(target))
+  else:
+    discard staticExec("mv -f " & quoteShell(tmp) & " " & quoteShell(target))
+
 macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## Generate type-safe, runtime-optional bindings for a dynamic library.
   ## The generated ``loadXxx``/``unloadXxx`` procs are **not thread-safe**.
@@ -1029,6 +1143,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newEmptyNode()
       )
     ))
+
+  # RFC-0001 §4 B.1: dump this block's probe facts (no-op unless
+  # -d:softlinkDumpProbes=<dir> is given). `libPattern` (the macro's
+  # as-typed argument), not `resolvedPattern` (the OS-expanded form), is
+  # dumped — the same choice already made for `baseName` above, and for
+  # the same reason (a single, OS-stable identity for the block).
+  dumpProbeFacts("dynlib", body.lineInfoObj.filename, libPattern, baseName, procs, body)
 
   # Visibility for trust points (RFC-0001 principle 2: "anything unverified
   # is surfaced at compile time, never silent"): enumerate {.noverify.}
@@ -1371,6 +1492,21 @@ macro verifyProcs*(body: untyped): untyped =
   result = newStmtList()
   for n in genVerifyBlock(procs, tag):
     result.add(n)
+
+  # RFC-0001 §4 B.1, spec gap resolved: `verifyProcs` blocks have no lib
+  # pattern and no derived ident base — `dynlib`'s "one file per derived
+  # base name" doesn't literally apply. Base name here is
+  # `"Verify" & capitalizeAscii(tag)`, reusing the SAME `tag`
+  # `genVerifyBlock` already uses to name the emitted `softlinkVerify<tag>`
+  # C proc (first proc's name, or "anon" for an empty block) — it is
+  # already the deterministic, block-unique discriminator this macro relies
+  # on (two blocks sharing a `tag` would already collide on that generated
+  # proc's name and fail to compile), so reusing it introduces no new
+  # naming scheme. `libPattern` is "" and `kind` is "verifyProcs", giving
+  # the Stage B3 harvester an explicit way to tell the two block kinds
+  # apart instead of inferring it from an empty `libPattern` alone.
+  dumpProbeFacts("verifyProcs", body.lineInfoObj.filename, "",
+                 "Verify" & capitalizeAscii(tag), procs, body)
 
 macro dyntype*(headerFile: static[string], body: untyped): untyped =
   ## Verify Nim struct layouts match C header struct definitions at compile time.
