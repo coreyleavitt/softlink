@@ -9,6 +9,7 @@ srcDir        = "src"
 requires "nim >= 2.0.0"
 
 import std/json
+import std/strutils
 
 proc validateProbeJson(path, expectKind, expectBaseName: string) =
   ## RFC-0001 §4 B.1 nimble-task check: schema validation for one
@@ -362,6 +363,218 @@ task test, "Run tests":
     validateProbeJson(verifyFile, "verifyProcs", "VerifyTestlib_noop")
     rmDir(dumpProbesDir)
 
+  # RFC-0001 §4 B.2: define-gated probe modes (`-d:softlinkProbeOnly=<sym|->`
+  # / `-d:softlinkProbeExistence`). tests/tcheck_probe_only.nim carries one
+  # dynlib block spanning all four declaration-source/gating axes the slice
+  # brief calls for: testlib_add (header + prototype, cross-checked),
+  # testlib_noop (header only), testlib_future (optional + header),
+  # testlib_gated (verifyWhen-gated + header) — reusing existing testlib.h
+  # symbols already proven correct elsewhere in this suite, same convention
+  # as tcheck_dump_probes.nim. tests/tcheck_probe_only_verifyprocs.nim
+  # proves the identical mechanism through `verifyProcs` alone (suppression/
+  # probing/existence classification lives once, in the shared
+  # `genVerifyBlock`, so both macros get it for free — see src/softlink.nim).
+  #
+  # Verification is inspected DIRECTLY against softlink's own emitted C via
+  # `walkGenSources`/`expectAnchor` below (NimScript's own `listDirs`/
+  # `listFiles`/`readFile` — NOT `std/os`'s `walkDirRec`; importing
+  # `std/os` here breaks NimScript builtins, per this file's other notes).
+  # That inspection targets softlink's OWN text, not a C/C++ compiler's
+  # diagnostic wording, so — like `validateProbeJson`'s schema check above —
+  # it needs no grep/findstr split and runs identically from all three OS
+  # branches via one call, `runProbeOnlyChecks()`.
+  const probeOnlyM0 = "tests/nimcache_probeonly_m0"
+  const probeOnlyM1 = "tests/nimcache_probeonly_m1"
+  const probeOnlyM2 = "tests/nimcache_probeonly_m2"
+  const probeOnlyM3 = "tests/nimcache_probeonly_m3"
+  const probeOnlyM3cpp = "tests/nimcache_probeonly_m3cpp"
+  const probeOnlyM4 = "tests/nimcache_probeonly_m4"
+  const probeOnlyV0 = "tests/nimcache_probeonly_v0"
+  const probeOnlyV1 = "tests/nimcache_probeonly_v1"
+  const probeOnlyV2 = "tests/nimcache_probeonly_v2"
+  const probeOnlyDirs = [probeOnlyM0, probeOnlyM1, probeOnlyM2, probeOnlyM3,
+                          probeOnlyM3cpp, probeOnlyM4,
+                          probeOnlyV0, probeOnlyV1, probeOnlyV2]
+
+  const poAssertAdd = "softlink: testlib_add signature mismatch vs tests/testlib.h"
+  const poAssertNoop = "softlink: testlib_noop signature mismatch vs tests/testlib.h"
+  const poAssertFuture = "softlink: testlib_future signature mismatch vs tests/testlib.h"
+  const poAssertGated = "softlink: testlib_gated signature mismatch vs tests/testlib.h"
+  const poProtoDeclAdd = "extern int testlib_add(int a, int b);"
+  const poInclude = "#include \"tests/testlib.h\""
+  const poExistAddGcc = "sizeof(__typeof__(&testlib_add))"
+  const poExistAddCpp = "sizeof(decltype(&testlib_add))"
+  # Adjacency proof (same rigor as protoGateTrueCheck's `grep -A5` above,
+  # just expressed as one literal substring instead of a shell pipeline):
+  # the gated proc's existence reference — ALL THREE tiers — sits directly
+  # inside its own `#if (EXPR)` gate, exactly as `emitPrototypeDecl`'s
+  # verifyWhen wrapping already proved for {.prototype.} decls.
+  const poExistGatedGated =
+    "#if (TESTLIB_VERSION >= 1) /* softlink verifyWhen */\n" &
+    "#if defined(__cplusplus)\n(void)sizeof(decltype(&testlib_gated));\n" &
+    "#elif defined(__GNUC__)\n(void)sizeof(__typeof__(&testlib_gated));"
+
+  const vpoAssertMagic = "softlink: testlib_magic signature mismatch vs tests/testlib.h"
+  const vpoAssertProtoonly = "softlink: testlib_protoonly signature mismatch vs vendored prototype"
+  const vpoProtoDeclProtoonly = "extern int testlib_protoonly(void);"
+  const vpoExistMagicGcc = "sizeof(__typeof__(&testlib_magic))"
+
+  proc walkGenSources(dir: string): seq[string] =
+    ## All generated .c/.cpp files under one --nimcache dir. NimScript's
+    ## `listDirs`/`listFiles` are each non-recursive (see their doc
+    ## comments in system/nimscript.nim), so this walks the tree by hand
+    ## with an explicit stack rather than reaching for `std/os.walkDirRec`.
+    var stack = @[dir]
+    while stack.len > 0:
+      let d = stack.pop()
+      for f in listFiles(d):
+        if f.endsWith(".c") or f.endsWith(".cpp"):
+          result.add(f)
+      for sub in listDirs(d):
+        stack.add(sub)
+
+  proc slurpGenSources(dir: string): string =
+    for f in walkGenSources(dir):
+      result.add(readFile(f))
+      result.add('\n')
+
+  proc expectAnchor(dir, needle, label: string, wantPresent: bool) =
+    ## RFC-0001 slice B2: presence/absence assertion against softlink's own
+    ## emitted C for one probe-mode compile. `wantPresent = false` covers
+    ## the suppression side of the brief (an absence assertion, the same
+    ## polarity problem `expectNoEmptyInclude` above already solves for a
+    ## single fixed needle — this generalizes it to an arbitrary needle so
+    ## every probe-mode assertion below doesn't need its own bespoke helper).
+    let found = needle in slurpGenSources(dir)
+    if found != wantPresent:
+      quit("softlink: RFC-0001 slice B2 (" & label & "): expected '" &
+           needle & "' to be " & (if wantPresent: "PRESENT" else: "ABSENT") &
+           " under " & dir & ", but it was " &
+           (if found: "present" else: "absent"))
+
+  proc runProbeOnlyChecks() =
+    ## Compiles both probe-mode fixtures under every configuration the
+    ## slice brief lists, then asserts on the resulting generated C. Exits
+    ## non-zero (via `quit`, from `expectAnchor`, or from `exec` itself
+    ## raising on a nonzero compiler exit) on any mismatch.
+    for d in probeOnlyDirs:
+      if dirExists(d): rmDir(d)
+
+    let cBase = "nim c --compileOnly --path:src --passC:-I. --nimcache:"
+    # M0: no defines — control. Every predicate in genVerifyBlock's probe
+    # logic is unreachable when both consts are at their default/empty
+    # value, so this compile is byte-identical to pre-B2 emission by
+    # construction; this assertion is the executable proof of that claim.
+    exec cBase & probeOnlyM0 & " tests/tcheck_probe_only.nim"
+    # M1: -d:softlinkProbeOnly=- — suppress everything (harvester baseline).
+    exec cBase & probeOnlyM1 & " -d:softlinkProbeOnly=- tests/tcheck_probe_only.nim"
+    # M2: -d:softlinkProbeOnly=testlib_add — only that symbol survives.
+    exec cBase & probeOnlyM2 & " -d:softlinkProbeOnly=testlib_add tests/tcheck_probe_only.nim"
+    # M3: M2 + -d:softlinkProbeExistence — existence-only for testlib_add.
+    exec cBase & probeOnlyM3 &
+      " -d:softlinkProbeOnly=testlib_add -d:softlinkProbeExistence tests/tcheck_probe_only.nim"
+    # M3cpp: the SAME M3 combination under `nim cpp`, proving the C++
+    # decltype existence tier (not merely the GCC/Clang __typeof__ one).
+    exec "nim cpp --compileOnly --path:src --passC:-I. --nimcache:" & probeOnlyM3cpp &
+      " -d:softlinkProbeOnly=testlib_add -d:softlinkProbeExistence tests/tcheck_probe_only.nim"
+    # M4: -d:softlinkProbeOnly=testlib_gated -d:softlinkProbeExistence —
+    # proves the existence reference for a {.verifyWhen.}-gated proc stays
+    # inside that proc's own #if (EXPR) gate.
+    exec cBase & probeOnlyM4 &
+      " -d:softlinkProbeOnly=testlib_gated -d:softlinkProbeExistence tests/tcheck_probe_only.nim"
+
+    expectAnchor(probeOnlyM0, poAssertAdd, "M0 control: testlib_add assert", true)
+    expectAnchor(probeOnlyM0, poAssertNoop, "M0 control: testlib_noop assert", true)
+    expectAnchor(probeOnlyM0, poAssertFuture, "M0 control: testlib_future assert", true)
+    expectAnchor(probeOnlyM0, poAssertGated, "M0 control: testlib_gated assert", true)
+    expectAnchor(probeOnlyM0, poProtoDeclAdd, "M0 control: testlib_add prototype decl", true)
+    expectAnchor(probeOnlyM0, poInclude, "M0 control: header include", true)
+
+    expectAnchor(probeOnlyM1, poAssertAdd, "M1 suppress-all: testlib_add assert", false)
+    expectAnchor(probeOnlyM1, poAssertNoop, "M1 suppress-all: testlib_noop assert", false)
+    expectAnchor(probeOnlyM1, poAssertFuture, "M1 suppress-all: testlib_future assert", false)
+    expectAnchor(probeOnlyM1, poAssertGated, "M1 suppress-all: testlib_gated assert", false)
+    expectAnchor(probeOnlyM1, poProtoDeclAdd, "M1 suppress-all: testlib_add prototype decl", false)
+    expectAnchor(probeOnlyM1, poInclude, "M1 suppress-all: header include still present", true)
+
+    expectAnchor(probeOnlyM2, poAssertAdd, "M2 probe-add: testlib_add assert", true)
+    expectAnchor(probeOnlyM2, poAssertNoop, "M2 probe-add: testlib_noop assert", false)
+    expectAnchor(probeOnlyM2, poAssertFuture, "M2 probe-add: testlib_future assert", false)
+    expectAnchor(probeOnlyM2, poAssertGated, "M2 probe-add: testlib_gated assert", false)
+    expectAnchor(probeOnlyM2, poProtoDeclAdd, "M2 probe-add: testlib_add prototype decl", true)
+
+    expectAnchor(probeOnlyM3, poAssertAdd, "M3 existence-add: testlib_add assert", false)
+    expectAnchor(probeOnlyM3, poProtoDeclAdd, "M3 existence-add: testlib_add prototype decl", false)
+    expectAnchor(probeOnlyM3, poExistAddGcc, "M3 existence-add: __typeof__ existence reference", true)
+    expectAnchor(probeOnlyM3cpp, poExistAddCpp, "M3cpp existence-add: decltype existence reference", true)
+    expectAnchor(probeOnlyM3cpp, poAssertAdd, "M3cpp existence-add: testlib_add assert", false)
+    expectAnchor(probeOnlyM3cpp, poProtoDeclAdd, "M3cpp existence-add: testlib_add prototype decl", false)
+
+    expectAnchor(probeOnlyM4, poExistGatedGated,
+      "M4 existence-gated: existence reference sits inside its own verifyWhen gate", true)
+    expectAnchor(probeOnlyM4, poAssertGated, "M4 existence-gated: testlib_gated assert", false)
+
+    exec cBase & probeOnlyV0 & " tests/tcheck_probe_only_verifyprocs.nim"
+    exec cBase & probeOnlyV1 & " -d:softlinkProbeOnly=testlib_magic tests/tcheck_probe_only_verifyprocs.nim"
+    exec cBase & probeOnlyV2 &
+      " -d:softlinkProbeOnly=testlib_magic -d:softlinkProbeExistence tests/tcheck_probe_only_verifyprocs.nim"
+
+    expectAnchor(probeOnlyV0, vpoAssertMagic, "V0 control (verifyProcs): testlib_magic assert", true)
+    expectAnchor(probeOnlyV0, vpoAssertProtoonly, "V0 control (verifyProcs): testlib_protoonly assert", true)
+    expectAnchor(probeOnlyV0, vpoProtoDeclProtoonly, "V0 control (verifyProcs): testlib_protoonly prototype decl", true)
+
+    expectAnchor(probeOnlyV1, vpoAssertMagic, "V1 probe-magic (verifyProcs): testlib_magic assert", true)
+    expectAnchor(probeOnlyV1, vpoAssertProtoonly, "V1 probe-magic (verifyProcs): testlib_protoonly assert", false)
+    expectAnchor(probeOnlyV1, vpoProtoDeclProtoonly, "V1 probe-magic (verifyProcs): testlib_protoonly prototype decl", false)
+
+    expectAnchor(probeOnlyV2, vpoAssertMagic, "V2 existence-magic (verifyProcs): testlib_magic assert", false)
+    expectAnchor(probeOnlyV2, vpoExistMagicGcc, "V2 existence-magic (verifyProcs): __typeof__ existence reference", true)
+
+    for d in probeOnlyDirs:
+      if dirExists(d): rmDir(d)
+
+  # RFC-0001 §4 B.2, classification-table discriminators: the heart of the
+  # RFC's harvester classification table, proven directly against the
+  # shipped mechanism (no harvester exists yet — that's slice B3):
+  # - a verify-mode probe of a real symbol bound with a deliberately WRONG
+  #   Nim signature must still fail with softlink's own "signature
+  #   mismatch" (probing a single symbol is not a weaker check);
+  # - the SAME mismatched binding under existence mode must SUCCEED (an
+  #   existence reference never depends on the declared signature);
+  # - an existence probe of a symbol the header does NOT declare must FAIL
+  #   (this is what lets a future harvester classify `absent`) — checked
+  #   under both `nim c` (GCC/Clang __typeof__ tier) and `nim cpp` (C++
+  #   decltype tier) via `expectCompileFailure` (exit-code only: this is a
+  #   raw "undeclared identifier" compiler diagnostic, not softlink's own
+  #   string — see `expectCompileFailure`'s doc comment above).
+  const probeMismatchVerifyFailCheck =
+    "nim c --path:src --passC:-I. -d:softlinkProbeOnly=testlib_add " &
+    "tests/tcheck_probe_existence_mismatch.nim"
+  const probeMismatchExistenceSuccessCheck =
+    "nim c --compileOnly --path:src --passC:-I. -d:softlinkProbeOnly=testlib_add " &
+    "-d:softlinkProbeExistence tests/tcheck_probe_existence_mismatch.nim"
+  const probeAbsentCCheck =
+    "nim c --path:src --passC:-I. -d:softlinkProbeOnly=testlib_totally_absent " &
+    "-d:softlinkProbeExistence tests/tfail_probe_existence_absent.nim"
+  const probeAbsentCppCheck =
+    "nim cpp --path:src --passC:-I. -d:softlinkProbeOnly=testlib_totally_absent " &
+    "-d:softlinkProbeExistence tests/tfail_probe_existence_absent.nim"
+  # RFC-0001 §4 B.2, design guidance point 4: `-d:softlinkProbeExistence`
+  # set without `softlinkProbeOnly` naming a real symbol (unset, or the
+  # `"-"` all-suppress sentinel) is a meaningless probe configuration and
+  # must be a clear macro-expansion-time error — softlink's own string,
+  # so (unlike the two checks directly above) this pair DOES need the
+  # grep/findstr split, same as every other softlink-diagnostic check in
+  # this file.
+  const probeNoTargetUnsetCheck =
+    "nim c --path:src --passC:-I. -d:softlinkProbeExistence " &
+    "tests/tfail_probe_existence_no_target.nim"
+  const probeNoTargetSentinelCheck =
+    "nim c --path:src --passC:-I. -d:softlinkProbeExistence " &
+    "-d:softlinkProbeOnly=- tests/tfail_probe_existence_no_target.nim"
+  const probeNoTargetAnchor =
+    "requires -d:softlinkProbeOnly=<CName> naming a real probed symbol"
+
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   if dirExists(protoOnlyDir): rmDir(protoOnlyDir)
   when defined(windows):
@@ -444,6 +657,14 @@ task test, "Run tests":
       protoOnlyDir & "\\*.c >NUL"
     rmDir(protoOnlyDir)
     runDumpProbesCheck()
+    # RFC-0001 §4 B.2: define-gated probe modes.
+    exec probeMismatchVerifyFailCheck & " 2>&1 | findstr /C:\"signature mismatch\" >NUL"
+    exec probeMismatchExistenceSuccessCheck
+    expectCompileFailure(probeAbsentCCheck)
+    expectCompileFailure(probeAbsentCppCheck)
+    exec probeNoTargetUnsetCheck & " 2>&1 | findstr /C:\"" & probeNoTargetAnchor & "\" >NUL"
+    exec probeNoTargetSentinelCheck & " 2>&1 | findstr /C:\"" & probeNoTargetAnchor & "\" >NUL"
+    runProbeOnlyChecks()
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -499,6 +720,14 @@ task test, "Run tests":
     exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
     runDumpProbesCheck()
+    # RFC-0001 §4 B.2: define-gated probe modes.
+    exec probeMismatchVerifyFailCheck & " 2>&1 | grep -q 'signature mismatch'"
+    exec probeMismatchExistenceSuccessCheck
+    expectCompileFailure(probeAbsentCCheck)
+    expectCompileFailure(probeAbsentCppCheck)
+    exec probeNoTargetUnsetCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
+    exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
+    runProbeOnlyChecks()
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -560,6 +789,14 @@ task test, "Run tests":
     exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
     runDumpProbesCheck()
+    # RFC-0001 §4 B.2: define-gated probe modes.
+    exec probeMismatchVerifyFailCheck & " 2>&1 | grep -q 'signature mismatch'"
+    exec probeMismatchExistenceSuccessCheck
+    expectCompileFailure(probeAbsentCCheck)
+    expectCompileFailure(probeAbsentCppCheck)
+    exec probeNoTargetUnsetCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
+    exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
+    runProbeOnlyChecks()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
   ## `task test`'s `when defined(windows):` branch always builds the

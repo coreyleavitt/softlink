@@ -598,6 +598,47 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
       else:
         hint(msg, stmt)
 
+const softlinkProbeOnly {.strdefine.} = ""
+  ## RFC-0001 §4 B.2: with `-d:softlinkProbeOnly=<CName>`, `genVerifyBlock`
+  ## suppresses the ENTIRE verification apparatus (the call-based
+  ## `_Static_assert` chain AND any `{.prototype.}` extern declaration —
+  ## see `emitPrototypeDecl`) for every proc EXCEPT the one whose C name
+  ## equals `<CName>`. Block-level `#include`s are STILL emitted regardless
+  ## — the harvester's baseline probe exists precisely to detect broken
+  ## corpus headers, so the includes must run even when nothing else does.
+  ## The sentinel value `"-"` suppresses verification for every proc (the
+  ## harvester's baseline mode: "do the headers even compile"). A
+  ## comma-separated list (RFC §4 B.2's optional fast-path, slice B7) is
+  ## deliberately NOT parsed here — a value containing a comma simply never
+  ## equals any single symbol's C name, so it degrades to "suppress
+  ## everything" rather than silently misbehaving as a partial list match.
+  ## Harvest-only, like `softlinkDumpProbes`: a dedicated single-shot
+  ## invocation, not something left set in ordinary dev/CI builds. Default
+  ## `""` (unset) is a no-op — every existing `dynlib`/`verifyProcs` block
+  ## compiles byte-identically, because every check below short-circuits on
+  ## `softlinkProbeOnly.len == 0` before touching emission at all.
+
+const softlinkProbeExistence {.booldefine.} = false
+  ## RFC-0001 §4 B.2: with `-d:softlinkProbeExistence` (meaningful only
+  ## together with `-d:softlinkProbeOnly=<CName>` naming a real symbol),
+  ## the probed symbol's verification is replaced by a bare
+  ## declaration-existence reference — `__typeof__(&sym)` / `decltype(&sym)`
+  ## through the SAME three-tier compiler gating the call-based assert
+  ## uses — instead of the full call-based assert chain: it compiles iff
+  ## the corpus headers declare the symbol at ANY signature, independent of
+  ## what that signature is. The probed symbol's own `{.prototype.}` extern
+  ## declaration (if any) is ALSO suppressed in this mode: emitting it would
+  ## let `__typeof__`/`decltype` resolve against the *vendored* prototype
+  ## even when the corpus header doesn't declare the symbol at all, making
+  ## `absent` unclassifiable for header+prototype procs (the RFC's
+  ## classification table depends on the existence probe reflecting the
+  ## HEADER alone). A `{.verifyWhen.}` gate on the probed proc wraps the
+  ## existence reference exactly as it would wrap the assert. Set without
+  ## `softlinkProbeOnly` naming a real symbol (unset, or the `"-"`
+  ## all-suppress sentinel) is a meaningless probe configuration — see the
+  ## macro error raised in `genVerifyBlock` below — rather than silently
+  ## compiling as some other mode.
+
 proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes
   ## (include section + a file-local _Static_assert proc). Shared by
@@ -622,6 +663,39 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
     if not p.noVerify and (p.headerFile != "" or p.prototype.len > 0): procs.add(p)
   if procs.len == 0:
     return @[]
+
+  # RFC-0001 §4 B.2: probe-mode config validation + per-proc classification.
+  # `probeOnlyActive` is false whenever `softlinkProbeOnly` is at its default
+  # "" value, so every predicate below is unreachable/false in the control
+  # path — pre-B2 emission is untouched by construction, not merely by test.
+  let probeOnlyActive = softlinkProbeOnly.len > 0
+  if softlinkProbeExistence and (softlinkProbeOnly == "" or softlinkProbeOnly == "-"):
+    let gotDesc =
+      if softlinkProbeOnly == "": "<unset>"
+      else: "'-' (the all-suppress sentinel, not a symbol name)"
+    let msg = "softlink: -d:softlinkProbeExistence requires " &
+      "-d:softlinkProbeOnly=<CName> naming a real probed symbol — an " &
+      "existence-only probe is meaningless without exactly one target " &
+      "symbol. Got softlinkProbeOnly=" & gotDesc & ". Pass the exact C " &
+      "name of the symbol being probed, e.g. -d:softlinkProbeOnly=" &
+      procs[0].nameStr & "."
+    error(msg, allProcs[0].name)
+
+  template isSuppressed(p: SoftlinkProc): bool =
+    ## RFC-0001 §4 B.2: true when this proc's entire verification apparatus
+    ## (call-based assert chain AND any {.prototype.} extern decl) must be
+    ## omitted this compile — probing is active and this proc is neither
+    ## the "-" sentinel's "everything" target nor the one named symbol.
+    probeOnlyActive and (softlinkProbeOnly == "-" or p.nameStr != softlinkProbeOnly)
+
+  template isProbedExistence(p: SoftlinkProc): bool =
+    ## RFC-0001 §4 B.2: true when this proc IS the probed symbol AND
+    ## existence-only mode was requested — its call-based assert is
+    ## replaced by a bare declaration-existence reference, and its own
+    ## {.prototype.} extern decl (if any) is ALSO suppressed (see the
+    ## `softlinkProbeExistence` const doc comment for why that matters).
+    probeOnlyActive and softlinkProbeExistence and p.nameStr == softlinkProbeOnly
+
   var nodes: seq[NimNode] = @[]
   # Compile-time header verification. Compares each symbol's type from
   # the C header against Nim's generated function pointer type.
@@ -647,8 +721,15 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
     # references resolve, and before the type_traits/verify-proc code below.
     # A proc with both {.header.} and {.prototype.} gets both declarations —
     # cross-checking (A.1 benefit 2); the C compiler itself flags disagreement.
+    #
+    # RFC-0001 §4 B.2: a suppressed proc's decl is omitted entirely — a
+    # suppressed proc's vendored prototype conflicting with a corpus header
+    # would fail the whole TU and poison the probe of the TARGET symbol. The
+    # probed symbol's OWN decl is also omitted under existence mode — see
+    # `isProbedExistence`'s doc comment for why that's load-bearing, not
+    # merely symmetric.
     for p in procs:
-      if p.prototype.len > 0:
+      if p.prototype.len > 0 and not isSuppressed(p) and not isProbedExistence(p):
         includeCode.add(emitPrototypeDecl(p.prototype, p.verifyWhen))
 
     # Emit #include directives + C++ type_traits if needed
@@ -678,6 +759,49 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
     # the assertions cannot be eliminated by link-time optimization.
     var verifyBody = newStmtList()
     for p in procs:
+      # RFC-0001 §4 B.2: a suppressed proc gets NO verification apparatus at
+      # all this compile — not even the dummy param vars, which exist only
+      # to feed the call-based assert chain this proc isn't getting.
+      if isSuppressed(p):
+        continue
+
+      if isProbedExistence(p):
+        # RFC-0001 §4 B.2: existence-only mode for the probed symbol — a
+        # bare declaration-existence reference through the SAME three-tier
+        # compiler gating the call-based assert uses, instead of the call-
+        # based assert itself. No dummy param vars are needed (nothing is
+        # called); the reference must compile iff the symbol is declared,
+        # with NO dependence on its signature — `sizeof(__typeof__(&sym))` /
+        # `sizeof(decltype(&sym))` (the C++ tier) fit exactly: they name the
+        # symbol (so an undeclared symbol is a hard compile error) but
+        # `sizeof` never evaluates its operand, so any real signature works.
+        var existArray = newNimNode(nnkBracket)
+        if p.verifyWhen.len > 0:
+          existArray.add(newStrLitNode(
+            "\n#if (" & p.verifyWhen & ") /* softlink verifyWhen */"))
+        existArray.add(newStrLitNode(
+          "\n#if defined(__cplusplus)\n(void)sizeof(decltype(&" &
+          p.nameStr & "));\n" &
+          "#elif defined(__GNUC__)\n(void)sizeof(__typeof__(&" &
+          p.nameStr & "));\n" &
+          "#elif defined(_MSC_VER) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n" &
+          "(void)sizeof(__typeof__(&" & p.nameStr & "));\n"))
+        when defined(softlinkStrictVerify):
+          existArray.add(newStrLitNode(
+            "#else\n#error \"softlink: existence probe unavailable here " &
+            "(need C++, GCC/Clang, or MSVC /std:clatest); remove " &
+            "-d:softlinkStrictVerify to skip\"\n#endif\n"))
+        else:
+          existArray.add(newStrLitNode(
+            "#else\n/* softlink: existence probe skipped — unsupported " &
+            "compiler/mode */\n#endif\n"))
+        if p.verifyWhen.len > 0:
+          existArray.add(newStrLitNode("#endif /* softlink verifyWhen */\n"))
+        verifyBody.add(newNimNode(nnkPragma).add(
+          newNimNode(nnkExprColonExpr).add(ident("emit"), existArray)
+        ))
+        continue
+
       # Generate dummy variables for each param — Nim emits typed C locals.
       # These are passed to the C function call, enabling const-tolerant
       # param checking (int* implicitly converts to const int* in C).
