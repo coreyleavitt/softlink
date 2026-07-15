@@ -10,6 +10,7 @@ requires "nim >= 2.0.0"
 
 import std/json
 import std/strutils
+import "src/softlink/versions"
 
 proc validateProbeJson(path, expectKind, expectBaseName: string) =
   ## RFC-0001 §4 B.1 nimble-task check: schema validation for one
@@ -81,6 +82,165 @@ proc expectCompileFailure(cmd: string) =
     quit("softlink: RFC-0001 slice A4 expected a compile FAILURE (header " &
          "vs. prototype conflict on testlib_add) but the compile " &
          "SUCCEEDED: " & cmd)
+
+proc corpusBaseName(path: string): string =
+  ## Last path component of a NimScript `listDirs`/`listFiles` result
+  ## (`"tests/corpus/1.0.0"` -> `"1.0.0"`). NimScript's directory walkers
+  ## consistently return forward-slash-joined paths on every OS this task
+  ## runs on (the existing `walkGenSources` helper above already relies on
+  ## the same assumption for `.c`/`.cpp` suffix checks), so a plain `rfind`
+  ## on `'/'` is enough — no `std/os` import needed.
+  let i = path.rfind('/')
+  if i < 0: path else: path[i + 1 .. ^1]
+
+proc runCorpusChecks() =
+  ## RFC-0001 slice B3a: validates the fixture corpus at tests/corpus has
+  ## every property the (not-yet-written) slice B3 harvester will depend
+  ## on. This is this slice's ENTIRE test surface — no harvester code, no
+  ## classification loop, just proof the fixtures can exercise all four
+  ## classification outcomes. See tests/corpus/README.md for the full
+  ## classification narrative.
+  const corpusDir = "tests/corpus"
+  const corpusJsonPath = corpusDir & "/corpus.json"
+  const b3aTag = "softlink: RFC-0001 slice B3a: "
+
+  if not fileExists(corpusJsonPath):
+    quit(b3aTag & "expected corpus provenance file to exist: " & corpusJsonPath)
+  let j = parseJson(readFile(corpusJsonPath))
+  if not j.hasKey("corpus") or j["corpus"].kind != JArray or j["corpus"].len == 0:
+    quit(b3aTag & corpusJsonPath & " missing a non-empty top-level 'corpus' array")
+  let entries = j["corpus"]
+
+  # Disk-side: exactly the version directories actually present.
+  var diskVersions: seq[string] = @[]
+  for d in listDirs(corpusDir):
+    diskVersions.add(corpusBaseName(d))
+
+  # Manifest-side: validate each entry's shape, and the exactly-one-prepare
+  # invariant, while collecting the versions it names.
+  var manifestVersions: seq[string] = @[]
+  var prepareCount = 0
+  for entry in entries:
+    if not entry.hasKey("version") or entry["version"].kind != JString:
+      quit(b3aTag & "a corpus.json entry is missing a string 'version': " & $entry)
+    let ver = entry["version"].getStr
+    # Validated against the REAL contract slice B0 shipped
+    # (src/softlink/versions.parseVersion), not a lexical approximation —
+    # confirmed empirically that importing that module from a nimble task
+    # works fine (nimble's NimScript VM, unlike bare macro/VM compile-time
+    # code, has a working `getCurrentDir`-style environment; see the
+    # `dumpProbesDir` comment below for the general asymmetry). A version
+    # string this corpus records but the shared comparator can't parse
+    # would silently break B4's interval compression later, so failing
+    # loudly here is exactly the guard this slice is supposed to provide.
+    if parseVersion(ver).isNone:
+      quit(b3aTag & "corpus.json version '" & ver &
+           "' does not parse under softlink/versions.parseVersion")
+    manifestVersions.add(ver)
+    if not entry.hasKey("source") or entry["source"].kind != JString:
+      quit(b3aTag & "corpus.json entry for version '" & ver & "' is missing a string 'source'")
+    let src = entry["source"].getStr
+    let atPos = src.find('@')
+    if not src.startsWith("git:") or atPos < 0:
+      quit(b3aTag & "corpus.json entry for version '" & ver &
+           "' has a malformed 'source' (expected 'git:owner/repo@<sha>'): " & src)
+    let sha = src[atPos + 1 .. ^1]
+    var shaOk = sha.len == 40
+    if shaOk:
+      for c in sha:
+        if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+          shaOk = false
+          break
+    if not shaOk:
+      quit(b3aTag & "corpus.json entry for version '" & ver &
+           "' has a 'source' whose commit hash is not 40 hex characters: " & src)
+    if entry.hasKey("prepare"):
+      if entry["prepare"].kind != JString or entry["prepare"].getStr.len == 0:
+        quit(b3aTag & "corpus.json entry for version '" & ver &
+             "' has a non-string or empty 'prepare'")
+      inc prepareCount
+
+  if prepareCount != 1:
+    quit(b3aTag & "expected exactly ONE corpus.json entry with a 'prepare' " &
+         "hook (the prepare-hook example the slice brief calls for), found " &
+         $prepareCount)
+
+  # Disk <-> manifest must name exactly the same set of versions.
+  for v in manifestVersions:
+    if v notin diskVersions:
+      quit(b3aTag & "corpus.json names version '" & v &
+           "' but tests/corpus/" & v & "/ does not exist on disk")
+  for v in diskVersions:
+    if v notin manifestVersions:
+      quit(b3aTag & "tests/corpus/" & v &
+           "/ exists on disk but corpus.json has no entry for it")
+  if diskVersions.len != 3:
+    quit(b3aTag & "expected exactly 3 corpus version directories " &
+         "(1.0.0, 2.0.0, 3.0.0 per the slice brief), found " &
+         $diskVersions.len & ": " & $diskVersions)
+
+  # Each version directory contains EXACTLY one file, testlib.h — the name
+  # the future B3 binding module's `#include "testlib.h"` will resolve
+  # against once the corpus dir is prepended via `--passC:-I`.
+  for v in diskVersions:
+    let files = listFiles(corpusDir & "/" & v)
+    if files.len != 1 or corpusBaseName(files[0]) != "testlib.h":
+      quit(b3aTag & "tests/corpus/" & v &
+           "/ must contain exactly one file, testlib.h — found: " & $files)
+
+  # Compile-behavior invariant: the classification table's baseline row.
+  # A trivial TU including "testlib.h" must compile with 1.0.0 and 2.0.0
+  # prepended, and must FAIL with 3.0.0 prepended (the broken-include
+  # version) — the executable proof this corpus can actually drive a
+  # baseline-fails-so-everything-classifies-`unknown` outcome, not merely
+  # a header comment asserting it does.
+  const scratchTu = corpusDir & "/_b3a_compile_check.c"
+  writeFile(scratchTu, "#include \"testlib.h\"\nint main(void) { return 0; }\n")
+  # Mirrors this task's OWN per-OS compiler choice for building testlib.c
+  # (gcc on the linux and windows-mingw branches below, cc on macosx) so
+  # this check exercises the SAME toolchain the rest of the suite already
+  # depends on, not a fresh assumption. `-fsyntax-only` is supported by
+  # both gcc and clang (macOS's `cc`) and needs no object/link step —
+  # exactly a "does this TU compile" question, nothing more.
+  const corpusCc = when defined(windows): "gcc" elif defined(macosx): "cc" else: "gcc"
+  proc corpusCompiles(version: string): bool =
+    let (_, code) = gorgeEx(corpusCc & " -fsyntax-only -I " & corpusDir &
+      "/" & version & " " & scratchTu)
+    code == 0
+  if not corpusCompiles("1.0.0"):
+    rmFile(scratchTu)
+    quit(b3aTag & "expected tests/corpus/1.0.0/testlib.h to compile cleanly, it did not")
+  if not corpusCompiles("2.0.0"):
+    rmFile(scratchTu)
+    quit(b3aTag & "expected tests/corpus/2.0.0/testlib.h to compile cleanly, it did not")
+  if corpusCompiles("3.0.0"):
+    rmFile(scratchTu)
+    quit(b3aTag & "expected tests/corpus/3.0.0/testlib.h (the broken-include " &
+         "version) to FAIL to compile, but it compiled cleanly")
+  rmFile(scratchTu)
+
+  # Signature-change invariant: corpuslib_changed's declaration text must
+  # differ between 1.0.0 and 2.0.0 (the deliberate signature change), while
+  # corpuslib_stable's must be identical (the control) — a grep-level check
+  # via plain readFile/`in`, no shell tool needed.
+  let text1 = readFile(corpusDir & "/1.0.0/testlib.h")
+  let text2 = readFile(corpusDir & "/2.0.0/testlib.h")
+  const stableDecl = "int corpuslib_stable(int a, int b);"
+  const changedDecl1 = "int corpuslib_changed(int a);"
+  const changedDecl2 = "double corpuslib_changed(int a, int b);"
+  if stableDecl notin text1 or stableDecl notin text2:
+    quit(b3aTag & "expected the IDENTICAL corpuslib_stable declaration in " &
+         "both 1.0.0/testlib.h and 2.0.0/testlib.h")
+  if changedDecl1 notin text1:
+    quit(b3aTag & "expected 1.0.0/testlib.h to declare '" & changedDecl1 & "'")
+  if changedDecl2 notin text2:
+    quit(b3aTag & "expected 2.0.0/testlib.h to declare '" & changedDecl2 & "'")
+  if changedDecl1 in text2:
+    quit(b3aTag & "expected 2.0.0/testlib.h's corpuslib_changed declaration " &
+         "to differ from 1.0.0's, but 1.0.0's text is still present in 2.0.0")
+
+  echo "softlink: RFC-0001 slice B3a: validated tests/corpus (" &
+       $diskVersions.len & " versions, prepare-hook on 1)"
 
 task test, "Run tests":
   # testlib.c is compiled under several names to exercise deriveLibPattern:
@@ -665,6 +825,7 @@ task test, "Run tests":
     exec probeNoTargetUnsetCheck & " 2>&1 | findstr /C:\"" & probeNoTargetAnchor & "\" >NUL"
     exec probeNoTargetSentinelCheck & " 2>&1 | findstr /C:\"" & probeNoTargetAnchor & "\" >NUL"
     runProbeOnlyChecks()
+    runCorpusChecks()
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -728,6 +889,7 @@ task test, "Run tests":
     exec probeNoTargetUnsetCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
+    runCorpusChecks()
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -797,6 +959,7 @@ task test, "Run tests":
     exec probeNoTargetUnsetCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
+    runCorpusChecks()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
   ## `task test`'s `when defined(windows):` branch always builds the
