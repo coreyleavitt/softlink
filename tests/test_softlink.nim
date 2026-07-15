@@ -72,7 +72,12 @@ else:
   const TestLib = "libtestlib.so"
 
 dynlib TestLib:
-  proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
+  # RFC-0001 slice A1: {.prototype.} may coexist with {.header.}
+  # (cross-checking, §3 A.1) — the vendored prototype below is inert for A1
+  # (nothing is emitted from it yet; wiring into the verify TU is slice A2),
+  # so this must compile and behave identically to a header-only binding.
+  proc testlib_add(a: cint, b: cint): cint
+    {.cdecl, header: "tests/testlib.h", prototype: "int testlib_add(int a, int b)".}
   proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
   # Regression: #11 — const-qualified pointer returns must verify
@@ -101,12 +106,23 @@ dynlib TestLib:
   # verify this signature.
   proc testlib_gated_v2(): cint
     {.cdecl, optional, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
+  # RFC-0001 slice A1: {.prototype.} alone (no {.header.}) is accepted — the
+  # header requirement is lifted. testlib_protoonly is in the .so but NOT in
+  # testlib.h (the F2 scenario A1 targets); runtime dispatch works exactly
+  # like {.noverify.}, but no {.noverify.} pragma is needed or accepted
+  # (prototype + noverify is a contradiction — both select a declaration
+  # source). Compile-time verification of the prototype itself is slice A2.
+  proc testlib_protoonly(): cint
+    {.cdecl, prototype: "int testlib_protoonly(void)".}
 
 # verifyProcs: compile-time signature verification ONLY (no loading, no
 # wrappers). Correct signatures must compile; the const-return case (#11)
 # must also be accepted here, sharing dynlib's verification codegen.
 verifyProcs:
-  proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
+  # {.prototype.} + {.header.} coexisting (cross-checking, §3 A.1) — inert
+  # for A1, must compile and verify exactly as header-only did before.
+  proc testlib_add(a: cint, b: cint): cint
+    {.cdecl, header: "tests/testlib.h", prototype: "int testlib_add(int a, int b)".}
   proc testlib_const_string(): cstring {.cdecl, header: "tests/testlib.h".}
   # verifyWhen in verifyProcs: identical semantics to dynlib. True condition →
   # verified (testlib_gated is declared in testlib.h); false condition →
@@ -137,6 +153,165 @@ suite "verifyProcs (static-binding header verification)":
     check not compiles(block:
       verifyProcs:
         proc vp_vararg(): cint {.cdecl, varargs, header: "tests/testlib.h".}
+    )
+
+suite "prototype tokenizer/analyzer (RFC-0001 slice A1)":
+  # Pure functions — unit-tested directly, no compiles() gymnastics needed.
+  # `tokenizePrototype` is the primitive slice A6 will reuse for builtin-type
+  # detection; `analyzePrototype` layers A1's specific rules (name
+  # extraction, function-pointer-return detection, variadic detection) on
+  # top of the token stream.
+  test "tokenizer: identifiers, punctuation, and paren depth":
+    let tokens = tokenizePrototype("int foo(int x)")
+    check tokens.len == 6
+    check tokens[0].kind == ptkIdent and tokens[0].text == "int" and tokens[0].depth == 0
+    check tokens[1].kind == ptkIdent and tokens[1].text == "foo" and tokens[1].depth == 0
+    check tokens[2].kind == ptkPunct and tokens[2].text == "(" and tokens[2].depth == 0
+    check tokens[3].kind == ptkIdent and tokens[3].text == "int" and tokens[3].depth == 1
+    check tokens[4].kind == ptkIdent and tokens[4].text == "x" and tokens[4].depth == 1
+    check tokens[5].kind == ptkPunct and tokens[5].text == ")" and tokens[5].depth == 0
+
+  test "tokenizer: nested parens (callback parameter) track depth correctly":
+    let tokens = tokenizePrototype("int bar(int x, void (*cb)(int))")
+    # The callback parameter's own parens must be depth >= 1, never depth 0 —
+    # only the function's own opening paren is depth 0.
+    var depth0Parens = 0
+    for tok in tokens:
+      if tok.kind == ptkPunct and tok.text == "(" and tok.depth == 0:
+        inc depth0Parens
+    check depth0Parens == 1
+
+  test "tokenizer: '...' is a single token, not three '.' punctuation tokens":
+    let tokens = tokenizePrototype("int fmt(const char *f, ...)")
+    var ellipsisCount = 0
+    for tok in tokens:
+      if tok.text == "...": inc ellipsisCount
+    check ellipsisCount == 1
+
+  test "analyzer: simple prototype — name extracted, not fn-ptr-return, not variadic":
+    let a = analyzePrototype("int foo(int x)")
+    check a.ok
+    check a.name == "foo"
+    check not a.isFunctionPointerReturn
+    check not a.hasVariadic
+
+  test "analyzer: pointer return type with spaces — name still extracted (#11-adjacent)":
+    let a = analyzePrototype("const char *foo(int)")
+    check a.ok
+    check a.name == "foo"
+    check not a.isFunctionPointerReturn
+
+  test "analyzer: nested parens in a parameter don't confuse depth-0 name extraction":
+    let a = analyzePrototype("int bar(int x, void (*cb)(int))")
+    check a.ok
+    check a.name == "bar"
+    check not a.isFunctionPointerReturn
+
+  test "analyzer: function-pointer return type detected (name nested, unextractable)":
+    let a = analyzePrototype("int (*make_thing(int))(int)")
+    check a.ok
+    check a.isFunctionPointerReturn
+
+  test "analyzer: the RFC's motivating function-pointer-return shape":
+    # void (*signal(int, void (*)(int)))(int) — signal's own name is nested
+    # inside the return type; the char after the first depth-0 '(' is '*'.
+    let a = analyzePrototype("void (*signal(int, void (*)(int)))(int)")
+    check a.ok
+    check a.isFunctionPointerReturn
+
+  test "analyzer: variadic '...' detected anywhere in the prototype":
+    let a = analyzePrototype("int fmt_like(const char *fmt, ...)")
+    check a.ok
+    check a.hasVariadic
+    check a.name == "fmt_like"
+
+  test "analyzer: embedded newlines/indentation (triple-quoted style) don't affect extraction":
+    let a = analyzePrototype("""
+      int
+        vp_multiline (
+          int x
+        )
+    """)
+    check a.ok
+    check a.name == "vp_multiline"
+    check not a.isFunctionPointerReturn
+    check not a.hasVariadic
+
+  test "analyzer: malformed prototype with no parens is reported, not crashed":
+    let a = analyzePrototype("int foo")
+    check not a.ok
+
+suite "verifyProcs — prototype pragma (RFC-0001 slice A1)":
+  test "positive: prototype + header coexist, name matches proc":
+    check compiles(block:
+      verifyProcs:
+        proc vp_proto_ok(x: cint): cint
+          {.cdecl, header: "tests/testlib.h", prototype: "int vp_proto_ok(int x)".}
+    )
+
+  test "positive: triple-quoted multi-line prototype accepted":
+    check compiles(block:
+      verifyProcs:
+        proc vp_proto_multiline(x: cint): cint
+          {.cdecl, header: "tests/testlib.h",
+            prototype: """
+              int
+              vp_proto_multiline(int x)
+            """.}
+    )
+
+  test "positive: prototype alone (no header) — header requirement lifted":
+    check compiles(block:
+      verifyProcs:
+        proc vp_proto_noheader(): cint {.cdecl, prototype: "int vp_proto_noheader(void)".}
+    )
+
+  test "negative: non-string-literal prototype value rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_notstring(): cint {.cdecl, prototype: 123, header: "tests/testlib.h".}
+    )
+
+  test "negative: empty prototype string rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_empty(): cint {.cdecl, prototype: "", header: "tests/testlib.h".}
+    )
+
+  test "negative: whitespace-only prototype string rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_ws(): cint {.cdecl, prototype: "   \n  ", header: "tests/testlib.h".}
+    )
+
+  test "negative: extracted name mismatched with proc's C name rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_mismatch(): cint
+          {.cdecl, header: "tests/testlib.h", prototype: "int vp_proto_other(void)".}
+    )
+
+  test "negative: variadic prototype rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_variadic(): cint
+          {.cdecl, header: "tests/testlib.h",
+            prototype: "int vp_proto_variadic(const char *fmt, ...)".}
+    )
+
+  test "negative: function-pointer-return prototype rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_fpret(): cint
+          {.cdecl, header: "tests/testlib.h",
+            prototype: "void (*vp_proto_fpret(int))(int)".}
+    )
+
+  test "negative: prototype + noverify contradiction rejected":
+    check not compiles(block:
+      verifyProcs:
+        proc vp_proto_noverify(): cint
+          {.cdecl, noverify, prototype: "int vp_proto_noverify(void)".}
     )
 
 suite "softlink":
@@ -246,6 +421,15 @@ suite "softlink":
     check not testlib_future_nvAvailable()
     expect SoftlinkError:
       discard testlib_future_nv()
+
+  # RFC-0001 slice A1: {.prototype.} alone (no {.header.}) lifts the header
+  # requirement. testlib_protoonly is absent from testlib.h entirely — a
+  # plain {.header.} binding of it would be a C implicit-declaration error —
+  # yet loads and dispatches normally, since runtime resolution never
+  # depended on compile-time verification.
+  test "prototype: header-optional path resolves and dispatches at runtime (A1)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_protoonly() == 77.cint
 
   # Regression: #11 — const-qualified pointer returns must bind to
   # cstring without a "signature mismatch vs testlib.h" error under

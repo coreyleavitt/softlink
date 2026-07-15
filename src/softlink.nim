@@ -155,6 +155,168 @@ proc parseVerifyWhenExpr(pragma, stmt: NimNode): string =
     ""
 
 type
+  PrototypeTokenKind = enum
+    ## `ptkIdent`: a C identifier (`[A-Za-z_][A-Za-z0-9_]*`) — this includes
+    ## C keywords like `const`/`void`; the tokenizer does no declarator-
+    ## grammar analysis, so callers filter keywords themselves if needed
+    ## (see A6's builtin-type detection).
+    ## `ptkPunct`: single-character punctuation (`(`, `)`, `*`, `,`, `;`,
+    ## `[`, `]`, ...), or the three-character `...` ellipsis, emitted as one
+    ## token.
+    ptkIdent
+    ptkPunct
+
+  PrototypeToken = object
+    ## One token of a tokenized C prototype string. `depth` is the paren
+    ## nesting level: for identifiers/other punctuation it's the level the
+    ## token sits at; for `(`/`)` it's the level of the group being opened/
+    ## closed (i.e. a matching `(`/`)` pair share the same `depth`), so "the
+    ## first `(` at paren depth 0" (RFC-0001 §3 A.1) is exactly
+    ## `tokens.find(tok => tok.text == "(" and tok.depth == 0)`.
+    ## Fields are exported (not the type itself) so the test suite — which
+    ## imports this module with `{.all.}` — can unit-test the tokenizer
+    ## directly; object field visibility is independent of `{.all.}`.
+    kind*: PrototypeTokenKind
+    text*: string
+    depth*: int
+
+func tokenizePrototype(prototype: string): seq[PrototypeToken] =
+  ## Minimal C-prototype tokenizer: identifiers, punctuation, and paren
+  ## depth only — no full declarator grammar (RFC-0001 §3 A.1, "round 2"
+  ## name-extraction rule). A pure function, reused as-is by two consumers:
+  ## A1's name extraction / function-pointer-return / variadic detection
+  ## (`analyzePrototype` below), and (later) A6's builtin-type detection,
+  ## which scans the same identifier tokens against a builtin-type
+  ## allowlist. Whitespace (including embedded newlines/indentation from
+  ## triple-quoted, upstream-formatted prototypes) is skipped entirely —
+  ## inert for tokenization, exactly as it is in the emitted C.
+  var i = 0
+  var depth = 0
+  let n = prototype.len
+  while i < n:
+    let c = prototype[i]
+    if c in Whitespace:
+      inc i
+    elif c == '_' or c.isAlphaAscii:
+      let start = i
+      inc i
+      while i < n and (prototype[i] == '_' or prototype[i].isAlphaNumeric):
+        inc i
+      result.add(PrototypeToken(kind: ptkIdent, text: prototype[start ..< i], depth: depth))
+    elif c == '.' and i + 2 < n and prototype[i + 1] == '.' and prototype[i + 2] == '.':
+      result.add(PrototypeToken(kind: ptkPunct, text: "...", depth: depth))
+      i += 3
+    elif c == '(':
+      result.add(PrototypeToken(kind: ptkPunct, text: "(", depth: depth))
+      inc depth
+      inc i
+    elif c == ')':
+      if depth > 0: dec depth
+      result.add(PrototypeToken(kind: ptkPunct, text: ")", depth: depth))
+      inc i
+    else:
+      # Any other single character (`*`, `,`, `;`, `[`, `]`, digits of a
+      # numeric literal, ...) — inert for the rules above, emitted
+      # one-at-a-time so paren depth stays exact around it.
+      result.add(PrototypeToken(kind: ptkPunct, text: $c, depth: depth))
+      inc i
+
+type
+  PrototypeAnalysis = object
+    ## A1-specific analysis over one prototype's token stream. Fields
+    ## exported for the same `{.all.}`-import reason as `PrototypeToken`.
+    ok*: bool                       ## false: no depth-0 '(' found (malformed)
+    name*: string                   ## identifier before the first depth-0 '('
+    isFunctionPointerReturn*: bool  ## '(' immediately followed by '*' — name
+                                     ## is nested inside the return type
+    hasVariadic*: bool              ## a `...` token appears anywhere
+
+func analyzePrototype(prototype: string): PrototypeAnalysis =
+  ## Run the shared tokenizer and extract the facts A1's prototype
+  ## validation needs: the candidate symbol name, whether the prototype has
+  ## a function-pointer return type (name unextractable — the classic
+  ## `void (*signal(int, void (*)(int)))(int)` shape), and whether it's
+  ## variadic. Pure function over `tokenizePrototype`'s output; kept
+  ## separate from the tokenizer itself so A6 can consume the token stream
+  ## directly without inheriting A1's naming rules.
+  let tokens = tokenizePrototype(prototype)
+  var parenIdx = -1
+  for idx, tok in tokens:
+    if tok.kind == ptkPunct and tok.text == "(" and tok.depth == 0:
+      parenIdx = idx
+      break
+  if parenIdx == -1:
+    return PrototypeAnalysis(ok: false)
+  result.ok = true
+  if parenIdx + 1 < tokens.len and tokens[parenIdx + 1].text == "*":
+    result.isFunctionPointerReturn = true
+  elif parenIdx > 0 and tokens[parenIdx - 1].kind == ptkIdent:
+    result.name = tokens[parenIdx - 1].text
+  for tok in tokens:
+    if tok.text == "...":
+      result.hasVariadic = true
+      break
+
+proc parsePrototypePragma(pragma, stmt: NimNode, nameStr: string): tuple[raw, name: string] =
+  ## Extract and validate the `{.prototype: "<C prototype>".}` pragma
+  ## (RFC-0001 §3 A.1): a non-empty string literal — triple-quoted/
+  ## multi-line strings are explicitly blessed so upstream's own
+  ## multi-line formatting can be pasted verbatim — containing a single C
+  ## function prototype. Runs the shared tokenizer-based name extraction,
+  ## rejects function-pointer return types (name unextractable — route
+  ## through a typedef'd return type instead), rejects `...` (variadic —
+  ## mirrors the existing `varargs` rejection: C lets you call a variadic
+  ## function with only its fixed arguments, so the assert would type-check
+  ## without verifying the variadic tail), and requires the extracted name
+  ## to match the proc's C name. Shared by `dynlib` and `verifyProcs` —
+  ## both select a declaration source on this axis (RFC-0001 §3, "four
+  ## pragma axes"). A1 only validates; nothing is emitted from the result
+  ## yet (extern declaration + verify-TU wiring is slice A2).
+  if not (pragma.kind == nnkExprColonExpr and
+          pragma[1].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit}):
+    error("proc '" & nameStr & "': prototype pragma requires a C prototype " &
+          "string literal (e.g., {.prototype: \"int " & nameStr &
+          "(int x)\".}); triple-quoted strings are accepted for upstream's " &
+          "own multi-line formatting", stmt)
+    ("", "")
+  else:
+    let raw = pragma[1].strVal
+    if raw.strip().len == 0:
+      error("proc '" & nameStr &
+            "': prototype pragma requires a non-empty C prototype string", stmt)
+      ("", "")
+    else:
+      let analysis = analyzePrototype(raw)
+      if not analysis.ok:
+        error("proc '" & nameStr & "': could not find a top-level '(' " &
+              "introducing the parameter list in prototype: " & raw, stmt)
+        (raw, "")
+      elif analysis.isFunctionPointerReturn:
+        error("proc '" & nameStr & "': prototype has a function-pointer " &
+              "return type, so its name is nested inside the return type " &
+              "(e.g. `void (*signal(int))(int)`) and can't be extracted " &
+              "by name — introduce a typedef for the return type and use " &
+              "it instead (e.g. `typedef void (*signal_handler)(int); " &
+              "signal_handler signal(int)`)", stmt)
+        (raw, "")
+      elif analysis.hasVariadic:
+        error("proc '" & nameStr & "': prototype must not be variadic " &
+              "('...') — mirrors the existing varargs rejection: C " &
+              "permits calling a variadic function with only its fixed " &
+              "arguments, so the compile-time check would type-check " &
+              "without verifying the variadic tail; write a prototype " &
+              "for the fixed-arity form only", stmt)
+        (raw, "")
+      elif analysis.name != nameStr:
+        error("proc '" & nameStr & "': prototype declares '" & analysis.name &
+              "', which does not match the proc's name '" & nameStr &
+              "' — the prototype must describe the same C symbol as the " &
+              "proc", stmt)
+        (raw, "")
+      else:
+        (raw, analysis.name)
+
+type
   ProcPragmaMode = enum
     ## Which caller is parsing pragmas — `dynlib` and `verifyProcs` share the
     ## same token recognition but disagree on what `optional`/`noverify` mean
@@ -174,6 +336,8 @@ type
     isOptional*: bool
     noVerify*: bool
     verifyWhen*: string  ## C preprocessor expr gating verification; "" = always
+    prototype*: string   ## raw {.prototype: "...".} string; "" if absent
+    prototypeName*: string  ## tokenizer-extracted C name; "" if absent
 
 const callingConventions = ["cdecl", "stdcall", "fastcall", "syscall", "noconv"]
 
@@ -216,6 +380,10 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
                 "solely to verify; simply omit proc '" & nameStr & "'", stmt)
       elif pragmaName == "verifyWhen":
         result.verifyWhen = parseVerifyWhenExpr(pragma, stmt)
+      elif pragmaName == "prototype":
+        let (raw, name) = parsePrototypePragma(pragma, stmt, nameStr)
+        result.prototype = raw
+        result.prototypeName = name
       elif pragmaName == "header":
         if pragma.kind == nnkExprColonExpr:
           result.headerFile = pragma[1].strVal
@@ -235,14 +403,24 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
             "one requests conditional verification, the other none. Use " &
             "verifyWhen alone for symbols the header declares only in some " &
             "versions, or noverify alone for symbols no header declares", stmt)
-    if result.headerFile == "" and not result.noVerify:
+    if result.noVerify and result.prototype.len > 0:
+      error("proc '" & nameStr & "': {.prototype.} contradicts {.noverify.} — " &
+            "both select a declaration source (a vendored prototype to " &
+            "verify against vs. skipping verification entirely). Use " &
+            "prototype alone if you have a vendored C declaration, or " &
+            "noverify alone if none exists", stmt)
+    if result.headerFile == "" and not result.noVerify and result.prototype.len == 0:
       error("proc '" & nameStr &
             "' must specify a header pragma (e.g., {.header: \"foo.h\".}), " &
-            "or {.noverify.} to skip compile-time header verification", stmt)
+            "a prototype pragma (e.g., {.prototype: \"" & nameStr &
+            "(...)\".}), or {.noverify.} to skip compile-time header " &
+            "verification", stmt)
   else:
-    if result.headerFile == "":
+    if result.headerFile == "" and result.prototype.len == 0:
       error("proc '" & nameStr &
-            "' must specify a header pragma (e.g., {.header: \"foo.h\".})", stmt)
+            "' must specify a header pragma (e.g., {.header: \"foo.h\".}) " &
+            "or a prototype pragma (e.g., {.prototype: \"" & nameStr &
+            "(...)\".})", stmt)
 
 proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes
@@ -253,9 +431,19 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   # the installed headers (that's why verification is skipped), and its call
   # expression would be an implicit-declaration error in C. See #14/Defect B:
   # {.optional.} alone is runtime-optional but still compile-time verified.
+  #
+  # A {.prototype.} proc with no {.header.} (RFC-0001 §3 A.1: prototype lifts
+  # the header requirement) is ALSO excluded here for now: the header
+  # requirement is lifted at the parser level (slice A1), but the vendored
+  # prototype isn't wired into this verify TU as an `extern` declaration yet
+  # (slice A2) — until then there is nothing to call/assert against, so such
+  # a proc is simply unverified, exactly like {.noverify.}, without
+  # requiring the pragma. A proc carrying BOTH {.header.} and {.prototype.}
+  # (cross-checking) is unaffected: headerFile is non-empty, so it verifies
+  # exactly as it did before {.prototype.} existed.
   var procs: seq[SoftlinkProc]
   for p in allProcs:
-    if not p.noVerify: procs.add(p)
+    if not p.noVerify and p.headerFile != "": procs.add(p)
   if procs.len == 0:
     return @[]
   var nodes: seq[NimNode] = @[]
@@ -270,7 +458,12 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
     var headers: HashSet[string]
     var includeCode = ""
     for p in procs:
-      if p.headerFile notin headers:
+      # Defensive: `procs` is currently filtered to headerFile != "" (see
+      # above), but RFC-0001 §3 A.1 flags this as a landmine for slice A2,
+      # where a prototype-only proc (no header) WILL reach this loop once
+      # its `extern` declaration is wired into the verify TU instead of an
+      # #include — an empty entry must never become `#include ""`.
+      if p.headerFile != "" and p.headerFile notin headers:
         headers.incl(p.headerFile)
         includeCode.add(toIncludeDirective(p.headerFile))
 
@@ -519,10 +712,15 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## or an explicit `loadLibPattern` string (``"libz3.so(.4|)"``), used verbatim.
   ##
   ## Per-proc pragmas: a calling convention (required), ``header`` (required
-  ## unless ``noverify``), ``optional`` (symbol may be missing at runtime),
-  ## ``verifyWhen: "C_PP_EXPR"`` (verify only when the preprocessor condition
-  ## holds — for symbols newer than some installed headers), and ``noverify``
-  ## (skip verification — for symbols no header declares).
+  ## unless ``noverify`` or ``prototype``), ``optional`` (symbol may be
+  ## missing at runtime), ``verifyWhen: "C_PP_EXPR"`` (verify only when the
+  ## preprocessor condition holds — for symbols newer than some installed
+  ## headers), ``noverify`` (skip verification — for symbols no header
+  ## declares), and ``prototype: "<C prototype>"`` (RFC-0001 §3 A.1: a
+  ## vendored declaration copied from upstream's header, checked for a
+  ## well-formed, non-variadic, name-matching C prototype; may coexist with
+  ## ``header`` for cross-checking, but not with ``noverify``. As of slice
+  ## A1 this only validates — nothing is emitted from it yet).
   let resolvedPattern =
     if libPattern.isLogicalName: deriveLibPattern(libPattern, currentLibOs())
     else: libPattern

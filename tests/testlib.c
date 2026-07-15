@@ -32,3 +32,10 @@ TESTLIB_API char *testlib_mutable_string(void) {
   static char buf[] = "mutable";
   return buf;
 }
+
+/* testlib_protoonly: in the .so but deliberately NOT declared in testlib.h —
+ * RFC-0001 slice A1: bound with {.prototype: "int testlib_protoonly(void)".}
+ * and no {.header.}, exercising the "prototype lifts the header
+ * requirement" rule end-to-end (runtime dispatch is unaffected; the
+ * compile-time assert against the vendored prototype itself is slice A2). */
+TESTLIB_API int testlib_protoonly(void) { return 77; }

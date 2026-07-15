@@ -20,11 +20,14 @@ task test, "Run tests":
   # - verifyWhen: a TRUE gate condition must verify at full strength — a
   #   wrong signature must still fail the C compile with "signature mismatch".
   # - verifyWhen+noverify on one proc is contradictory → macro must error.
+  # - RFC-0001 slice A1: prototype+noverify on one proc is contradictory →
+  #   macro must error (both select a declaration source).
   # Diagnostic tests: {.noverify.} symbols must be enumerated at compile time —
   # a Hint normally, upgraded to a Warning under -d:softlinkStrictVerify.
   const dupFailCheck = "nim c --path:src tests/tfail_duplicate_dynlib.nim"
   const gateFailCheck = "nim c --path:src --passC:-I. tests/tfail_verifywhen_mismatch.nim"
   const contraFailCheck = "nim c --path:src tests/tfail_verifywhen_noverify.nim"
+  const protoContraFailCheck = "nim c --path:src tests/tfail_prototype_noverify.nim"
   # (--compileOnly: the diagnostics fire at macro expansion, so skipping the
   # C compile+link keeps the check fast and leaves no stray binary behind.)
   const hintCheck = "nim c --compileOnly --path:src tests/thint_noverify.nim"
@@ -38,6 +41,7 @@ task test, "Run tests":
     exec dupFailCheck & " 2>&1 | findstr /C:\"collides with an earlier dynlib block\" >NUL"
     exec gateFailCheck & " 2>&1 | findstr /C:\"signature mismatch\" >NUL"
     exec contraFailCheck & " 2>&1 | findstr /C:\"contradicts\" >NUL"
+    exec protoContraFailCheck & " 2>&1 | findstr /C:\"contradicts\" >NUL"
     exec hintCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Hint:\" >NUL"
     exec warnCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Warning:\" >NUL"
   elif defined(macosx):
@@ -48,6 +52,7 @@ task test, "Run tests":
     exec dupFailCheck & " 2>&1 | grep -q 'collides with an earlier dynlib block'"
     exec gateFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     exec contraFailCheck & " 2>&1 | grep -q 'contradicts'"
+    exec protoContraFailCheck & " 2>&1 | grep -q 'contradicts'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
   else:
@@ -60,5 +65,6 @@ task test, "Run tests":
     exec dupFailCheck & " 2>&1 | grep -q 'collides with an earlier dynlib block'"
     exec gateFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     exec contraFailCheck & " 2>&1 | grep -q 'contradicts'"
+    exec protoContraFailCheck & " 2>&1 | grep -q 'contradicts'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
