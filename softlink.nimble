@@ -115,6 +115,14 @@ task test, "Run tests":
   # C compile+link keeps the check fast and leaves no stray binary behind.)
   const hintCheck = "nim c --compileOnly --path:src tests/thint_noverify.nim"
   const warnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify.nim"
+  # RFC-0001 §3 A.2, slice A7: the {.noverify: "justification".} string is
+  # now READ (previously accepted and silently discarded) and folded into
+  # the same hint/warning checked above — this fixture carries one proc
+  # with a justification and one bare {.noverify.} proc, so both renderings
+  # ("<reason text>" and the "(no justification)" placeholder for the bare
+  # form) are exercised in the same compile.
+  const reasonHintCheck = "nim c --compileOnly --path:src tests/thint_noverify_reason.nim"
+  const reasonWarnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify_reason.nim"
   # RFC-0001 slice A6: a {.prototype.}-only proc (no {.header.}) whose
   # prototype references a non-builtin identifier (found via the shared
   # A1 tokenizer) must emit a hint naming it — "this prototype may need
@@ -208,6 +216,10 @@ task test, "Run tests":
     expectCompileFailure(protoConflictCppCheck)
     exec hintCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Hint:\" >NUL"
     exec warnCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Warning:\" >NUL"
+    exec reasonHintCheck & " 2>&1 | findstr /C:\"private symbol, no public header at any version\" | findstr /C:\"Hint:\" >NUL"
+    exec reasonHintCheck & " 2>&1 | findstr /C:\"(no justification)\" >NUL"
+    exec reasonWarnCheck & " 2>&1 | findstr /C:\"private symbol, no public header at any version\" | findstr /C:\"Warning:\" >NUL"
+    exec reasonWarnCheck & " 2>&1 | findstr /C:\"(no justification)\" >NUL"
     exec nonBuiltinHintCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Hint:\" >NUL"
     exec nonBuiltinWarnCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Warning:\" >NUL"
     exec protoEmitCheck
@@ -246,6 +258,10 @@ task test, "Run tests":
     expectCompileFailure(protoConflictCppCheck)
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
+    exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
+    exec reasonHintCheck & " 2>&1 | grep -q '(no justification)'"
+    exec reasonWarnCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Warning:'"
+    exec reasonWarnCheck & " 2>&1 | grep -q '(no justification)'"
     exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
     exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
     exec protoEmitCheck
@@ -283,6 +299,10 @@ task test, "Run tests":
     exec protoConflictCCheck & " 2>&1 | grep -q 'conflicting types for'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
+    exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
+    exec reasonHintCheck & " 2>&1 | grep -q '(no justification)'"
+    exec reasonWarnCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Warning:'"
+    exec reasonWarnCheck & " 2>&1 | grep -q '(no justification)'"
     exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
     exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
     exec protoEmitCheck

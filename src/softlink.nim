@@ -160,6 +160,7 @@ type
     headerFile: string
     isOptional: bool
     noVerify: bool
+    noVerifyReason: string  ## RFC-0001 §3 A.2: {.noverify: "why".} justification; "" if none given
     verifyWhen: string  ## C preprocessor expr gating verification; "" = always
     prototype: string   ## raw {.prototype: "...".} string; "" if absent
     hasReturn: bool
@@ -181,6 +182,27 @@ proc parseVerifyWhenExpr(pragma, stmt: NimNode): string =
   else:
     error("verifyWhen pragma requires a non-empty C preprocessor " &
           "expression (e.g., {.verifyWhen: \"FOO_VERSION >= 0x0300\".})", stmt)
+    ""
+
+proc parseNoVerifyReasonExpr(pragma, stmt: NimNode, nameStr: string): string =
+  ## RFC-0001 §3 A.2: extract the optional {.noverify: "justification".}
+  ## string. Bare `{.noverify.}` (an `nnkIdent`, no colon) carries no
+  ## justification — "" is returned, and the hint falls back to
+  ## "(no justification)". When a value IS supplied (`nnkExprColonExpr`),
+  ## it must be a non-empty string literal (same shape as `verifyWhen`);
+  ## anything else is a macro error rather than a silent discard — the
+  ## whole point of A7 is that this string is no longer thrown away.
+  if pragma.kind == nnkExprColonExpr:
+    if pragma[1].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit} and
+       pragma[1].strVal.strip().len > 0:
+      pragma[1].strVal
+    else:
+      error("proc '" & nameStr & "': noverify justification must be a " &
+            "non-empty string literal (e.g., {.noverify: \"private " &
+            "symbol, no public header\".}), or omit the value entirely " &
+            "for {.noverify.} with no justification", stmt)
+      ""
+  else:
     ""
 
 type
@@ -461,6 +483,7 @@ type
     headerFile*: string
     isOptional*: bool
     noVerify*: bool
+    noVerifyReason*: string  ## RFC-0001 §3 A.2: {.noverify: "why".} justification; "" if none given
     verifyWhen*: string  ## C preprocessor expr gating verification; "" = always
     prototype*: string   ## raw {.prototype: "...".} string; "" if absent
     prototypeName*: string  ## tokenizer-extracted C name; "" if absent
@@ -501,6 +524,7 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
       elif pragmaName == "noverify":
         if mode == ppmDynlib:
           result.noVerify = true
+          result.noVerifyReason = parseNoVerifyReasonExpr(pragma, stmt, nameStr)
         else:
           error("noverify is meaningless in verifyProcs — the block exists " &
                 "solely to verify; simply omit proc '" & nameStr & "'", stmt)
@@ -982,7 +1006,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: ptrName,
                         formalParams: formalParams, callConv: facts.callConv,
                         headerFile: facts.headerFile, isOptional: facts.isOptional,
-                        noVerify: facts.noVerify, verifyWhen: facts.verifyWhen,
+                        noVerify: facts.noVerify, noVerifyReason: facts.noVerifyReason,
+                        verifyWhen: facts.verifyWhen,
                         prototype: facts.prototype, hasReturn: hasReturn))
 
     # Build proc type for the var — C functions can't raise Nim exceptions
@@ -1020,9 +1045,19 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # (unverified yet also absent from this hint) — that gap is what A2 closes,
   # by making them genuinely verified rather than by adding them here.
   block:
+    # RFC-0001 §3 A.2, slice A7: "the current parser already accepts and
+    # silently discards the colon form — A7 makes it read the string. The
+    # justification is folded into the existing unverified-symbols hint/
+    # warning." Each entry renders as `name — "reason"` when a justification
+    # was given, or `name — (no justification)` for bare {.noverify.} — bare
+    # form stays legal (additive), per A.2.
     var unverified: seq[string]
     for p in procs:
-      if p.noVerify: unverified.add(p.nameStr)
+      if p.noVerify:
+        let reasonPart =
+          if p.noVerifyReason.len > 0: "\"" & p.noVerifyReason & "\""
+          else: "(no justification)"
+        unverified.add(p.nameStr & " — " & reasonPart)
     if unverified.len > 0:
       let msg = "softlink: dynlib \"" & libPattern & "\": " &
         $unverified.len & (if unverified.len == 1: " symbol" else: " symbols") &
