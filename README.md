@@ -117,6 +117,16 @@ if v2_featureAvailable():
 
 Required symbols (default) cause load failure if missing. Optional symbols are silently skipped — their wrapper raises `SoftlinkError` if called, and a generated `xxxAvailable*(): bool` proc lets you check before calling.
 
+#### Verification axes
+
+Every proc in a `dynlib` (or `verifyProcs`, see below) block picks a value on independent axes, mix-and-match:
+
+1. **Declaration source** — `header` (verify against an installed header), `prototype` (verify against a vendored C declaration), or `noverify` (skip verification). At least one is required; `header` and `prototype` may coexist for cross-checking. `prototype` + `noverify` is rejected — both pick a source, and they contradict.
+2. **Verification gating** — `{.verifyWhen: "EXPR".}` or nothing, orthogonal to the source axis.
+3. **Runtime requirement** — `{.optional.}` or required (the default), orthogonal to both of the above.
+
+The rest of this section covers `verifyWhen`, `prototype`, and `noverify` in turn — the three ways to shape *how* (or whether) a symbol gets compile-time checked.
+
 Note that `{.optional.}` is **runtime**-optional only: the symbol must still be declared in the compile-time header, because header verification runs for optional procs too. For a symbol that may also be absent from the installed headers (e.g. an API added in a newer library version), gate its verification on the library's version macro with `{.verifyWhen.}`:
 
 ```nim
@@ -132,9 +142,58 @@ dynlib "libfoo.so(.2|.1|)":
 
 The condition is any C preprocessor expression, evaluated after the proc's header is included — version macros like `MBEDTLS_VERSION_NUMBER` or `ZLIB_VERNUM` are the usual choice. This is "verify whenever possible": you lose checking only where checking is genuinely impossible.
 
-For a symbol that **no** header declares at any version (undocumented APIs, headers you don't ship), `{.noverify.}` skips verification entirely and lifts the `header` requirement. The declared signature is trusted as-is, so reserve it for symbols `verifyWhen` can't handle — and note that softlink emits a compile-time hint enumerating every `{.noverify.}` symbol (upgraded to a warning under `-d:softlinkStrictVerify`) so these trust points stay visible in audits. `{.verifyWhen.}` and `{.noverify.}` on the same proc is a compile-time error.
+#### `{.prototype: "<C prototype>".}` — vendor a declaration instead of a header
 
-One `dynlib` block per library per module: a second block whose pattern derives the same identifier base (e.g. `dynlib "m"` twice, or `"libfoo.so"` plus `"foo"`) is rejected at compile time with an error telling you to merge the blocks. Use `{.optional.}`/`{.verifyWhen.}`/`{.noverify.}` within the single block instead of gating extra symbols behind a separate block.
+For a symbol you can't verify against any installed header — too new for what's on your system, or a header you don't have at all — copy the prototype straight from upstream's own header (any version, including ones newer than what's installed). Strip export/calling-convention macros (`FOO_API`, `WINAPI`, ...); those are storage/link attributes, not part of the type the check compares:
+
+```nim
+dynlib "libfoo.so(.2|.1|)":
+  proc core_init(): cint {.cdecl, header: "foo.h".}
+  # Not in any header installed on this system yet — vendored from upstream's
+  # latest foo.h. header stays too, so systems that DO have it get cross-checked.
+  proc v3_feature(x: cint, y: cint): cint
+    {.cdecl, optional,
+      prototype: "int v3_feature(int x, int y)",
+      header: "foo.h".}
+```
+
+softlink emits the prototype as a file-scope `extern` declaration in the verification translation unit (wrapped in `extern "C" { ... }` under `--backend:cpp`), after the block's `#include`s and before the generated `_Static_assert` checks — then runs the exact same signature verification against it that it runs against a header declaration. This buys three things, in order of importance:
+
+1. **The Nim signature is checked on every system, every build** — the trust hole of "this symbol isn't in any header I can compile against" closes to "did I copy the prototype correctly," a transcription task you can check by eye against upstream.
+2. **Opportunistic conflict checking:** on a system whose installed header *does* declare the symbol (as in the example above, with both `header` and `prototype` present), C's same-scope redeclaration rules force the two to agree — an incompatible pair is a hard compile error.
+3. **A drift tripwire at recompile:** if upstream changes the signature later, compiling against the newer header conflicts with your vendored prototype and fails loudly instead of silently passing.
+
+Rules:
+- The value must be a non-empty string literal containing exactly one, non-variadic C prototype (no trailing `;` needed — the macro appends it). Triple-quoted strings are accepted so you can paste upstream's own multi-line formatting verbatim.
+- The declared name must match the proc's C name — a copy-pasted prototype for the wrong symbol is a macro error, not a silently inert declaration.
+- A function-pointer *return type* (`(*` immediately after the parameter list's opening paren, e.g. `void (*signal(int, void (*)(int)))(int)`) can't have its name extracted and is rejected — route through a `typedef`'d return type instead. Function-pointer *parameters* are unaffected.
+- `header` becomes optional when `prototype` is present, but only if the prototype uses nothing but builtin C types (`int`, `unsigned long`, `const char *`, ...). If it references anything else (`size_t`, a library typedef, a struct tag) and no `header` is given, softlink emits a hint — "this prototype may need `header:` to resolve `<name>`" (a warning under `-d:softlinkStrictVerify`) — since that identifier won't otherwise resolve. The hint never blocks the build; it's a nudge, not a requirement.
+- `prototype` + `noverify` is a compile-time error: both pragmas select a declaration source, and they contradict.
+- `prototype` + `verifyWhen` composes: both the emitted declaration and its `_Static_assert` are gated by the same `#if`, for prototypes that reference types absent from old headers.
+- The prototype is never used for dispatch — calls always go through the `dlsym`'d function pointer, exactly as with `header`-verified procs.
+
+Why not just derive the prototype from your Nim signature automatically? Because C prototype compatibility is `const`-*intolerant* and constness can't be inferred from the Nim side — a derived prototype would turn ABI-safe `const` differences (common across header versions) into build breaks. A prototype transcribed from upstream carries the real constness.
+
+#### `{.noverify: "reason".}` — skip verification, with an optional reason
+
+For a symbol that **no** header declares at any version and no prototype exists for either (undocumented APIs, headers you don't ship), `{.noverify.}` skips verification entirely and lifts the `header` requirement. The declared signature is trusted as-is — with `{.prototype.}` available, reserve `noverify` for symbols with no authoritative prototype anywhere.
+
+Give it a justification string and softlink folds it into the compile-time hint that enumerates every `{.noverify.}` symbol (upgraded to a warning under `-d:softlinkStrictVerify`), so these trust points stay visible in audits:
+
+```nim
+dynlib "libfoo.so(.2|.1|)":
+  proc internal_dbg_hook(): cint
+    {.cdecl, optional, noverify: "private symbol, no public header at any version".}
+```
+
+```
+softlink: dynlib "libfoo.so(.2|.1|)": 1 symbol not header-verified ({.noverify.}):
+  internal_dbg_hook — "private symbol, no public header at any version"
+```
+
+The reason is optional — bare `{.noverify.}` still works and renders as `internal_dbg_hook — (no justification)` in the same hint. `{.verifyWhen.}` and `{.noverify.}` on the same proc is a compile-time error (contradictory: one asks for conditional verification, the other for none); so is `{.prototype.}` and `{.noverify.}` together (above).
+
+One `dynlib` block per library per module: a second block whose pattern derives the same identifier base (e.g. `dynlib "m"` twice, or `"libfoo.so"` plus `"foo"`) is rejected at compile time with an error telling you to merge the blocks. Use `{.optional.}`/`{.verifyWhen.}`/`{.prototype.}`/`{.noverify.}` within the single block instead of gating extra symbols behind a separate block.
 
 ### Unload and reload
 
@@ -188,7 +247,7 @@ The casts from `pointer` to typed proc are generated by the macro from your type
 | Struct layout (sizeof) | C compiler — `dyntype` emits `_Static_assert(sizeof)` checks |
 | ABI compatibility | C compiler (signature + struct size) + test suite (runtime behavior) |
 
-Every proc requires a `header` pragma pointing to the C header that declares it (unless marked `{.noverify.}`, which skips verification for that proc; `{.verifyWhen: "EXPR".}` instead gates the check on a C preprocessor condition). At compile time, the macro emits `_Static_assert` checks that verify each symbol's type in the header matches the Nim declaration. This catches signature mismatches, misspelled symbol names, and missing declarations — all at compile time, without requiring the `.so` to be present. Only the C header files are needed (e.g., install the `-dev` package).
+Every proc needs a declaration to verify against: a `header` pragma pointing to the C header that declares it, a vendored `{.prototype: "...".}` (see below — usable with or without `header`, for cross-checking or standalone), or `{.noverify.}` to skip verification for that proc entirely (`{.verifyWhen: "EXPR".}` instead gates the check on a C preprocessor condition, and composes with either source). At compile time, the macro emits `_Static_assert` checks that verify each symbol's declared type matches the Nim declaration. This catches signature mismatches, misspelled symbol names, and missing declarations — all at compile time, without requiring the `.so` to be present. Header-backed procs need only the C header files (e.g., install the `-dev` package); `prototype`-backed procs need nothing installed at all.
 
 ### How header verification works
 
@@ -201,6 +260,22 @@ Three-tier fallback for compiler compatibility:
 3. **MSVC C mode**: Call expression + `_Static_assert` with `_Generic` + `__typeof__` pointer trick
 
 **Compiler requirements:** GCC, Clang, MSVC 2022+, or any C++ compiler with C++11 `decltype`. If your compiler supports none of these, compilation will fail with an explicit error message.
+
+## Standalone Verification (`verifyProcs`)
+
+If you're statically linking against a library — plain `{.importc.}` plus a linker flag, or `{.importc, dynlib: "libfoo.so".}` — but still want softlink's `_Static_assert`-grade signature checking, `verifyProcs` emits *only* the compile-time verification: no loading, no wrappers, no runtime footprint.
+
+```nim
+import softlink
+
+verifyProcs:
+  proc core_init(): cint {.cdecl, header: "foo.h".}
+  proc core_free(): cint {.cdecl, header: "foo.h".}
+```
+
+This expands to nothing but the header-verification machinery described above — no `loadFoo`, no function-pointer vars, no wrapper procs, no `SoftlinkError`. Use it alongside ordinary `{.importc.}` declarations to get the same signature checking `dynlib` gives you, without opting into runtime-optional loading.
+
+`verifyProcs` shares its pragma parser with `dynlib`, so `header`, `prototype`, and `verifyWhen` all work exactly as described above — with two differences: `{.optional.}` and `{.noverify.}` are rejected. Both are meaningless here: the block exists solely to verify, so a proc that's "optional" or "unverified" has nothing for `verifyProcs` to do with it — just omit it from the block instead.
 
 ## Struct Layout Verification (`dyntype`)
 
