@@ -5,6 +5,7 @@
 
 import std/[unittest, math, strutils]
 import softlink {.all.}
+import softlink/versions
 
 suite "deriveLibPattern — logical name → per-OS candidates":
   test "Linux → bare .so first, then descending single-component majors":
@@ -812,3 +813,82 @@ when defined(linux):
     test "resolves libvern.so.3 with no bare libvern.so present":
       check loadVern().kind == lrOk
       check testlib_versioned() == 7
+
+
+# RFC-0001 slice B0: softlink/versions — comparator + pinned types.
+# Property-style unit tests only; no interval/manifest/JSON logic exists yet
+# (that's B1+), so nothing behavioral is tested for VersionInterval/
+# SymbolFacts beyond their shape.
+suite "softlink/versions — B0 version comparator":
+  test "digit runs alone: 4.9.0 < 4.10.0 (the string-compare trap)":
+    # Plain string comparison would say "4.10.0" < "4.9.0" (byte '1' < '9');
+    # this is the whole reason the comparator parses digit runs as integers.
+    check cmpVersion("4.9.0", "4.10.0") < 0
+    check cmpVersion("4.10.0", "4.9.0") > 0
+
+  test "OpenSSL-style alpha suffixes preserve order: 1.1.1a < 1.1.1w":
+    check cmpVersion("1.1.1a", "1.1.1w") < 0
+
+  test "bijective base-26 rollover: 1.0.2z < 1.0.2za":
+    # Collapsing letter suffixes to a single ordinal would break exactly
+    # here (z=26 vs a naive "za"-as-one-token); bijective base-26 restores
+    # a total order across the two-letter rollover.
+    check cmpVersion("1.0.2z", "1.0.2za") < 0
+
+  test "4-component Z3-style version parses digit+alpha runs: 4.15.8p1":
+    check parseVersion("4.15.8p1") == some(@[4, 15, 8, 16, 1])
+
+  test "bijective base-26 spot values: a=1, z=26, aa=27, za=677":
+    check parseVersion("a") == some(@[1])
+    check parseVersion("z") == some(@[26])
+    check parseVersion("aa") == some(@[27])
+    check parseVersion("za") == some(@[677])
+
+  test "trailing-zero padding: 1.2 == 1.2.0 (missing components are 0)":
+    check parseVersion("1.2") == some(@[1, 2])
+    check parseVersion("1.2.0") == some(@[1, 2, 0])
+    check cmpVersion("1.2", "1.2.0") == 0
+    check cmpVersion("1.2.0", "1.2") == 0
+
+  test "case folding: alpha runs are case-insensitive":
+    check parseVersion("ZA") == parseVersion("za")
+    check cmpVersion("1.0.0A", "1.0.0a") == 0
+
+  test "no runs at all fails to parse (never raises)":
+    check parseVersion("").isNone
+    check parseVersion("...").isNone
+    check parseVersion("-").isNone
+    check parseVersion("+++").isNone
+
+  test "total order sanity: antisymmetry over a fixed version list":
+    let vs = ["1.0.0", "1.0.1", "1.1.0", "1.9.0", "1.10.0", "2.0.0",
+               "2.0.0a", "2.0.0b", "2.0.0za", "10.0.0"]
+    for i in 0 ..< vs.len:
+      for j in 0 ..< vs.len:
+        check cmpVersion(vs[i], vs[j]) == -cmpVersion(vs[j], vs[i])
+
+  test "total order sanity: the fixed list is strictly increasing (transitivity spot check)":
+    let vs = ["1.0.0", "1.0.1", "1.1.0", "1.9.0", "1.10.0", "2.0.0",
+               "2.0.0a", "2.0.0b", "2.0.0za", "10.0.0"]
+    for i in 0 ..< vs.len - 1:
+      check cmpVersion(vs[i], vs[i + 1]) < 0
+    # transitivity: vs[0] < vs[1] and vs[1] < vs[2] implies vs[0] < vs[2]
+    check cmpVersion(vs[0], vs[2]) < 0
+
+  test "VersionInterval/SymbolFacts: pinned shapes only (no interval logic yet)":
+    # B0 pins the TYPES the harvester (B6b) and Stage C will populate; this
+    # slice does not implement containment, compression, or JSON. "" means
+    # unbounded by convention (documented on the type), not asserted here.
+    let unbounded = VersionInterval(lo: "", hi: "")
+    check unbounded.lo == ""
+    check unbounded.hi == ""
+    let bounded = VersionInterval(lo: "1.0.0", hi: "2.0.0")
+    check bounded.lo == "1.0.0"
+    check bounded.hi == "2.0.0"
+    var facts = SymbolFacts(cname: "testlib_add")
+    facts.header[fkVerified].add VersionInterval(lo: "1.0.0", hi: "2.0.0")
+    facts.header[fkAbsent].add VersionInterval(lo: "", hi: "1.0.0")
+    check facts.cname == "testlib_add"
+    check facts.header[fkVerified].len == 1
+    check facts.header[fkMismatch].len == 0
+    check facts.header[fkUnknown].len == 0
