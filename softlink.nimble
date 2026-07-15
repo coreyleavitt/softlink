@@ -24,6 +24,9 @@ task test, "Run tests":
   #   macro must error (both select a declaration source).
   # Diagnostic tests: {.noverify.} symbols must be enumerated at compile time —
   # a Hint normally, upgraded to a Warning under -d:softlinkStrictVerify.
+  # Positive C-inspection check (RFC-0001 slice A2): a {.prototype.}-only
+  # proc must emit a real `extern` declaration into the generated C, proving
+  # verification actually ran against it (not merely compiled by accident).
   const dupFailCheck = "nim c --path:src tests/tfail_duplicate_dynlib.nim"
   const gateFailCheck = "nim c --path:src --passC:-I. tests/tfail_verifywhen_mismatch.nim"
   const contraFailCheck = "nim c --path:src tests/tfail_verifywhen_noverify.nim"
@@ -32,6 +35,20 @@ task test, "Run tests":
   # C compile+link keeps the check fast and leaves no stray binary behind.)
   const hintCheck = "nim c --compileOnly --path:src tests/thint_noverify.nim"
   const warnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify.nim"
+  # RFC-0001 slice A2: a {.prototype.}-only proc (testlib_protoonly, no
+  # {.header.}) must be verified for real against its vendored C prototype —
+  # emitted as a file-scope `extern` declaration in the verify TU, ahead of
+  # the standard call-based _Static_assert chain. "Genuinely verified"
+  # vs. A1's interim "silently unverified" are indistinguishable from a
+  # runtime unittest (both compile and dispatch identically), so this
+  # inspects the generated C directly for the extern declaration. The
+  # emitted text (including the `#if defined(__cplusplus) extern "C" { ...
+  # }` wrapper) is backend-agnostic — written to the .c file regardless of
+  # target — so one C-backend --compileOnly run covers both backends.
+  const protoEmitDir = "tests/nimcache_protocheck"
+  const protoEmitCheck = "nim c --compileOnly --nimcache:" & protoEmitDir &
+    " --path:src --passC:-I. tests/test_softlink.nim"
+  if dirExists(protoEmitDir): rmDir(protoEmitDir)
   when defined(windows):
     exec "gcc -shared -o tests/testlib.dll tests/testlib.c"
     exec "gcc -shared -o tests/libmagic.dll tests/testlib.c"
@@ -44,6 +61,10 @@ task test, "Run tests":
     exec protoContraFailCheck & " 2>&1 | findstr /C:\"contradicts\" >NUL"
     exec hintCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Hint:\" >NUL"
     exec warnCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Warning:\" >NUL"
+    exec protoEmitCheck
+    exec "findstr /s /m /c:\"extern int testlib_protoonly(void);\" " &
+      protoEmitDir & "\\*.c >NUL"
+    rmDir(protoEmitDir)
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -55,6 +76,9 @@ task test, "Run tests":
     exec protoContraFailCheck & " 2>&1 | grep -q 'contradicts'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
+    exec protoEmitCheck
+    exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    rmDir(protoEmitDir)
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -68,3 +92,6 @@ task test, "Run tests":
     exec protoContraFailCheck & " 2>&1 | grep -q 'contradicts'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
+    exec protoEmitCheck
+    exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    rmDir(protoEmitDir)

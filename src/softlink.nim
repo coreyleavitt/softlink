@@ -54,6 +54,34 @@ func toIncludeDirective(header: string): string =
   else:
     "#include \"" & header & "\"\n"
 
+func emitPrototypeDecl(prototype: string, verifyWhen: string): string =
+  ## Render RFC-0001 §3 A.1's vendored-prototype file-scope `extern`
+  ## declaration for one proc's `{.prototype: "<C prototype>".}`. Emitted
+  ## into the verify TU after the block's `#include`s (so named types
+  ## resolve) and before the verify proc body — the same `includeCode`
+  ## blob `genVerifyBlock` already builds for headers, just appended.
+  ##
+  ## Wrapped in `extern "C" { ... }` under the C++ backend: C11 6.7p4 makes
+  ## an incompatible same-scope redeclaration a mandatory diagnostic, but
+  ## without C linkage a drifted upstream declaration is a legal *overload*
+  ## in C++ — overload resolution would quietly pick the header's
+  ## declaration and the drift tripwire (benefit 3 of A.1) would never
+  ## fire. The `#if defined(__cplusplus)` guard is inert (but present) in
+  ## the C-backend output too — the emitted text is backend-agnostic; only
+  ## the C preprocessor decides which branch survives.
+  ##
+  ## When `{.verifyWhen.}` is also present, the declaration itself is gated
+  ## by the same `#if (EXPR)` as its assert (A.1: "composes... both the
+  ## emitted declaration and its assert are gated by the #if") — needed
+  ## when the vendored prototype references types absent from old headers.
+  var decl = "#if defined(__cplusplus)\nextern \"C\" {\n#endif\n" &
+    "extern " & prototype & ";\n" &
+    "#if defined(__cplusplus)\n}\n#endif\n"
+  if verifyWhen.len > 0:
+    decl = "#if (" & verifyWhen & ") /* softlink verifyWhen: prototype decl */\n" &
+      decl & "#endif /* softlink verifyWhen */\n"
+  decl
+
 func libNameToIdent(libPattern: string): string =
   ## Derive an identifier base name from a library pattern string.
   ## Strips "lib" prefix, truncates at first dot, removes non-alphanumeric
@@ -133,6 +161,7 @@ type
     isOptional: bool
     noVerify: bool
     verifyWhen: string  ## C preprocessor expr gating verification; "" = always
+    prototype: string   ## raw {.prototype: "...".} string; "" if absent
     hasReturn: bool
 
 func pragmaKeyName(pragma: NimNode): string =
@@ -432,18 +461,18 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
   # expression would be an implicit-declaration error in C. See #14/Defect B:
   # {.optional.} alone is runtime-optional but still compile-time verified.
   #
-  # A {.prototype.} proc with no {.header.} (RFC-0001 §3 A.1: prototype lifts
-  # the header requirement) is ALSO excluded here for now: the header
-  # requirement is lifted at the parser level (slice A1), but the vendored
-  # prototype isn't wired into this verify TU as an `extern` declaration yet
-  # (slice A2) — until then there is nothing to call/assert against, so such
-  # a proc is simply unverified, exactly like {.noverify.}, without
-  # requiring the pragma. A proc carrying BOTH {.header.} and {.prototype.}
-  # (cross-checking) is unaffected: headerFile is non-empty, so it verifies
-  # exactly as it did before {.prototype.} existed.
+  # A {.prototype.} proc (RFC-0001 §3 A.1) verifies even with no {.header.}:
+  # the vendored prototype is emitted as a file-scope `extern` declaration
+  # (see `emitPrototypeDecl`) below the block's #includes, giving the
+  # subsequent call-based _Static_assert something real to check against —
+  # no implicit-declaration error, because the symbol is now declared.
+  # A proc carrying BOTH {.header.} and {.prototype.} (cross-checking) gets
+  # BOTH declarations; if they disagree, the C compiler itself reports the
+  # conflict (opportunistic conflict checking, benefit 2 of A.1 — the actual
+  # conflict fixture is slice A4).
   var procs: seq[SoftlinkProc]
   for p in allProcs:
-    if not p.noVerify and p.headerFile != "": procs.add(p)
+    if not p.noVerify and (p.headerFile != "" or p.prototype.len > 0): procs.add(p)
   if procs.len == 0:
     return @[]
   var nodes: seq[NimNode] = @[]
@@ -458,14 +487,22 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
     var headers: HashSet[string]
     var includeCode = ""
     for p in procs:
-      # Defensive: `procs` is currently filtered to headerFile != "" (see
-      # above), but RFC-0001 §3 A.1 flags this as a landmine for slice A2,
-      # where a prototype-only proc (no header) WILL reach this loop once
-      # its `extern` declaration is wired into the verify TU instead of an
-      # #include — an empty entry must never become `#include ""`.
+      # `procs` now includes prototype-only entries (no {.header.}) per
+      # RFC-0001 §3 A.1 slice A2 — the empty-headerFile guard here is load-
+      # bearing, not defensive dead code: without it a prototype-only proc
+      # would emit `#include ""`, a compile error.
       if p.headerFile != "" and p.headerFile notin headers:
         headers.incl(p.headerFile)
         includeCode.add(toIncludeDirective(p.headerFile))
+
+    # Vendored-prototype extern declarations (RFC-0001 §3 A.1), emitted
+    # after all of this block's #includes so any named types the prototype
+    # references resolve, and before the type_traits/verify-proc code below.
+    # A proc with both {.header.} and {.prototype.} gets both declarations —
+    # cross-checking (A.1 benefit 2); the C compiler itself flags disagreement.
+    for p in procs:
+      if p.prototype.len > 0:
+        includeCode.add(emitPrototypeDecl(p.prototype, p.verifyWhen))
 
     # Emit #include directives + C++ type_traits if needed
     nodes.add(newNimNode(nnkPragma).add(
@@ -516,7 +553,11 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
 
       # Build the call expression arguments for emit: "symbol(p1, p2, ...)"
       # Each dummy var is a Nim node resolved to its C name via emit array.
-      let errMsg = "softlink: " & p.nameStr & " signature mismatch vs " & p.headerFile
+      let declSource =
+        if p.headerFile != "": p.headerFile
+        elif p.prototype.len > 0: "vendored prototype"
+        else: "declaration"
+      let errMsg = "softlink: " & p.nameStr & " signature mismatch vs " & declSource
 
       # Helper: build the call args portion of emit array
       # Result: [symName, "(", p1, ", ", p2, ", ", ..., ")"]
@@ -719,8 +760,10 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## declares), and ``prototype: "<C prototype>"`` (RFC-0001 §3 A.1: a
   ## vendored declaration copied from upstream's header, checked for a
   ## well-formed, non-variadic, name-matching C prototype; may coexist with
-  ## ``header`` for cross-checking, but not with ``noverify``. As of slice
-  ## A1 this only validates — nothing is emitted from it yet).
+  ## ``header`` for cross-checking, but not with ``noverify``. Emitted as a
+  ## file-scope ``extern`` declaration in the verify TU — verified with the
+  ## same call-based ``_Static_assert`` machinery as a header, so a
+  ## ``prototype``-only proc is fully header-verified without a header).
   let resolvedPattern =
     if libPattern.isLogicalName: deriveLibPattern(libPattern, currentLibOs())
     else: libPattern
@@ -817,7 +860,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
                         formalParams: formalParams, callConv: facts.callConv,
                         headerFile: facts.headerFile, isOptional: facts.isOptional,
                         noVerify: facts.noVerify, verifyWhen: facts.verifyWhen,
-                        hasReturn: hasReturn))
+                        prototype: facts.prototype, hasReturn: hasReturn))
 
     # Build proc type for the var — C functions can't raise Nim exceptions
     var procTy = newNimNode(nnkProcTy)
@@ -839,12 +882,20 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       )
     ))
 
-  # Visibility for trust points: enumerate {.noverify.} symbols at compile
-  # time so audits don't depend on grepping source. A hint in normal builds,
-  # upgraded to a warning under -d:softlinkStrictVerify — audit mode wants
-  # loudness, but an explicit opt-out must not fail the build. verifyWhen
-  # procs get no diagnostic: their status is decided by the C preprocessor
-  # and the pragma documents itself at the declaration site.
+  # Visibility for trust points (RFC-0001 principle 2: "anything unverified
+  # is surfaced at compile time, never silent"): enumerate {.noverify.}
+  # symbols so audits don't depend on grepping source. A hint in normal
+  # builds, upgraded to a warning under -d:softlinkStrictVerify — audit mode
+  # wants loudness, but an explicit opt-out must not fail the build.
+  # verifyWhen procs get no diagnostic: their status is decided by the C
+  # preprocessor and the pragma documents itself at the declaration site.
+  # {.prototype.}-only procs (no {.header.}) do NOT appear here either — as
+  # of slice A2 they ARE header-verified (against the vendored extern
+  # declaration; see `genVerifyBlock`/`emitPrototypeDecl`), so listing them
+  # as a trust hole would be actively wrong, not merely redundant. Before
+  # A2 wired the emission, such procs were invisible in a different sense
+  # (unverified yet also absent from this hint) — that gap is what A2 closes,
+  # by making them genuinely verified rather than by adding them here.
   block:
     var unverified: seq[string]
     for p in procs:
@@ -1145,7 +1196,8 @@ proc collectVProcs(body: NimNode): seq[SoftlinkProc] =
     let facts = parseProcPragmas(stmt, nameStr, ppmVerifyProcs)
     result.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
       formalParams: formalParams, callConv: facts.callConv, headerFile: facts.headerFile,
-      isOptional: false, verifyWhen: facts.verifyWhen, hasReturn: hasReturn))
+      isOptional: false, verifyWhen: facts.verifyWhen, prototype: facts.prototype,
+      hasReturn: hasReturn))
 
 macro verifyProcs*(body: untyped): untyped =
   ## Emit ONLY compile-time C header signature verification for the given proc

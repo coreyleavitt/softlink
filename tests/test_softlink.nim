@@ -72,10 +72,11 @@ else:
   const TestLib = "libtestlib.so"
 
 dynlib TestLib:
-  # RFC-0001 slice A1: {.prototype.} may coexist with {.header.}
-  # (cross-checking, §3 A.1) — the vendored prototype below is inert for A1
-  # (nothing is emitted from it yet; wiring into the verify TU is slice A2),
-  # so this must compile and behave identically to a header-only binding.
+  # RFC-0001 §3 A.1: {.prototype.} coexisting with {.header.} (cross-checking)
+  # — both the header's declaration and the vendored `extern` prototype are
+  # emitted; the C compiler itself enforces same-scope agreement (C11
+  # 6.7p4), so this compiling at all is a live conflict-free-agreement check
+  # (the deliberate-conflict case is slice A4).
   proc testlib_add(a: cint, b: cint): cint
     {.cdecl, header: "tests/testlib.h", prototype: "int testlib_add(int a, int b)".}
   proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
@@ -106,12 +107,15 @@ dynlib TestLib:
   # verify this signature.
   proc testlib_gated_v2(): cint
     {.cdecl, optional, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
-  # RFC-0001 slice A1: {.prototype.} alone (no {.header.}) is accepted — the
-  # header requirement is lifted. testlib_protoonly is in the .so but NOT in
-  # testlib.h (the F2 scenario A1 targets); runtime dispatch works exactly
-  # like {.noverify.}, but no {.noverify.} pragma is needed or accepted
-  # (prototype + noverify is a contradiction — both select a declaration
-  # source). Compile-time verification of the prototype itself is slice A2.
+  # RFC-0001 §3 A.1 slice A2 happy path: {.prototype.} alone (no {.header.})
+  # is accepted, header requirement lifted, AND now fully verified — the
+  # vendored prototype is emitted as a file-scope `extern` declaration ahead
+  # of the standard call-based _Static_assert chain (see `emitPrototypeDecl`
+  # in softlink.nim), so a wrong signature here would fail the C compile
+  # exactly like a header-verified proc's would (that negative case is slice
+  # A3). testlib_protoonly is in the .so but NOT in testlib.h — the F2
+  # scenario A.1 targets — and runtime dispatch is unaffected: still routed
+  # through the dlsym'd pointer, never through the extern declaration.
   proc testlib_protoonly(): cint
     {.cdecl, prototype: "int testlib_protoonly(void)".}
 
@@ -119,11 +123,23 @@ dynlib TestLib:
 # wrappers). Correct signatures must compile; the const-return case (#11)
 # must also be accepted here, sharing dynlib's verification codegen.
 verifyProcs:
-  # {.prototype.} + {.header.} coexisting (cross-checking, §3 A.1) — inert
-  # for A1, must compile and verify exactly as header-only did before.
+  # {.prototype.} + {.header.} coexisting (cross-checking, §3 A.1): both
+  # declarations are emitted; must compile as a live conflict-free-agreement
+  # check (same reasoning as the dynlib block above).
   proc testlib_add(a: cint, b: cint): cint
     {.cdecl, header: "tests/testlib.h", prototype: "int testlib_add(int a, int b)".}
   proc testlib_const_string(): cstring {.cdecl, header: "tests/testlib.h".}
+  # verifyProcs parity (RFC-0001 slice A2, deliverable 4): the same
+  # {.prototype.}-only emission path must fire here too — no dynlib-specific
+  # special-casing in `genVerifyBlock`. Reuses testlib_unheralded (the RFC's
+  # named A2 fixture, §9): absent from testlib.h, so this compiling proves
+  # the extern declaration + assert ran for real, not skipped. (dynlib's own
+  # binding of testlib_unheralded stays on {.noverify.} for the #14
+  # regression above — a proc name may be reused across independent
+  # macro-block instances since neither macro declares a Nim-level symbol
+  # by that name outside the emitted C text.)
+  proc testlib_unheralded(): cint
+    {.cdecl, prototype: "int testlib_unheralded(void)".}
   # verifyWhen in verifyProcs: identical semantics to dynlib. True condition →
   # verified (testlib_gated is declared in testlib.h); false condition →
   # skipped entirely, so a symbol absent from the header must NOT be an
@@ -422,12 +438,16 @@ suite "softlink":
     expect SoftlinkError:
       discard testlib_future_nv()
 
-  # RFC-0001 slice A1: {.prototype.} alone (no {.header.}) lifts the header
-  # requirement. testlib_protoonly is absent from testlib.h entirely — a
-  # plain {.header.} binding of it would be a C implicit-declaration error —
-  # yet loads and dispatches normally, since runtime resolution never
-  # depended on compile-time verification.
-  test "prototype: header-optional path resolves and dispatches at runtime (A1)":
+  # RFC-0001 §3 A.1 slice A2: {.prototype.} alone (no {.header.}) lifts the
+  # header requirement AND is now genuinely header-verified — testlib_protoonly
+  # is absent from testlib.h entirely (a plain {.header.} binding of it would
+  # be a C implicit-declaration error), yet compiles because the vendored
+  # prototype is emitted as its own `extern` declaration ahead of the
+  # _Static_assert chain (see softlink.nim `emitPrototypeDecl`; the compile
+  # succeeding at all is the compile-time half of this test — a wrong
+  # signature here is slice A3). Runtime dispatch is a separate, unaffected
+  # path: still routed through the dlsym'd pointer, never the extern decl.
+  test "prototype: header-optional path verifies at compile time and dispatches at runtime (A2)":
     check loadTestlib().kind in {lrOk, lrOkPartial}
     check testlib_protoonly() == 77.cint
 
