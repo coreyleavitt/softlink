@@ -59,6 +59,24 @@ task test, "Run tests":
   # of one self-contained script per CI leg.
   const protoConflictCCheck = "nim c --path:src --passC:-I. tests/tfail_prototype_conflict.nim"
   const protoConflictCppCheck = "nim cpp --path:src --passC:-I. tests/tfail_prototype_conflict.nim"
+  # RFC-0001 slice A8: verifyProcs parity pins for {.prototype.} — the RFC's
+  # own framing is that parity with dynlib already exists STRUCTURALLY (A0
+  # gave both macros the same `parseProcPragmas`; A2 wired prototype
+  # emission through the shared `genVerifyBlock`/`collectVProcs` path), and
+  # this slice's job is to PIN that with tests so a future refactor can't
+  # silently regress the verifyProcs side without dynlib's own tests
+  # noticing. The A3 (mismatch) and A4 (conflict) analogs below are C-level
+  # failures — `compiles()` only catches Nim-side macro errors, never a
+  # C-level _Static_assert or redeclaration conflict (the C compiler runs
+  # later, outside Nim's semantic check) — so they reuse the tfail-fixture
+  # pattern instead of a suite-level `compiles()` test, exactly like their
+  # dynlib originals.
+  const vpProtoMismatchFailCheck =
+    "nim c --path:src --passC:-I. tests/tfail_verifyprocs_prototype_mismatch.nim"
+  const vpProtoConflictCCheck =
+    "nim c --path:src --passC:-I. tests/tfail_verifyprocs_prototype_conflict.nim"
+  const vpProtoConflictCppCheck =
+    "nim cpp --path:src --passC:-I. tests/tfail_verifyprocs_prototype_conflict.nim"
 
   proc expectCompileFailure(cmd: string) =
     ## RFC-0001 slice A4: assert a compile FAILS by exit code alone. Every
@@ -199,6 +217,45 @@ task test, "Run tests":
     "extern void testlib_proto_gated_false(double a, double b, double c);"
   const protoGateFalseCheck = "grep -rFA5 '" & protoGateFalseAnchor & "' " &
     protoEmitDir & " | grep -Fq '" & protoGateFalseDecl & "'"
+  # RFC-0001 slice A8: verifyProcs parity for the non-builtin-identifier hint
+  # (slice A6). thint_prototype_nonbuiltin.nim above is dynlib-only; this is
+  # the verifyProcs mirror, same fixture shape, through `verifyProcs` instead.
+  const vpNonBuiltinHintCheck =
+    "nim c --compileOnly --path:src tests/thint_verifyprocs_prototype_nonbuiltin.nim"
+  const vpNonBuiltinWarnCheck = "nim c --compileOnly --path:src " &
+    "-d:softlinkStrictVerify tests/thint_verifyprocs_prototype_nonbuiltin.nim"
+  # RFC-0001 slice A8: verifyProcs parity for slice A2's "prototype-only
+  # proc is genuinely verified, not silently skipped" proof. The verifyProcs
+  # block in test_softlink.nim binds testlib_unheralded (absent from
+  # testlib.h) via {.prototype.} alone; dynlib's OWN binding of the same C
+  # symbol stays on {.noverify.} (the #14 regression fixture) and so is
+  # excluded from `genVerifyBlock`'s `procs` filter entirely — it never
+  # emits an extern declaration for testlib_unheralded. That makes this grep
+  # unambiguous: the only possible source of `extern int
+  # testlib_unheralded(void);` in the whole compiled TU is verifyProcs's
+  # prototype-only emission path, proven the same way A2 proved it for
+  # dynlib's testlib_protoonly above (a runtime unittest can't tell
+  # "genuinely verified" from "silently unverified" apart — verifyProcs has
+  # no runtime unittests at all).
+  const vpProtoOnlyDecl = "extern int testlib_unheralded(void);"
+  # RFC-0001 slice A8: the verifyProcs analog of the A5 true/false-gate
+  # C-inspection pair above (protoGateTrueCheck/protoGateFalseCheck), using
+  # vp_proto_gated_true/vp_proto_gated_false — C names UNIQUE to the
+  # verifyProcs block (never bound by the dynlib block), so a match can only
+  # be explained by verifyProcs's own emission, not dynlib's (see the doc
+  # comment on those two procs in test_softlink.nim for why sharing a name
+  # with the dynlib fixture would leave this ambiguous). Empirically
+  # verified load-bearing during this slice's TDD cycle: fault-injecting
+  # `collectVProcs` to drop `verifyWhen`/`prototype` on the way into
+  # `SoftlinkProc` (verifyProcs-specific code, NOT shared with dynlib's own
+  # body-collection loop) left the full suite green but was caught here.
+  const vpProtoGateTrueDecl = "extern int vp_proto_gated_true(void);"
+  const vpProtoGateTrueCheck = "grep -rFA5 '" & protoGateTrueAnchor & "' " &
+    protoEmitDir & " | grep -Fq '" & vpProtoGateTrueDecl & "'"
+  const vpProtoGateFalseDecl =
+    "extern void vp_proto_gated_false(double a, double b, double c);"
+  const vpProtoGateFalseCheck = "grep -rFA5 '" & protoGateFalseAnchor & "' " &
+    protoEmitDir & " | grep -Fq '" & vpProtoGateFalseDecl & "'"
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   if dirExists(protoOnlyDir): rmDir(protoOnlyDir)
   when defined(windows):
@@ -214,6 +271,11 @@ task test, "Run tests":
     exec protoMismatchFailCheck & " 2>&1 | findstr /C:\"signature mismatch\" >NUL"
     expectCompileFailure(protoConflictCCheck)
     expectCompileFailure(protoConflictCppCheck)
+    # RFC-0001 slice A8: verifyProcs parity analogs of the A3/A4 negative
+    # fixtures directly above.
+    exec vpProtoMismatchFailCheck & " 2>&1 | findstr /C:\"signature mismatch\" >NUL"
+    expectCompileFailure(vpProtoConflictCCheck)
+    expectCompileFailure(vpProtoConflictCppCheck)
     exec hintCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Hint:\" >NUL"
     exec warnCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Warning:\" >NUL"
     exec reasonHintCheck & " 2>&1 | findstr /C:\"private symbol, no public header at any version\" | findstr /C:\"Hint:\" >NUL"
@@ -222,8 +284,17 @@ task test, "Run tests":
     exec reasonWarnCheck & " 2>&1 | findstr /C:\"(no justification)\" >NUL"
     exec nonBuiltinHintCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Hint:\" >NUL"
     exec nonBuiltinWarnCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Warning:\" >NUL"
+    # RFC-0001 slice A8: verifyProcs parity analog of the A6 non-builtin
+    # hint check directly above.
+    exec vpNonBuiltinHintCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Hint:\" >NUL"
+    exec vpNonBuiltinWarnCheck & " 2>&1 | findstr /C:\"may need `header:` to resolve\" | findstr /C:\"Warning:\" >NUL"
     exec protoEmitCheck
     exec "findstr /s /m /c:\"extern int testlib_protoonly(void);\" " &
+      protoEmitDir & "\\*.c >NUL"
+    # RFC-0001 slice A8: verifyProcs parity analog of A2's dynlib
+    # prototype-only emission proof above — see `vpProtoOnlyDecl`'s doc
+    # comment for why this grep is unambiguous.
+    exec "findstr /s /m /c:\"" & vpProtoOnlyDecl & "\" " &
       protoEmitDir & "\\*.c >NUL"
     # RFC-0001 slice A5 (Windows proxy): findstr has no "-A" context-lines
     # equivalent to grep's, so this checks the gate line and the declaration
@@ -237,6 +308,18 @@ task test, "Run tests":
     exec "findstr /s /m /c:\"" & protoGateFalseAnchor & "\" " &
       protoEmitDir & "\\*.c >NUL"
     exec "findstr /s /m /c:\"" & protoGateFalseDecl & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    # RFC-0001 slice A8: verifyProcs parity analogs of the A5 true/false-gate
+    # C-inspection pair directly above (same weaker Windows-proxy shape:
+    # anchor and declaration checked as separate presence tests, not
+    # adjacency-proven).
+    exec "findstr /s /m /c:\"" & protoGateTrueAnchor & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    exec "findstr /s /m /c:\"" & vpProtoGateTrueDecl & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    exec "findstr /s /m /c:\"" & protoGateFalseAnchor & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    exec "findstr /s /m /c:\"" & vpProtoGateFalseDecl & "\" " &
       protoEmitDir & "\\*.c >NUL"
     rmDir(protoEmitDir)
     exec protoOnlyCheck
@@ -256,6 +339,11 @@ task test, "Run tests":
     exec protoMismatchFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     expectCompileFailure(protoConflictCCheck)
     expectCompileFailure(protoConflictCppCheck)
+    # RFC-0001 slice A8: verifyProcs parity analogs of the A3/A4 negative
+    # fixtures directly above.
+    exec vpProtoMismatchFailCheck & " 2>&1 | grep -q 'signature mismatch'"
+    expectCompileFailure(vpProtoConflictCCheck)
+    expectCompileFailure(vpProtoConflictCppCheck)
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
     exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
@@ -264,10 +352,21 @@ task test, "Run tests":
     exec reasonWarnCheck & " 2>&1 | grep -q '(no justification)'"
     exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
     exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
+    # RFC-0001 slice A8: verifyProcs parity analog of the A6 non-builtin
+    # hint check directly above.
+    exec vpNonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
+    exec vpNonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
     exec protoEmitCheck
     exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    # RFC-0001 slice A8: verifyProcs parity analog of A2's dynlib
+    # prototype-only emission proof directly above.
+    exec "grep -rq '" & vpProtoOnlyDecl & "' " & protoEmitDir
     exec protoGateTrueCheck
     exec protoGateFalseCheck
+    # RFC-0001 slice A8: verifyProcs parity analogs of the A5 true/false-gate
+    # C-inspection pair directly above.
+    exec vpProtoGateTrueCheck
+    exec vpProtoGateFalseCheck
     rmDir(protoEmitDir)
     exec protoOnlyCheck
     expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")
@@ -287,6 +386,11 @@ task test, "Run tests":
     exec protoMismatchFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     expectCompileFailure(protoConflictCCheck)
     expectCompileFailure(protoConflictCppCheck)
+    # RFC-0001 slice A8: verifyProcs parity analogs of the A3/A4 negative
+    # fixtures directly above.
+    exec vpProtoMismatchFailCheck & " 2>&1 | grep -q 'signature mismatch'"
+    expectCompileFailure(vpProtoConflictCCheck)
+    expectCompileFailure(vpProtoConflictCppCheck)
     # RFC-0001 slice A4, optional extra confidence (gcc/clang-gated only —
     # never on the Windows/MSVC branch above): also inspect the compiler's
     # own wording for the redeclaration conflict. Deliberately NOT required
@@ -297,6 +401,9 @@ task test, "Run tests":
     # ("conflicting types for ...") is not a stable cross-version/cross-
     # compiler contract the way softlink's own diagnostic strings are.
     exec protoConflictCCheck & " 2>&1 | grep -q 'conflicting types for'"
+    # RFC-0001 slice A8: same optional gcc-gated wording sanity check, for
+    # the verifyProcs conflict fixture.
+    exec vpProtoConflictCCheck & " 2>&1 | grep -q 'conflicting types for'"
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
     exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
@@ -305,10 +412,21 @@ task test, "Run tests":
     exec reasonWarnCheck & " 2>&1 | grep -q '(no justification)'"
     exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
     exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
+    # RFC-0001 slice A8: verifyProcs parity analog of the A6 non-builtin
+    # hint check directly above.
+    exec vpNonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
+    exec vpNonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
     exec protoEmitCheck
     exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    # RFC-0001 slice A8: verifyProcs parity analog of A2's dynlib
+    # prototype-only emission proof directly above.
+    exec "grep -rq '" & vpProtoOnlyDecl & "' " & protoEmitDir
     exec protoGateTrueCheck
     exec protoGateFalseCheck
+    # RFC-0001 slice A8: verifyProcs parity analogs of the A5 true/false-gate
+    # C-inspection pair directly above.
+    exec vpProtoGateTrueCheck
+    exec vpProtoGateFalseCheck
     rmDir(protoEmitDir)
     exec protoOnlyCheck
     expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")

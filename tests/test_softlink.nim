@@ -186,6 +186,33 @@ verifyProcs:
   proc testlib_proto_gated_true(): cint
     {.cdecl, prototype: "int testlib_proto_gated_true(void)",
       verifyWhen: "TESTLIB_VERSION >= 1".}
+  # RFC-0001 slice A8: the false-gate mirror of the pair above, completing
+  # the A5 composition parity sweep for verifyProcs (the RFC's own words
+  # for this slice: "including the A5 composition"). Deliberately given a
+  # C name UNIQUE to this block (never bound by the dynlib block above,
+  # unlike testlib_proto_gated_true/false, which verifyProcs reuses) —
+  # collision-safe reuse is fine for a *positive* compile, but it would
+  # make a C-inspection grep for this exact declaration text ambiguous:
+  # it could be satisfied by the dynlib block's own (already-tested)
+  # emission instead of proving verifyProcs's independently. `collectVProcs`
+  # is the one piece of code NOT literally shared with dynlib's own body-
+  # collection loop (both funnel into the same `parseProcPragmas` +
+  # `genVerifyBlock`, but each macro has its own loop translating parsed
+  # facts into `SoftlinkProc`) — a regression there (e.g. dropping
+  # `verifyWhen`/`prototype` on the way into `SoftlinkProc`) is exactly
+  # the kind of "future refactor silently breaks the verifyProcs side"
+  # this slice exists to catch, and a shared-name fixture can't catch it
+  # (proven by fault injection during this slice's TDD cycle — see the
+  # nimble test task's `vpProtoGateTrueCheck`/`vpProtoGateFalseCheck`
+  # comments). The prototype is deliberately WRONG (different return type
+  # and arity, matching the A5 false-gate precedent above) — the false
+  # gate must suppress both the (wrong) declaration and its assert.
+  proc vp_proto_gated_true(): cint
+    {.cdecl, prototype: "int vp_proto_gated_true(void)",
+      verifyWhen: "TESTLIB_VERSION >= 1".}
+  proc vp_proto_gated_false(): cint
+    {.cdecl, prototype: "void vp_proto_gated_false(double a, double b, double c)",
+      verifyWhen: "TESTLIB_VERSION >= 99".}
 
 suite "verifyProcs (static-binding header verification)":
   test "correct signatures pass compile-time verification":
