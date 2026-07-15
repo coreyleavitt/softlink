@@ -72,22 +72,6 @@ jobs:
           cl /LD /DTESTLIB_BUILDING /Fe:tests\testlib.dll tests\testlib.c
           cl /LD /DTESTLIB_BUILDING /Fe:tests\libmagic.dll tests\testlib.c
 
-      - name: Build test library (GCC/Clang)
-        if: matrix.cc != 'vcc'
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            gcc -shared -o tests/testlib.dll tests/testlib.c
-            gcc -shared -o tests/libmagic.dll tests/testlib.c
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c
-            cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c
-          else
-            gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c
-            gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c
-            gcc -shared -fPIC -o tests/libvern.so.3 tests/testlib.c
-          fi
-
       # /std:clatest opens the C23 gate so MSVC exposes _Generic/__typeof__;
       # -d:softlinkStrictVerify turns a would-be-skipped verify block into a hard
       # #error, so this leg cannot go green unless the real check actually compiled.
@@ -98,15 +82,29 @@ jobs:
           set PATH=%CD%\tests;%CD%\nim-2.2.0\bin;%PATH%
           nim c -r --cc:vcc --path:src --passC:/I. --passC:/std:clatest -d:softlinkStrictVerify tests\test_softlink.nim
 
-      - name: Run tests (GCC/Clang)
+      # RFC-0001 slice A9: the portable, exit-code-only A4 checks (dynlib +
+      # verifyProcs prototype-conflict fixtures, C and C++ backends) via the
+      # dedicated `testMsvcExitCodes` nimble task -- see that task's doc
+      # comment in softlink.nimble for why the MSVC leg gets this narrower
+      # task instead of the full `test` task (which is gcc-only by
+      # construction: it always builds fixtures with gcc and never passes
+      # `--cc:vcc`). No separate library build needed: these fixtures are
+      # compile-only, no runtime dlsym dispatch.
+      - name: Run RFC-0001 A9 MSVC exit-code checks
+        if: matrix.cc == 'vcc'
+        shell: cmd
+        run: |
+          nimble testMsvcExitCodes -y
+
+      # RFC-0001 slice A9: previously this leg ran `nim c -r`/`nim cpp -r`
+      # directly and never invoked the nimble `test` task, so every tfail_*/
+      # thint_*/tcheck_* grep and exit-code check in softlink.nimble was
+      # CI-unenforced -- only the suite's runtime unittests ran here. `nimble
+      # test` builds the same fixture libraries (testlib/libmagic/libvern)
+      # this step used to build by hand and additionally runs both backends
+      # plus every negative-compile/hint check. Not run for MSVC (matrix.cc
+      # == 'vcc'): the nimble task's windows branch is gcc-only (see above).
+      - name: Run tests (nimble test)
         if: matrix.cc != 'vcc'
         shell: bash
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            export LD_LIBRARY_PATH=./tests
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            export DYLD_LIBRARY_PATH=./tests
-          elif [ "$RUNNER_OS" = "Windows" ]; then
-            export PATH="./tests:$PATH"
-          fi
-          nim c -r --path:src --passC:-I. -d:softlinkStrictVerify tests/test_softlink.nim
+        run: nimble test -y

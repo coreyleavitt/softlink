@@ -8,6 +8,31 @@ srcDir        = "src"
 # Dependencies
 requires "nim >= 2.0.0"
 
+proc expectCompileFailure(cmd: string) =
+  ## RFC-0001 slice A4: assert a compile FAILS by exit code alone. Every
+  ## other tfail_* check in this file greps compiler/softlink output for a
+  ## specific diagnostic string via `exec cmd | grep -q ...` — `exec`
+  ## itself raises (failing the task) on a nonzero exit, so piping through
+  ## a grep that succeeds exactly when the expected wording is present is
+  ## how those checks turn "found the message" into "task step passes".
+  ## That trick is unavailable here on purpose: A4's failure is the C/C++
+  ## compiler's OWN diagnostic for a redeclaration conflict (wording varies
+  ## by compiler/version — gcc/clang say "conflicting types for ...", MSVC
+  ## says C2371), not a fixed softlink string, so nothing portable to grep
+  ## for exists across all four CI legs. `gorgeEx` (unlike `exec`) returns
+  ## the exit code instead of raising on failure, so the polarity can be
+  ## inverted directly: this check PASSES when the compile FAILS.
+  ##
+  ## RFC-0001 slice A9: hoisted to file scope (was local to `task test`) so
+  ## `task testMsvcExitCodes` below can share it verbatim — no logic
+  ## duplication between the two tasks. Behavior is unchanged.
+  let (output, code) = gorgeEx(cmd)
+  if code == 0:
+    echo output
+    quit("softlink: RFC-0001 slice A4 expected a compile FAILURE (header " &
+         "vs. prototype conflict on testlib_add) but the compile " &
+         "SUCCEEDED: " & cmd)
+
 task test, "Run tests":
   # testlib.c is compiled under several names to exercise deriveLibPattern:
   #   libtestlib.*  — explicit-pattern block (verbatim escape hatch)
@@ -77,27 +102,6 @@ task test, "Run tests":
     "nim c --path:src --passC:-I. tests/tfail_verifyprocs_prototype_conflict.nim"
   const vpProtoConflictCppCheck =
     "nim cpp --path:src --passC:-I. tests/tfail_verifyprocs_prototype_conflict.nim"
-
-  proc expectCompileFailure(cmd: string) =
-    ## RFC-0001 slice A4: assert a compile FAILS by exit code alone. Every
-    ## other tfail_* check in this file greps compiler/softlink output for a
-    ## specific diagnostic string via `exec cmd | grep -q ...` — `exec`
-    ## itself raises (failing the task) on a nonzero exit, so piping through
-    ## a grep that succeeds exactly when the expected wording is present is
-    ## how those checks turn "found the message" into "task step passes".
-    ## That trick is unavailable here on purpose: A4's failure is the C/C++
-    ## compiler's OWN diagnostic for a redeclaration conflict (wording varies
-    ## by compiler/version — gcc/clang say "conflicting types for ...", MSVC
-    ## says C2371), not a fixed softlink string, so nothing portable to grep
-    ## for exists across all four CI legs. `gorgeEx` (unlike `exec`) returns
-    ## the exit code instead of raising on failure, so the polarity can be
-    ## inverted directly: this check PASSES when the compile FAILS.
-    let (output, code) = gorgeEx(cmd)
-    if code == 0:
-      echo output
-      quit("softlink: RFC-0001 slice A4 expected a compile FAILURE (header " &
-           "vs. prototype conflict on testlib_add) but the compile " &
-           "SUCCEEDED: " & cmd)
 
   proc expectNoEmptyInclude(dumpCmd: string) =
     ## RFC-0001 slice A6: assert the generated C contains no `#include ""`
@@ -261,6 +265,16 @@ task test, "Run tests":
   when defined(windows):
     exec "gcc -shared -o tests/testlib.dll tests/testlib.c"
     exec "gcc -shared -o tests/libmagic.dll tests/testlib.c"
+    # RFC-0001 slice A9: this branch is now exercised by CI (via `nimble
+    # test`) for the first time — previously ci.yaml called `nim c -r`/
+    # `nim cpp -r` directly and set `PATH="./tests:$PATH"` itself (see the
+    # old "Run tests (GCC/Clang)" step) so the compiled test binary's
+    # bare-name LoadLibrary("testlib.dll") could find it via Windows' PATH-
+    # search step of the documented DLL search order. This task never did
+    # that, so this branch would fail library resolution the moment CI
+    # actually ran it. `putEnv` (unlike a shell-only prefix) persists for
+    # the rest of THIS script process, so it covers both exec calls below.
+    putEnv("PATH", "tests;" & getEnv("PATH"))
     exec "nim c -r --path:src --passC:-I. tests/test_softlink.nim"
     # Regression matrix for #12: cpp backend must also pass.
     exec "nim cpp -r --path:src --passC:-I. tests/test_softlink.nim"
@@ -330,8 +344,17 @@ task test, "Run tests":
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
-    exec "nim c -r --path:src --passC:-I. tests/test_softlink.nim"
-    exec "nim cpp -r --path:src --passC:-I. tests/test_softlink.nim"
+    # RFC-0001 slice A9: this branch is now exercised by CI (via `nimble
+    # test`) for the first time — previously ci.yaml called `nim c -r`/
+    # `nim cpp -r` directly with `DYLD_LIBRARY_PATH=./tests` set itself (see
+    # the old "Run tests (GCC/Clang)" step); this task never set it, so
+    # dlopen("libtestlib.dylib") would fail (macOS's dlopen/dyld default
+    # search does not include the cwd, only DYLD_LIBRARY_PATH/
+    # DYLD_FALLBACK_LIBRARY_PATH and a few system dirs). Mirrors the
+    # `LD_LIBRARY_PATH=./tests` prefix the `else` (Linux) branch below
+    # already uses (POSIX `VAR=val cmd` syntax works the same way here).
+    exec "DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I. tests/test_softlink.nim"
+    exec "DYLD_LIBRARY_PATH=./tests nim cpp -r --path:src --passC:-I. tests/test_softlink.nim"
     exec dupFailCheck & " 2>&1 | grep -q 'collides with an earlier dynlib block'"
     exec gateFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     exec contraFailCheck & " 2>&1 | grep -q 'contradicts'"
@@ -432,3 +455,35 @@ task test, "Run tests":
     expectNoEmptyInclude("cat " & protoOnlyDir & "/*.c")
     exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
+
+task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
+  ## `task test`'s `when defined(windows):` branch always builds the
+  ## fixture libraries with `gcc` and never passes `--cc:vcc`/`/std:clatest`
+  ## -- it targets the windows-mingw CI leg, not MSVC. Making it MSVC-aware
+  ## too (real `cl`-built fixtures, full suite, all grep checks under MSVC's
+  ## diagnostic wording) is more surgery than RFC-0001 Section 9 A9 asks
+  ## for: the RFC's stated minimum for the MSVC leg is the portable,
+  ## exit-code-only A4 checks (softlink-authored-string greps are required
+  ## on Linux/gcc only -- MSVC diagnostics differ enough from gcc/clang's
+  ## that grepping them here would be the "overreach into flaky territory"
+  ## the slice brief warns against). The full MSVC suite run (real `cl`,
+  ## `/std:clatest` C23 gate, `-d:softlinkStrictVerify` no-op-tier trap) is
+  ## unaffected and still runs directly from ci.yaml's own "Run tests
+  ## (MSVC)" step, same as before this slice -- this task adds coverage, it
+  ## doesn't replace that.
+  ##
+  ## These four checks need no built library at all (compile-only, no
+  ## runtime dlsym dispatch), so they can run standalone against the real
+  ## MSVC `cl` via `--cc:vcc`, independent of `task test`'s fixture-build
+  ## assumptions. Mirrors RFC-0001 slice A4's C/C++ backend pair, for both
+  ## the dynlib (tfail_prototype_conflict.nim) and verifyProcs
+  ## (tfail_verifyprocs_prototype_conflict.nim) prototype-conflict fixtures
+  ## already used by `task test`'s own `protoConflictCCheck`/
+  ## `protoConflictCppCheck`/`vpProtoConflictCCheck`/`vpProtoConflictCppCheck`
+  ## (same fixtures, same `expectCompileFailure` helper, `--cc:vcc` swapped
+  ## in for the default gcc and `/I.`/`/std:clatest` swapped in for `-I.`).
+  const vccFlags = " --cc:vcc --path:src --passC:/I. --passC:/std:clatest "
+  expectCompileFailure("nim c" & vccFlags & "tests/tfail_prototype_conflict.nim")
+  expectCompileFailure("nim cpp" & vccFlags & "tests/tfail_prototype_conflict.nim")
+  expectCompileFailure("nim c" & vccFlags & "tests/tfail_verifyprocs_prototype_conflict.nim")
+  expectCompileFailure("nim cpp" & vccFlags & "tests/tfail_verifyprocs_prototype_conflict.nim")
