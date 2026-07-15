@@ -39,3 +39,11 @@ TESTLIB_API char *testlib_mutable_string(void) {
  * requirement" rule end-to-end (runtime dispatch is unaffected; the
  * compile-time assert against the vendored prototype itself is slice A2). */
 TESTLIB_API int testlib_protoonly(void) { return 77; }
+
+/* testlib_proto_gated_true / testlib_proto_gated_false: RFC-0001 slice A5 —
+ * {.prototype.} + {.verifyWhen.} composition. Like testlib_protoonly, both
+ * are in the .so but deliberately NOT declared in testlib.h (prototype-only
+ * bindings) — whether either is actually checked against its vendored
+ * prototype depends entirely on the gate's C-preprocessor truth value. */
+TESTLIB_API int testlib_proto_gated_true(void) { return 88; }
+TESTLIB_API int testlib_proto_gated_false(void) { return 55; }

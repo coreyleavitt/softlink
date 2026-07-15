@@ -118,6 +118,34 @@ dynlib TestLib:
   # through the dlsym'd pointer, never through the extern declaration.
   proc testlib_protoonly(): cint
     {.cdecl, prototype: "int testlib_protoonly(void)".}
+  # RFC-0001 §3 A.1 / slice A5: {.prototype.} + {.verifyWhen.} composition —
+  # TRUE gate. TESTLIB_VERSION is 1, so "TESTLIB_VERSION >= 1" holds: BOTH
+  # the vendored `extern` declaration and its _Static_assert are emitted
+  # (see `emitPrototypeDecl`), so a wrong prototype here would fail the C
+  # compile exactly like slice A3's un-gated case — the gate composes
+  # without weakening verification when the condition holds. Absent from
+  # testlib.h (prototype-only), present in the .so.
+  proc testlib_proto_gated_true(): cint
+    {.cdecl, prototype: "int testlib_proto_gated_true(void)",
+      verifyWhen: "TESTLIB_VERSION >= 1".}
+  # RFC-0001 slice A5: {.prototype.} + {.verifyWhen.} composition — FALSE
+  # gate. TESTLIB_VERSION is 1, so "TESTLIB_VERSION >= 99" is false: the
+  # entire `#if`-wrapped blob — vendored declaration AND its assert — is
+  # skipped by the C preprocessor. The prototype string below is
+  # DELIBERATELY WRONG (different return type and arity than the real C
+  # function, which takes no arguments and returns int): this compiling is
+  # the "nothing checks the prototype at all" half of the RFC's false-gate
+  # semantics. It does NOT by itself prove the *declaration* is gated —
+  # runtime dispatch calls through a dlsym'd function pointer, never the
+  # symbol name directly, and there's no {.header.} here to conflict with,
+  # so an ungated-but-unused wrong-arity `extern` would compile fine too
+  # (verified empirically; see the nimble test task's `protoGateFalseCheck`
+  # comment). The C-inspection grep there is what actually proves the
+  # declaration is suppressed; this test is the runtime half, confirming
+  # dispatch is unaffected by the gate either way.
+  proc testlib_proto_gated_false(): cint
+    {.cdecl, prototype: "void testlib_proto_gated_false(double a, double b, double c)",
+      verifyWhen: "TESTLIB_VERSION >= 99".}
 
 # verifyProcs: compile-time signature verification ONLY (no loading, no
 # wrappers). Correct signatures must compile; the const-return case (#11)
@@ -148,6 +176,16 @@ verifyProcs:
     {.cdecl, verifyWhen: "TESTLIB_VERSION >= 1", header: "tests/testlib.h".}
   proc testlib_gated_v2(): cint
     {.cdecl, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
+  # RFC-0001 slice A5, deliverable 3: {.prototype.} + {.verifyWhen.}
+  # composition parity — verifyProcs must accept the same combination
+  # dynlib does and compose the same way (gated declaration + gated
+  # assert). True-gate only; false-gate and a full parity sweep across
+  # every pragma combination is slice A8. Reuses the dynlib block's C
+  # symbol name — safe, since verifyProcs declares no Nim-level identifier
+  # for it (same precedent as testlib_add/testlib_gated above).
+  proc testlib_proto_gated_true(): cint
+    {.cdecl, prototype: "int testlib_proto_gated_true(void)",
+      verifyWhen: "TESTLIB_VERSION >= 1".}
 
 suite "verifyProcs (static-binding header verification)":
   test "correct signatures pass compile-time verification":
@@ -450,6 +488,26 @@ suite "softlink":
   test "prototype: header-optional path verifies at compile time and dispatches at runtime (A2)":
     check loadTestlib().kind in {lrOk, lrOkPartial}
     check testlib_protoonly() == 77.cint
+
+  # RFC-0001 slice A5: {.prototype.} + {.verifyWhen.} composition, true gate.
+  # The compile-time half (declaration + assert both emitted and checked) is
+  # covered by the nimble test task's C-inspection grep; this is the runtime
+  # half — the symbol still binds and dispatches through the dlsym'd pointer
+  # exactly like any other required symbol.
+  test "prototype + verifyWhen: true gate verifies and dispatches (A5)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_proto_gated_true() == 88.cint
+
+  # RFC-0001 slice A5: {.prototype.} + {.verifyWhen.} composition, false
+  # gate. The bound prototype string is deliberately wrong (see the dynlib
+  # block above); the declaration being genuinely suppressed under the
+  # false gate is proven by the nimble test task's C-inspection grep
+  # (`protoGateFalseCheck`), not by this test — dispatch goes through a
+  # dlsym'd function pointer regardless of the gate, so this is only the
+  # runtime half, confirming dispatch is unaffected by the gate either way.
+  test "prototype + verifyWhen: false gate skips verification, still dispatches (A5)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_proto_gated_false() == 55.cint
 
   # Regression: #11 — const-qualified pointer returns must bind to
   # cstring without a "signature mismatch vs testlib.h" error under

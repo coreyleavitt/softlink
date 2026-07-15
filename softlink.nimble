@@ -97,6 +97,50 @@ task test, "Run tests":
   const protoEmitDir = "tests/nimcache_protocheck"
   const protoEmitCheck = "nim c --compileOnly --nimcache:" & protoEmitDir &
     " --path:src --passC:-I. tests/test_softlink.nim"
+  # RFC-0001 slice A5: {.prototype.} + {.verifyWhen.} composition — the gate
+  # must wrap the emitted DECLARATION itself, not merely its assert (A.1:
+  # "both the emitted declaration and its assert are gated by the #if").
+  # testlib_proto_gated_true's `#if (TESTLIB_VERSION >= 1)` gate holds
+  # (TESTLIB_VERSION is 1); `emitPrototypeDecl` always emits the
+  # `#if defined(__cplusplus)` / `extern "C" {` / `#endif` wrapper and then
+  # the `extern` declaration itself within the 5 lines right after the gate
+  # line, so finding the declaration text inside that window (via `grep -A5`)
+  # proves the gate actually wraps the declaration, not some unrelated part
+  # of the file. `-F` (fixed-string) sidesteps the `(`/`*`/`/` characters in
+  # both patterns being read as regex metacharacters.
+  const protoGateTrueAnchor =
+    "#if (TESTLIB_VERSION >= 1) /* softlink verifyWhen: prototype decl */"
+  const protoGateTrueDecl = "extern int testlib_proto_gated_true(void);"
+  const protoGateTrueCheck = "grep -rFA5 '" & protoGateTrueAnchor & "' " &
+    protoEmitDir & " | grep -Fq '" & protoGateTrueDecl & "'"
+  # The false-gate mirror — REQUIRED, not merely supplementary (see below for
+  # why). testlib_proto_gated_false's `#if (TESTLIB_VERSION >= 99)` gate does
+  # NOT hold (TESTLIB_VERSION is 1), and its vendored prototype is
+  # deliberately WRONG — different return type and arity than the real C
+  # function. Finding both the gate line and the deliberately-wrong extern
+  # text in the generated C proves the declaration was emitted-but-suppressed
+  # (never seen by the C compiler).
+  #
+  # Empirically verified this grep is load-bearing, not decorative: injecting
+  # a declaration-gating regression (emitPrototypeDecl always emitting the
+  # `extern`, ignoring `verifyWhen`) left `nim c --compileOnly` AND the full
+  # `nim c -r`/`nim cpp -r` suite green — every runtime test, including this
+  # slice's dispatch checks, still passed. Runtime dispatch never calls a
+  # C symbol by name (it goes through a dlsym'd function pointer), and this
+  # fixture has no `{.header.}` to conflict with, so a leaked, unused,
+  # wrong-arity `extern` declaration is inert C — nothing calls it, nothing
+  # else declares the same symbol, so gcc never objects. Only this grep
+  # caught the injected regression. This is why a false-gate proc's runtime
+  # behavior (the RFC's "(suite)" scope for this item) cannot by itself prove
+  # the DECLARATION is gated — only the assert's independent, already-correct
+  # gating (unaffected by the injected bug) — so this C-inspection is added
+  # beyond the slice's literal text to actually close that coverage gap.
+  const protoGateFalseAnchor =
+    "#if (TESTLIB_VERSION >= 99) /* softlink verifyWhen: prototype decl */"
+  const protoGateFalseDecl =
+    "extern void testlib_proto_gated_false(double a, double b, double c);"
+  const protoGateFalseCheck = "grep -rFA5 '" & protoGateFalseAnchor & "' " &
+    protoEmitDir & " | grep -Fq '" & protoGateFalseDecl & "'"
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   when defined(windows):
     exec "gcc -shared -o tests/testlib.dll tests/testlib.c"
@@ -116,6 +160,19 @@ task test, "Run tests":
     exec protoEmitCheck
     exec "findstr /s /m /c:\"extern int testlib_protoonly(void);\" " &
       protoEmitDir & "\\*.c >NUL"
+    # RFC-0001 slice A5 (Windows proxy): findstr has no "-A" context-lines
+    # equivalent to grep's, so this checks the gate line and the declaration
+    # text are each present in the generated C SEPARATELY — weaker than the
+    # adjacency proof the Unix branches below run, but still catches the
+    # gate or the declaration going missing entirely.
+    exec "findstr /s /m /c:\"" & protoGateTrueAnchor & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    exec "findstr /s /m /c:\"" & protoGateTrueDecl & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    exec "findstr /s /m /c:\"" & protoGateFalseAnchor & "\" " &
+      protoEmitDir & "\\*.c >NUL"
+    exec "findstr /s /m /c:\"" & protoGateFalseDecl & "\" " &
+      protoEmitDir & "\\*.c >NUL"
     rmDir(protoEmitDir)
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
@@ -133,6 +190,8 @@ task test, "Run tests":
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
     exec protoEmitCheck
     exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    exec protoGateTrueCheck
+    exec protoGateFalseCheck
     rmDir(protoEmitDir)
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
@@ -162,4 +221,6 @@ task test, "Run tests":
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
     exec protoEmitCheck
     exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    exec protoGateTrueCheck
+    exec protoGateFalseCheck
     rmDir(protoEmitDir)
