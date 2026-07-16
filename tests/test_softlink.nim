@@ -930,6 +930,20 @@ suite "softlink — error paths":
   test "lrLibNotFound for missing library":
     check loadDefinitelyNotReal().kind == lrLibNotFound
 
+  # RFC-0001 §9/§C.5 — degradation matrix, cell 3 ("neither" — no
+  # versionProbe, no compatManifest at all, the plain pre-Stage-C shape):
+  # `definitelyNotRealC2Compat` (directly below) already pins this for a
+  # block that DOES declare a probe but never reaches it (Phase 1 fails
+  # first). The genuinely probe-less/manifest-less `libdefinitely_not_real.so`
+  # block above must degrade identically after a failed load — zero
+  # report, unconditionally, exactly like every other return path.
+  test "CompatReport: zero report (atNoProbe) after a failed load, no probe declared at all":
+    check loadDefinitelyNotReal().kind == lrLibNotFound
+    let c = definitelyNotRealCompat()
+    check c.attestation == atNoProbe
+    check c.runtimeVersion == ""
+    check c.missing.len == 0
+
   # RFC-0001 §9/§C.2, slice C2 — TDD suite item 5: fooCompat() after a
   # FAILED load, even with a versionProbe declared on the block, must
   # report the zero state — the probe never got a chance to run.
@@ -980,6 +994,50 @@ when defined(linux):
 # nimble test task); "magic" must resolve to it.
 dynlib "magic":
   proc testlib_magic(): cint {.cdecl, header: "tests/testlib.h".}
+
+# RFC-0001 §9/§C.5 — degradation matrix, cell 4: `unloadX` on a block that
+# was NEVER loaded, has no versionProbe, and has no compatManifest — must
+# be a total no-op yielding the zero-state report. This is the ONLY place
+# in this file "magic" is touched before the suite directly below loads it
+# for the first time (nothing above this point calls loadMagic/unloadMagic),
+# so this test genuinely observes the pristine, never-loaded state — not
+# merely "unloaded after a prior load" (which the very next suite's own
+# reset-after-load coverage already pins).
+#
+# Judgment call, recorded here rather than silently claimed: the C4c
+# handoff flagged "unload on a never-loaded block" as worth a dedicated
+# test, framing it as pinning the report/probe/drift-story resets' move
+# OUT of the `if not handle.isNil` guard (commit 773162d). Empirically
+# reverting that exact restructuring (moving the reset back inside the
+# guard) does NOT fail this test — a probe-less, drift-less block's
+# report is ALREADY the zero state before unload ever runs, so the
+# restructuring is observably a no-op here by construction; ONLY a block
+# that reached a non-zero report with a nil handle (C4c's own required-
+# drift-refusal unwind) can distinguish the two placements, and
+# `tests/tcompat_drift_required.nim`'s own "unload after a refused load
+# resets the report" test already pins exactly that (verified directly:
+# reverting the restructuring fails THAT test, not this one). What THIS
+# test is actually, empirically sensitive to (verified the same way) is
+# the more fundamental `if not handle.isNil` guard around the
+# handle/pointer/cached-result reset — removing it entirely turns any
+# never-loaded `unloadX()` call into a SIGSEGV (`unloadLib` on a nil
+# handle). It also pins the "byte-identical" claim (§C.3/RFC §9 C5) that
+# a plain, directive-less block's `unloadX` never required a prior load
+# to begin with.
+suite "CompatReport degradation (RFC-0001 C5) — unloadX on a never-loaded block (cell 4)":
+  test "unloadMagic before any load is a no-op; report is already the zero state":
+    check not magicLoaded()
+    unloadMagic()
+    check not magicLoaded()
+    let c = magicCompat()
+    check c.attestation == atNoProbe
+    check c.runtimeVersion == ""
+    check c.missing.len == 0
+    # A subsequent, real load still works — the no-op unload didn't
+    # corrupt anything.
+    check loadMagic().kind == lrOk
+    check testlib_magic() == 42
+    unloadMagic()
 
 suite "dynlib magic — bare logical name resolves and loads":
   test "dynlib \"magic\" resolves to libmagic.so and calls its symbol":

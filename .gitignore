@@ -13,6 +13,9 @@ tests/tcompat_report_manifest
 # `runDriftRequiredChecks` in the nimble test task).
 tests/tcompat_drift_required
 tests/tcompat_drift_refuse_false
+# RFC-0001 §9/§C.2, slice C5: tests/tcompat_degradation.nim's own runtime
+# binary (built by `runDegradationChecks` in the nimble test task).
+tests/tcompat_degradation
 # RFC-0001 slice B5: tests/tharvest.nim's drift-alarm exit-code integration
 # test compiles+runs the harvester CLI shim itself (`nim c -r
 # tools/harvest/harvester.nim ...`), which builds this binary in place.

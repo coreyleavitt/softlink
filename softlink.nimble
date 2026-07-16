@@ -1078,6 +1078,26 @@ task test, "Run tests":
     rmFile(mdir & reqBase & ".compat.json")
     rmFile(mdir & refuseFalseBase & ".compat.json")
 
+  proc runDegradationChecks(runCmd: string) =
+    ## RFC-0001 §9/§C.2, slice C5 — degradation matrix, cell 2: "no probe +
+    ## manifest attached" needs a REAL load (a manifest with real fact
+    ## intervals, attached to a block with NO versionProbe), exactly like
+    ## `runCompatReportManifestChecks`/`runDriftRequiredChecks` above, for
+    ## the same reason (the `--compileOnly` fixtures `runManifestChecks`
+    ## drives can't exercise a real load). `tests/tcompat_degradation.nim`
+    ## binds the identical `libtestlib.so`/`.dylib`/`.dll` (its own module —
+    ## per-module duplicate-block-guard scoping, same reasoning as
+    ## `tests/tcompat_report_manifest.nim`'s own doc comment). The
+    ## remaining degradation cells (probe-less/manifest-less "neither", and
+    ## unload-on-never-loaded) need no manifest at all and live directly in
+    ## `tests/test_softlink.nim`, run by the plain `nim c -r`/`nim cpp -r`
+    ## calls above already.
+    const mdir = "tests/manifests/"
+    const base = "testlib_degradation"
+    writeManifestFromTemplate(mdir & base & ".tmpl.json", mdir & base & ".compat.json")
+    exec runCmd & " tests/tcompat_degradation.nim"
+    rmFile(mdir & base & ".compat.json")
+
   # RFC-0001 §4 B.2, classification-table discriminators: the heart of the
   # RFC's harvester classification table, proven directly against the
   # shipped mechanism (no harvester exists yet — that's slice B3):
@@ -1223,6 +1243,7 @@ task test, "Run tests":
     runVersionProbeChecks()
     runCompatReportManifestChecks("nim c -r --path:src --passC:-I.")
     runDriftRequiredChecks("nim c -r --path:src --passC:-I.")
+    runDegradationChecks("nim c -r --path:src --passC:-I.")
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -1291,6 +1312,7 @@ task test, "Run tests":
     runVersionProbeChecks()
     runCompatReportManifestChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runDriftRequiredChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
+    runDegradationChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -1365,6 +1387,7 @@ task test, "Run tests":
     runVersionProbeChecks()
     runCompatReportManifestChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runDriftRequiredChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
+    runDegradationChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runHarvesterCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
