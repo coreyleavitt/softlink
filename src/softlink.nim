@@ -15,9 +15,17 @@ when defined(js):
 import std/[macros, sets, strutils, os, json]
 import std/dynlib as stdDynlib
 import ./softlink/manifest
+import ./softlink/versions
 # Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
        stdDynlib.unloadLib
+# RFC-0001 §B.5/§9, slice B6b: the pinned B0 types (`softlink/versions`) that
+# `softlinkCompatFacts<Base>: seq[SymbolFacts]` is typed with. Exported for
+# the SAME reason as the `stdDynlib` re-exports above — the const is
+# macro-generated code living in the CONSUMING module, which resolves
+# `SymbolFacts`/`VersionInterval`/`FactKind` unqualified via `import softlink`
+# alone, with no separate `import softlink/versions` of its own required.
+export versions.SymbolFacts, versions.VersionInterval, versions.FactKind
 
 type
   SoftlinkError* = ref object of CatchableError
@@ -718,24 +726,41 @@ proc compatManifestDupError(macroName: string, first, second: CompatManifestDire
   "them into a single compatManifest directive; a dynlib/verifyProcs " &
   "block may attach at most one compat manifest."
 
+type
+  AppliedManifest = object
+    ## RFC-0001 §B.5/§9, slice B6b: `applyCompatManifest`'s return value.
+    ## `attached` is the one bit `genVerifyBlock` has needed since B6a
+    ## ("a manifest was attached AND not ABI-ignored"); `manifest` is the
+    ## fully parsed `CompatManifest` itself — meaningful only when
+    ## `attached` is true — which the `dynlib` macro's NEW const-embedding
+    ## codegen (`softlinkCompatFacts<Base>`, RFC §B.5) needs downstream.
+    ## This is the exact seam the B6a handoff doc flagged: B6a returned a
+    ## bare `bool` because nothing yet needed the parsed manifest back;
+    ## B6b is that consumer.
+    attached*: bool
+    manifest*: CompatManifest
+
 proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
                           procs: seq[SoftlinkProc],
-                          directive: CompatManifestDirective): bool =
-  ## RFC-0001 §B.5/§B.5a, slice B6a: the compile-time manifest-consumption
-  ## orchestration. Every actual DECISION is a pure `softlink/manifest`
-  ## predicate (independently unit-tested there); this proc's only job is
-  ## sequencing them in the RFC's own order and turning each into an
-  ## `error`/`warning`/`hint` anchored at the directive or the offending
-  ## proc. No runtime behavior changes here — everything below runs at
-  ## macro-expansion time only, and without a `compatManifest` directive
-  ## this proc returns immediately (additive: existing blocks are
-  ## byte-for-byte unaffected).
+                          directive: CompatManifestDirective): AppliedManifest =
+  ## RFC-0001 §B.5/§B.5a, slice B6a (return shape extended in B6b): the
+  ## compile-time manifest-consumption orchestration. Every actual
+  ## DECISION is a pure `softlink/manifest` predicate (independently
+  ## unit-tested there); this proc's only job is sequencing them in the
+  ## RFC's own order and turning each into an `error`/`warning`/`hint`
+  ## anchored at the directive or the offending proc. No runtime behavior
+  ## changes here — everything below runs at macro-expansion time only,
+  ## and without a `compatManifest` directive this proc returns
+  ## immediately (additive: existing blocks are byte-for-byte unaffected).
   ##
-  ## Returns `true` iff a manifest was attached AND not ABI-ignored — the
-  ## one bit `genVerifyBlock` needs downstream, to decide whether its
-  ## graceful `#else` fallback gets the degraded-tier `#pragma message`
-  ## (check 9 below).
-  if not directive.present: return false
+  ## Returns `AppliedManifest(attached: true, manifest: m)` iff a manifest
+  ## was attached AND not ABI-ignored; every early-return path below
+  ## (missing directive, unreadable file, malformed JSON, unsupported
+  ## schema, wrong lib, ABI mismatch) yields the zero value —
+  ## `attached: false` via a bare `return`, `manifest` left as the
+  ## zero-value `CompatManifest` (never read by a caller that checks
+  ## `attached` first, per the field doc above).
+  if not directive.present: return
 
   let macroName = if mode == ppmDynlib: "dynlib" else: "verifyProcs"
 
@@ -755,7 +780,7 @@ proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
   if not fileExists(absPath):
     error("softlink: " & macroName & ": compatManifest: manifest file not " &
           "found: " & absPath, directive.node)
-    return false
+    return
 
   # `staticRead` (not a plain compile-time `readFile`) registers the
   # manifest as a compile dependency, so editing it retriggers
@@ -766,7 +791,7 @@ proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
     m = parseManifest(jsonText, absPath)
   except ManifestError as e:
     error(e.msg, directive.node)
-    return false
+    return
 
   # Check 2: schema policy — an unsupported (newer) schema is a compile
   # error naming the required schema, never a silent partial read.
@@ -775,7 +800,7 @@ proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
           " has schema " & $m.schema & ", but this softlink version only " &
           "supports schema " & $supportedSchema & " — upgrade softlink to " &
           "consume it", directive.node)
-    return false
+    return
 
   # Check 3: lib identity (dynlib only — verifyProcs has no library
   # identity to check against, RFC-0001 §B.5a).
@@ -786,7 +811,7 @@ proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
             libNameForIdentity & "' — wrong-file paste protection " &
             "(RFC-0001 §B.3): point compatManifest at the right file, or " &
             "regenerate it for this library", directive.node)
-      return false
+      return
 
   # Check 4: ABI. A mismatch degrades to no-manifest behavior entirely —
   # every check below (5 through 9) is skipped, per the RFC ("a manifest
@@ -800,7 +825,7 @@ proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
             "manifest entirely for this compile (a manifest asserting " &
             "confidence across a different OS/data-model would be worse " &
             "than none)", directive.node)
-    return false
+    return
 
   # Check 5: disjoint/exhaustive validation — every violation found, not
   # just the first (a hand-merge mistake should surface completely).
@@ -849,8 +874,11 @@ proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
 
   # Check 9 (the degraded-tier warning) is emitted by `genVerifyBlock`
   # itself, into the graceful `#else` fallback branch — this proc's
-  # `true` return is the signal that tells it to.
-  true
+  # `attached: true` return is the signal that tells it to. `manifest: m`
+  # is the B6b addition: the fully parsed manifest, handed back so the
+  # `dynlib` macro can embed its `symbols` verbatim into
+  # `softlinkCompatFacts<Base>`.
+  AppliedManifest(attached: true, manifest: m)
 
 const softlinkProbeOnly {.strdefine.} = ""
   ## RFC-0001 §4 B.2: with `-d:softlinkProbeOnly=<CName>`, `genVerifyBlock`
@@ -1610,12 +1638,39 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
   # RFC-0001 §B.5, slice B6a: compile-time compat-manifest consumption —
   # no-op unless a `compatManifest` directive was found above. Must run
-  # before `genVerifyBlock` so its return value (whether a manifest is
+  # before `genVerifyBlock` so its `attached` bit (whether a manifest is
   # attached, ABI-ignored or not) can gate the degraded-tier warning.
-  let hasManifestAttached = applyCompatManifest(ppmDynlib, baseNameLower, procs, manifestDirective)
+  let appliedManifest = applyCompatManifest(ppmDynlib, baseNameLower, procs, manifestDirective)
 
-  for verifyNode in genVerifyBlock(procs, baseName, hasManifestAttached):
+  for verifyNode in genVerifyBlock(procs, baseName, appliedManifest.attached):
     result.add(verifyNode)
+
+  # RFC-0001 §B.5/§9, slice B6b: embed the manifest's per-symbol interval
+  # table as a module-level const, `softlinkCompatFacts<Base>:
+  # seq[SymbolFacts]`, for Stage C's future load-time use — the pinned B0
+  # types from `softlink/versions` are the contract between this producer
+  # (v0.9.0) and Stage C's consumer (v0.10.0), pinned so the two cannot
+  # drift apart independently. Only when a manifest is attached AND
+  # survived the ABI check (`appliedManifest.attached`, the same bit
+  # `genVerifyBlock` used just above): no manifest, or one degraded to
+  # no-manifest behavior by an ABI mismatch, means NO const at all — an
+  # empty-seq const would blur "no manifest" with "manifest with zero
+  # symbols" (design guidance; also proven by
+  # `tests/tcheck_manifest_facts_const_absent.nim` and
+  # `tests/tcheck_manifest_facts_const_abi_ignored.nim`). `newLit` handles
+  # the nested `array[FactKind, seq[VersionInterval]]` field shape fine —
+  # verified directly before wiring this in. Unexported, like
+  # `softlinkHandle<Base>` above: the sole consumer is generated code in
+  # this same module (Stage C's runtime probe, not yet wired — this slice
+  # only emits and statically-inspects the const, nothing reads it at
+  # runtime yet).
+  if appliedManifest.attached:
+    let factsConstName = ident("softlinkCompatFacts" & baseName)
+    let factsTypeNode = newNimNode(nnkBracketExpr).add(ident("seq"), ident("SymbolFacts"))
+    let factsInit = newLit(appliedManifest.manifest.symbols)
+    result.add(newNimNode(nnkConstSection).add(
+      newNimNode(nnkConstDef).add(factsConstName, factsTypeNode, factsInit)
+    ))
 
   # loadXxx*(): LoadResult
   block:
@@ -1926,10 +1981,14 @@ macro verifyProcs*(body: untyped): untyped =
   let tag = if procs.len > 0: procs[0].nameStr else: "anon"
   # RFC-0001 SS4 B.5a, slice B6a: the compile-time subset (no lib-identity
   # check -- verifyProcs has no library identity to check against).
-  let hasManifestAttached = applyCompatManifest(ppmVerifyProcs, "", procs, manifestDirective)
+  let appliedManifest = applyCompatManifest(ppmVerifyProcs, "", procs, manifestDirective)
   result = newStmtList()
-  for n in genVerifyBlock(procs, tag, hasManifestAttached):
+  for n in genVerifyBlock(procs, tag, appliedManifest.attached):
     result.add(n)
+  # RFC-0001 §B.5a, slice B6b: NO const embedding for verifyProcs — "no
+  # library identity, no loadX, no pointers, no wrappers... no const
+  # embedding" is a documented CEILING, not an oversight. `dynlib`'s
+  # `softlinkCompatFacts<Base>` block above simply has no counterpart here.
 
   # RFC-0001 §4 B.1, spec gap resolved: `verifyProcs` blocks have no lib
   # pattern and no derived ident base — `dynlib`'s "one file per derived

@@ -850,6 +850,19 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_manifest_verifyprocs_since_contradiction.nim",
       ["corrected lower bound is 2.0.0"])
 
+    # RFC-0001 §B.5/§9, slice B6b: the interval-const embedding,
+    # `softlinkCompatFacts<Base>: seq[SymbolFacts]` — a `static:` assert
+    # failure inside each fixture would itself fail the compile, so
+    # `expectManifestCompileOk`/`expectManifestCompileFail` succeeding IS
+    # the const-shape/const-absence assertion; no extra output-string
+    # check is needed beyond what each fixture already asserts internally.
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_facts_const.nim", [], [])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_facts_const_absent.nim", [], [])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_facts_const_abi_ignored.nim",
+      ["ignoring the compat manifest entirely"], [])
+
     # Check 9 (degraded-tier warning): direct C-inspection, mirroring
     # `runProbeOnlyChecks`'s own `expectAnchor` convention above — the
     # macro cannot know at expansion time which C tier fires, so the

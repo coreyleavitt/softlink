@@ -10,7 +10,7 @@
 ##
 ## `tests/manifests/testlib.compat.json`'s `harvest.abi` is rewritten
 ## in-place by the nimble task (per-OS-leg-correct) immediately before
-## this file is compiled — see `writeManifestAbi` in softlink.nimble.
+## this file is compiled — see `writeManifestFromTemplate` in softlink.nimble.
 ##
 ## NOT compiled by the regular test suite; see the `nimble test` task.
 import softlink
