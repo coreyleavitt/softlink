@@ -45,6 +45,95 @@ suite "classify — pure decision table (RFC-0001 SS4 B.2)":
                                   verifyOk: false, assertMsgSeen: false)) == fkUnknown
 
 # ---------------------------------------------------------------------------
+# bisectPlan — pure bisection helper (RFC-0001 SS4 B.2, optional fast-path
+# slice B7). No I/O: driven entirely by synthetic "does this group pass?"
+# callbacks, so every shape of bisection (all-pass, one-fail, all-fail,
+# two-fail-in-different-halves, odd-sized groups, singleton input) is
+# unit-tested here without a single real compile — `harvest`'s fast path
+# supplies the real, compile-backed callback (`groupVerifies` in
+# `tools/harvest/harvester.nim`), never re-implements this recursion.
+# ---------------------------------------------------------------------------
+suite "bisectPlan — pure bisection (RFC-0001 SS4 B.2, slice B7)":
+  test "empty input -> empty plan, callback never invoked":
+    var calls: seq[seq[string]] = @[]
+    let plan = bisectPlan(@[], proc(g: seq[string]): bool =
+      calls.add g
+      true)
+    check plan.verified.len == 0
+    check plan.needsStandard.len == 0
+    check calls.len == 0
+
+  test "singleton input, passing -> verified, one call":
+    var calls: seq[seq[string]] = @[]
+    let plan = bisectPlan(@["a"], proc(g: seq[string]): bool =
+      calls.add g
+      true)
+    check plan.verified == @["a"]
+    check plan.needsStandard.len == 0
+    check calls == @[@["a"]]
+
+  test "singleton input, failing -> needsStandard, one call":
+    var calls: seq[seq[string]] = @[]
+    let plan = bisectPlan(@["a"], proc(g: seq[string]): bool =
+      calls.add g
+      false)
+    check plan.verified.len == 0
+    check plan.needsStandard == @["a"]
+    check calls == @[@["a"]]
+
+  test "all-pass group -> every symbol verified, exactly ONE call (the whole group)":
+    var calls = 0
+    let plan = bisectPlan(@["a", "b", "c", "d"], proc(g: seq[string]): bool =
+      inc calls
+      true)
+    check plan.verified == @["a", "b", "c", "d"]
+    check plan.needsStandard.len == 0
+    check calls == 1
+
+  test "all-fail group -> every symbol recurses down to needsStandard, none dropped":
+    let plan = bisectPlan(@["a", "b", "c"], proc(g: seq[string]): bool = false)
+    check plan.verified.len == 0
+    check plan.needsStandard.len == 3
+    for s in ["a", "b", "c"]:
+      check s in plan.needsStandard
+
+  test "one symbol fails among several -> only it lands in needsStandard":
+    let bad = "c"
+    let plan = bisectPlan(@["a", "b", "c", "d"], proc(g: seq[string]): bool =
+      bad notin g)
+    check plan.needsStandard == @["c"]
+    check "a" in plan.verified
+    check "b" in plan.verified
+    check "d" in plan.verified
+    check plan.verified.len == 3
+
+  test "two failures in DIFFERENT halves -> both isolated, rest verified":
+    let bads = ["b", "g"]  # symbol at index 1 (left half) and index 6 (right half) of 8
+    let syms = @["a", "b", "c", "d", "e", "f", "g", "h"]
+    let plan = bisectPlan(syms, proc(g: seq[string]): bool =
+      for b in bads:
+        if b in g: return false
+      true)
+    check plan.needsStandard.len == 2
+    check "b" in plan.needsStandard
+    check "g" in plan.needsStandard
+    check plan.verified.len == 6
+    for s in syms:
+      if s notin bads:
+        check s in plan.verified
+
+  test "odd-sized group (5 symbols), one failure -> correct split, none dropped or duplicated":
+    let syms = @["a", "b", "c", "d", "e"]
+    let plan = bisectPlan(syms, proc(g: seq[string]): bool = "e" notin g)
+    check plan.needsStandard == @["e"]
+    check plan.verified.len == 4
+    for s in ["a", "b", "c", "d"]:
+      check s in plan.verified
+    # Exhaustiveness/no-duplication: verified + needsStandard is exactly
+    # the input set, each symbol exactly once.
+    check (plan.verified & plan.needsStandard).len == syms.len
+
+# ---------------------------------------------------------------------------
 # Integration: real `nim c --noLinking` compiles against the B3a fixture
 # corpus, driven by an actual B.1 dump of tests/tharvest_binding.nim — the
 # dump-driven flow is exactly the real one (RFC-0001 SS4 B.2 design
@@ -72,6 +161,72 @@ doAssert fileExists(dumpFile),
 # c --noLinking` subprocess work, ~1 minute wall time — see
 # `runHarvesterCheck`'s doc comment in softlink.nimble).
 let r = harvest(dumpFile, "tests" / "corpus")
+
+# RFC-0001 SS4 B.2, optional fast-path (slice B7): a SECOND real harvest of
+# the IDENTICAL dump/corpus, with `opts.fastPath = true` — yes, this roughly
+# doubles this file's already ~1-minute wall time; acceptable, since it's
+# the only way to prove the fast path's `facts` are byte-for-byte identical
+# to the standard path's on a real toolchain, not merely by inspection.
+var fastOpts = defaultHarvestOptions()
+fastOpts.fastPath = true
+let rFast = harvest(dumpFile, "tests" / "corpus", fastOpts)
+
+suite "harvest fastPath — identical facts to the standard path (RFC-0001 SS4 B.2, slice B7)":
+  test "facts are deep-equal between the standard and fast-path harvests":
+    check rFast.facts == r.facts
+
+  test "baselineOk is deep-equal between the standard and fast-path harvests":
+    check rFast.baselineOk == r.baselineOk
+
+  test "skipped (corpus-invariant procs) is deep-equal between the two harvests":
+    check rFast.skipped == r.skipped
+
+  test "compile-count arithmetic on this fixture corpus (honest, derived, not assumed)":
+    ## This fixture corpus has only 3 probed symbols across 3 versions — far
+    ## below the scale where O(k·log n) bisection wins over "up to 3
+    ## compiles per symbol per version" (the standard path's own cost
+    ## shape). Worked by hand BEFORE this assertion was written (see the
+    ## slice's own handoff notes) and then confirmed against a real run:
+    ##
+    ## STANDARD path, per version (baseline + up to 2 compiles/symbol):
+    ##   1.0.0: baseline(1) + stable verified(2) + changed verified(2) +
+    ##          added ABSENT(1, existence only) = 6
+    ##   2.0.0: baseline(1) + stable verified(2) + changed MISMATCH(2) +
+    ##          added verified(2) = 7
+    ##   3.0.0: baseline FAILS(1); every symbol unknown, 0 extra = 1
+    ##   TOTAL = 6 + 7 + 1 = 14
+    ##
+    ## FAST path, per version (define-free compile first; corpuslib_added
+    ## is the one 1.0.0 drift, corpuslib_changed the one 2.0.0 drift):
+    ##   1.0.0: define-free FAILS(1) [added is absent] -> baseline ok(1) ->
+    ##          bisect{stable,changed,added}: root FAILS(1), left{stable}
+    ##          PASSES(1), right{changed,added} FAILS(1), left{changed}
+    ##          PASSES(1), right{added} FAILS(1) = 5 group compiles ->
+    ##          singleton "added" -> standard existence-only(1, absent) =
+    ##          1 + 1 + 5 + 1 = 8
+    ##   2.0.0: define-free FAILS(1) [changed mismatches] -> baseline ok(1)
+    ##          -> bisect: root FAILS(1), left{stable} PASSES(1),
+    ##          right{changed,added} FAILS(1), left{changed} FAILS(1)
+    ##          [singleton], right{added} PASSES(1) = 5 group compiles ->
+    ##          singleton "changed" -> standard existence+verify(2,
+    ##          mismatch) = 1 + 1 + 5 + 2 = 9
+    ##   3.0.0: define-free FAILS(1) [broken #include] -> baseline ALSO
+    ##          FAILS(1); every symbol unknown, no bisection = 1 + 1 = 2
+    ##   TOTAL = 8 + 9 + 2 = 19
+    ##
+    ## So on THIS fixture the fast path costs MORE real compiles (19 > 14)
+    ## — expected and fine: a 3-symbol corpus is dominated by the fast
+    ## path's own overhead (a define-free compile plus a baseline probe
+    ## PLUS the bisection tree, paid IN ADDITION TO the standard pipeline
+    ## for every symbol that doesn't settle at the whole-module level,
+    ## which on this corpus is every symbol at every non-broken version).
+    ## The O(k·log n) win the RFC describes shows up at real-corpus scale
+    ## (hundreds of symbols, few drifted) — not on a 3-symbol fixture where
+    ## k/n is large and log n is tiny. This assertion pins the CONCRETE,
+    ## derived-then-confirmed counts rather than a directional "fewer"
+    ## claim that would be false for this corpus.
+    check r.compileCount == 14
+    check rFast.compileCount == 19
 
 suite "runCalibration — preflight (RFC-0001 SS4 B.2)":
   test "the dev toolchain's own known-answer trio classifies correctly":

@@ -21,7 +21,7 @@
 ## the macro already understands (`softlinkProbeOnly`/`softlinkProbeExistence`,
 ## slice B2) — this module never re-derives or re-parses a binding, it only
 ## drives the compiler against the one that already exists.
-import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times]
+import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times, sequtils]
 import softlink/versions
 
 export FactKind, abiTag
@@ -84,6 +84,21 @@ type
     report*: string
       ## Human-readable summary. Tests should assert primarily on the
       ## structured fields above; this is for a human running the CLI.
+    compileCount*: int
+      ## RFC-0001 SS4 B.2, optional fast-path (slice B7): incremented once
+      ## per real `compileProbe` invocation made while producing THIS
+      ## `HarvestResult` — the headline "fewer compiles" property the fast
+      ## path exists to deliver is measured by comparing this field across
+      ## two `harvest()` calls (`opts.fastPath = false` vs `true`) against
+      ## the SAME dump/corpus (see `tests/tharvest.nim`). The calibration
+      ## preflight's own compiles (`runCalibration`, called once at the top
+      ## of `harvest`) are DELIBERATELY EXCLUDED — calibration is a fixed,
+      ## mode-independent cost paid identically regardless of `fastPath`,
+      ## so folding it in would only dilute the comparison this field
+      ## exists to enable. Every compile the CORPUS harvest itself performs
+      ## — baseline, define-free, bisection group, and standard-pipeline
+      ## existence/verify — is counted, in both the standard and fast-path
+      ## loops (see `harvest`'s doc comment for the full accounting).
 
   HarvestOptions* = object
     nimPaths*: seq[string]
@@ -102,6 +117,16 @@ type
     scratchDir*: string
       ## Base directory for unique per-invocation nimcaches and any
       ## runtime-generated calibration fixture.
+    fastPath*: bool
+      ## RFC-0001 SS4 B.2, optional (slice B7): when true, `harvest` tries
+      ## a plain, define-free compile of the module per corpus version
+      ## FIRST, falling back to the standard baseline/bisection/per-symbol
+      ## pipeline only where that shortcut doesn't immediately settle the
+      ## question. Pure optimization — `harvest`'s `facts` are IDENTICAL
+      ## whether this is `false` (default) or `true`; see `harvest`'s own
+      ## doc comment for the full algorithm and soundness argument. Default
+      ## `false`: this is opt-in, never a silent behavior change for an
+      ## existing caller.
 
   HarvestMeta* = object
     ## The `<lib>.compat.json` manifest's `"harvest"` object (RFC-0001 SS4
@@ -176,6 +201,79 @@ func classify*(o: ProbeOutcomes): FactKind =
   if o.verifyOk: return fkVerified
   if o.assertMsgSeen: return fkMismatch
   fkUnknown
+
+type
+  BisectPlan* = object
+    ## The result of `bisectPlan`'s recursive divide-and-conquer over a
+    ## symbol list, using nothing but an opaque pass/fail oracle. Every
+    ## input symbol lands in EXACTLY ONE of these two seqs — see
+    ## `bisectPlan`'s own doc comment for why that's structural, not merely
+    ## tested.
+    verified*: seq[string]
+      ## Symbols a passing group compile already proved `fkVerified` at —
+      ## no further compile is ever needed for them.
+    needsStandard*: seq[string]
+      ## Symbols whose bisection bottomed out at a failing SINGLETON — the
+      ## only case that needs the standard three-probe pipeline
+      ## (`probeOutcomes`/`classify`) to actually tell `fkAbsent` from
+      ## `fkMismatch` from `fkUnknown`.
+
+proc bisectPlan*(symbols: seq[string],
+                  groupPasses: proc(group: seq[string]): bool {.closure.}
+                  ): BisectPlan =
+  ## (`proc`, not `func`: `groupPasses` is a caller-supplied closure that,
+  ## in real use, performs I/O — a `func`'s effect system would need it
+  ## marked `{.noSideEffect.}`, which would be a lie. `bisectPlan` itself
+  ## still performs no I/O of its own; see the architectural note in the
+  ## module doc comment.)
+  ## RFC-0001 SS4 B.2's optional fast-path (slice B7), the bisection step in
+  ## pure isolation: given a symbol list and an opaque "does a compile of
+  ## THIS group pass?" callback, partitions the list into `verified` (a
+  ## compile naming exactly this group's symbols succeeded) and
+  ## `needsStandard` (bisection bottomed out at a failing singleton — the
+  ## ONLY place the standard pipeline is ever needed). No I/O of its own —
+  ## `harvest` supplies the real callback, a `compileProbe` call with
+  ## `softlinkProbeOnly=<comma-joined group>` in verify mode; this function
+  ## is unit-tested (`tests/tharvest.nim`) entirely with synthetic
+  ## callbacks (all-pass, one-fail, all-fail, two-fail-in-different-halves,
+  ## odd-sized groups, singleton input) precisely because it has no I/O.
+  ##
+  ## Soundness (the RFC's own argument): per-symbol `_Static_assert`s are
+  ## independent statements in the verify TU, so a passing group compile
+  ## really does mean EVERY symbol in that group individually verifies —
+  ## there is no way for one symbol's assert to pass only in the "wrong"
+  ## company of others. A failing group means AT LEAST ONE symbol in it
+  ## doesn't verify, but — per RFC-0001 SS4 B.2's "no textual attribution
+  ## ever" — WHICH one is never read off the compiler's output; recursing
+  ## into halves is the only way this module ever learns that, and a
+  ## failing singleton is the base case where "at least one" becomes
+  ## "this one".
+  ##
+  ## Structurally exhaustive/disjoint by construction: `symbols.len == 0`
+  ## returns immediately (empty plan, oracle never invoked — there is
+  ## nothing to bisect). Otherwise, exactly one of two things happens to
+  ## the WHOLE input list at each call: it is fully claimed by `verified`
+  ## (the passing branch) or split into two non-overlapping, jointly-
+  ## exhaustive halves that are each recursed into independently (the
+  ## failing, non-singleton branch) — so every symbol given to the
+  ## top-level call ends up in exactly one leaf, and every leaf is either
+  ## a passing group (-> `verified`) or a failing singleton
+  ## (-> `needsStandard`). A failing singleton with `symbols.len == 1` is
+  ## the unconditional base case: it never recurses further (there is no
+  ## smaller half to split into), it lands in `needsStandard` directly.
+  if symbols.len == 0:
+    return
+  if groupPasses(symbols):
+    result.verified = symbols
+    return
+  if symbols.len == 1:
+    result.needsStandard = symbols
+    return
+  let mid = symbols.len div 2
+  let left = bisectPlan(symbols[0 ..< mid], groupPasses)
+  let right = bisectPlan(symbols[mid .. ^1], groupPasses)
+  result.verified = left.verified & right.verified
+  result.needsStandard = left.needsStandard & right.needsStandard
 
 # ---------------------------------------------------------------------------
 # B.1 dump parsing
@@ -310,20 +408,34 @@ proc compileProbe(nimExe, modulePath, nimcacheRoot: string, opts: HarvestOptions
   CompileOutcome(exitCode: code, output: output)
 
 proc probeOutcomes(nimExe, modulePath, versionDir, cName, nimcacheRoot: string,
-                    opts: HarvestOptions): ProbeOutcomes =
+                    opts: HarvestOptions, compileCounter: ptr int = nil): ProbeOutcomes =
   ## Runs the existence + (conditionally) verify compiles for one already-
   ## baseline-ok `(version, symbol)` pair — the two of the "up to three"
   ## compiles that are genuinely per-symbol (baseline is cached once per
   ## version by the caller, `harvest`, per RFC-0001 SS4 B.2 design guidance:
-  ## it is symbol-independent by construction).
+  ## it is symbol-independent by construction). This is THE ONE place
+  ## `fkAbsent`/`fkMismatch`/`fkUnknown` are ever distinguished from
+  ## `fkVerified` — both the standard per-version loop AND the fast path's
+  ## failing-singleton fallback (RFC-0001 SS4 B.2, slice B7) route through
+  ## this identical proc, which is what makes their `facts` provably
+  ## identical (see `harvest`'s doc comment).
+  ##
+  ## `compileCounter`, when non-nil, is incremented once per real compile
+  ## this call performs (one for the existence probe, a second if it
+  ## passed and the verify probe also runs) — `nil` (the default) leaves
+  ## compiles uncounted, which is what `runCalibration`'s own calls rely on
+  ## (calibration compiles are deliberately excluded from
+  ## `HarvestResult.compileCount`, see that field's doc comment).
   result.baselineOk = true
   let existence = compileProbe(nimExe, modulePath, nimcacheRoot, opts, @[versionDir],
     @["softlinkProbeOnly=" & cName, "softlinkProbeExistence"])
+  if compileCounter != nil: inc compileCounter[]
   result.existenceOk = existence.exitCode == 0
   if not result.existenceOk:
     return
   let verify = compileProbe(nimExe, modulePath, nimcacheRoot, opts, @[versionDir],
     @["softlinkProbeOnly=" & cName])
+  if compileCounter != nil: inc compileCounter[]
   result.verifyOk = verify.exitCode == 0
   if not result.verifyOk:
     result.assertMsgSeen = assertMismatchNeedle in verify.output
@@ -452,6 +564,36 @@ proc harvest*(dumpFile, corpusDir: string,
   ## emitted for them regardless of which probe mode is active — probing
   ## either would just observe "nothing emitted, so it trivially compiles"
   ## at every version, a false `verified` by construction, not a real fact.
+  ## The calibration preflight's own compiles are NEVER counted toward
+  ## `result.compileCount` (see that field's doc comment) — deliberately
+  ## NOT fast-pathed either: calibration's whole point is exercising the
+  ## standard existence/verify probes' teeth against a known-answer trio
+  ## (RFC-0001 SS4 B.2), and `opts.fastPath` only changes how the CORPUS
+  ## loop below reaches its per-version conclusions, never this preflight.
+  ##
+  ## `opts.fastPath` (RFC-0001 SS4 B.2, optional slice B7): per corpus
+  ## version, tries a single plain, define-free compile of the module
+  ## FIRST. Success is, by construction, the shipped verification
+  ## succeeding for every probed symbol at that version — record
+  ## `fkVerified` for all of them and move to the next version, no further
+  ## compiles needed. On failure, this loop cannot yet tell "headers
+  ## broken this version" from "one or more symbols individually drifted"
+  ## — that's what the baseline probe (`softlinkProbeOnly=-`) is for,
+  ## exactly as the standard loop already runs it. A failing baseline means
+  ## every symbol is `fkUnknown`, same as the standard path, no bisection
+  ## attempted (nothing sound to bisect: the compile that's failing doesn't
+  ## even reach the `#include`s cleanly). A PASSING baseline with a failed
+  ## define-free compile means the headers are fine but the plain
+  ## verification of at least one symbol failed — `bisectPlan` (pure,
+  ## unit-tested above) partitions `probeTargets` into symbols a group
+  ## compile already proved `fkVerified` and symbols that bottomed out at a
+  ## failing singleton, each of which THEN runs through the IDENTICAL
+  ## `probeOutcomes`/`classify` pipeline the standard loop below uses. That
+  ## shared final step is what makes `facts` provably identical between the
+  ## two paths regardless of which one produced them — the fast path only
+  ## ever shortcuts the `fkVerified` case, and only when a real compile
+  ## structurally proves it; every other classification still goes through
+  ## the exact same two-probe pipeline as the non-fast-path loop.
   let calibration = runCalibration(opts)
   if not calibration.ok:
     raise newException(CalibrationRefusedError, calibration.diagnosis)
@@ -488,8 +630,78 @@ proc harvest*(dumpFile, corpusDir: string,
 
   for v in result.versions:
     let versionDir = corpusDir / v
+
+    if opts.fastPath:
+      # RFC-0001 SS4 B.2, optional fast-path (slice B7). See `harvest`'s own
+      # doc comment for the full algorithm; this block is its I/O.
+      let fast = compileProbe(nimExe, dump.modulePath, scratchRoot, opts,
+        @[versionDir], @[])
+      inc result.compileCount
+      if fast.exitCode == 0:
+        result.baselineOk[v] = true
+        for p in probeTargets:
+          var facts = result.facts.getOrDefault(p.cName)
+          facts[v] = fkVerified
+          result.facts[p.cName] = facts
+        continue
+
+      let baseline = compileProbe(nimExe, dump.modulePath, scratchRoot, opts,
+        @[versionDir], @["softlinkProbeOnly=-"])
+      inc result.compileCount
+      let baselineOk = baseline.exitCode == 0
+      result.baselineOk[v] = baselineOk
+      if not baselineOk:
+        for p in probeTargets:
+          var facts = result.facts.getOrDefault(p.cName)
+          facts[v] = fkUnknown
+          result.facts[p.cName] = facts
+        continue
+
+      # Baseline ok, define-free compile failed: some probed symbol(s)
+      # drifted at THIS version. Bisect via `softlinkProbeOnly=<comma
+      # list>` (verify mode — no `softlinkProbeExistence`; a multi-symbol
+      # existence probe is a macro error, see src/softlink.nim) rather than
+      # ever parsing which symbol's assert text appears in a group
+      # compile's output ("no textual attribution ever" — RFC-0001 SS4
+      # B.2). `groupVerifies` is the ONLY thing that talks to the compiler
+      # in this branch; `bisectPlan` itself (unit-tested in isolation
+      # above) never does.
+      let compileCountPtr = addr result.compileCount
+        ## Captured by address BEFORE `groupVerifies` is defined: that
+        ## proc's own return type (`bool`) gives IT an implicit `result`
+        ## variable, which would shadow `harvest`'s own `result` if
+        ## referenced as `result.compileCount` from inside the closure —
+        ## this named alias sidesteps the shadowing entirely.
+      proc groupVerifies(group: seq[string]): bool =
+        let outcome = compileProbe(nimExe, dump.modulePath, scratchRoot, opts,
+          @[versionDir], @["softlinkProbeOnly=" & group.join(",")])
+        inc compileCountPtr[]
+        outcome.exitCode == 0
+
+      let plan = bisectPlan(probeTargets.mapIt(it.cName), groupVerifies)
+      for cname in plan.verified:
+        var facts = result.facts.getOrDefault(cname)
+        facts[v] = fkVerified
+        result.facts[cname] = facts
+      for cname in plan.needsStandard:
+        # The ONLY place absent/mismatch/unknown are ever assigned, in
+        # EITHER path — see `harvest`'s doc comment for why that's what
+        # makes the two paths' `facts` provably identical.
+        let o = probeOutcomes(nimExe, dump.modulePath, versionDir, cname,
+          scratchRoot, opts, addr result.compileCount)
+        var facts = result.facts.getOrDefault(cname)
+        facts[v] = classify(o)
+        result.facts[cname] = facts
+      continue
+
+    # Standard path (`opts.fastPath == false`, the default) — byte-
+    # identical to pre-slice-B7 behavior; no existing caller (none of which
+    # ever sets `fastPath`) observes any change here beyond the new
+    # `compileCount` bookkeeping, which was `0`/absent before this field
+    # existed and is now populated identically regardless of which path ran.
     let baseline = compileProbe(nimExe, dump.modulePath, scratchRoot, opts,
       @[versionDir], @["softlinkProbeOnly=-"])
+    inc result.compileCount
     let baselineOk = baseline.exitCode == 0
     result.baselineOk[v] = baselineOk
     for p in probeTargets:
@@ -498,7 +710,7 @@ proc harvest*(dumpFile, corpusDir: string,
         facts[v] = fkUnknown
       else:
         let o = probeOutcomes(nimExe, dump.modulePath, versionDir, p.cName,
-          scratchRoot, opts)
+          scratchRoot, opts, addr result.compileCount)
         facts[v] = classify(o)
       result.facts[p.cName] = facts
 

@@ -628,11 +628,21 @@ task test, "Run tests":
   const probeOnlyM3 = "tests/nimcache_probeonly_m3"
   const probeOnlyM3cpp = "tests/nimcache_probeonly_m3cpp"
   const probeOnlyM4 = "tests/nimcache_probeonly_m4"
+  # RFC-0001 §4 B.2, slice B7 (fast-path list support):
+  #   M5 -d:softlinkProbeOnly=testlib_add,testlib_noop — a two-symbol list
+  #      keeps BOTH symbols' verification, suppresses the other two procs.
+  #   M8 -d:softlinkProbeOnly=testlib_add,<space>testlib_noop — pins this
+  #      slice's whitespace-not-trimmed decision (see the `softlinkProbeOnly`
+  #      const's doc comment in src/softlink.nim): the untrimmed, space-
+  #      padded second element never equals any real C name, so it behaves
+  #      as if absent from the list (fails closed) rather than matching.
+  const probeOnlyM5 = "tests/nimcache_probeonly_m5"
+  const probeOnlyM8 = "tests/nimcache_probeonly_m8"
   const probeOnlyV0 = "tests/nimcache_probeonly_v0"
   const probeOnlyV1 = "tests/nimcache_probeonly_v1"
   const probeOnlyV2 = "tests/nimcache_probeonly_v2"
   const probeOnlyDirs = [probeOnlyM0, probeOnlyM1, probeOnlyM2, probeOnlyM3,
-                          probeOnlyM3cpp, probeOnlyM4,
+                          probeOnlyM3cpp, probeOnlyM4, probeOnlyM5, probeOnlyM8,
                           probeOnlyV0, probeOnlyV1, probeOnlyV2]
 
   const poAssertAdd = "softlink: testlib_add signature mismatch vs tests/testlib.h"
@@ -652,6 +662,15 @@ task test, "Run tests":
     "#if (TESTLIB_VERSION >= 1) /* softlink verifyWhen */\n" &
     "#if defined(__cplusplus)\n(void)sizeof(decltype(&testlib_gated));\n" &
     "#elif defined(__GNUC__)\n(void)sizeof(__typeof__(&testlib_gated));"
+
+  # RFC-0001 §4 B.2, slice B7: the malformed-list and multi-symbol-plus-
+  # existence macro errors are softlink's OWN fixed text, but — like
+  # `expectManifestCompileFail` above — asserted via `gorgeEx` + plain `in`
+  # at the NimScript level rather than an OS-specific grep/findstr pipe, so
+  # these two checks run identically from all three OS branches through
+  # this one `runProbeOnlyChecks()` call (no triplication needed).
+  const poMalformedListAnchor = "malformed -d:softlinkProbeOnly"
+  const poMultiExistenceAnchor = "requires exactly ONE probed symbol"
 
   const vpoAssertMagic = "softlink: testlib_magic signature mismatch vs tests/testlib.h"
   const vpoAssertProtoonly = "softlink: testlib_protoonly signature mismatch vs vendored prototype"
@@ -700,6 +719,10 @@ task test, "Run tests":
       if dirExists(d): rmDir(d)
 
     let cBase = "nim c --compileOnly --path:src --passC:-I. --nimcache:"
+    # For the two macro-ERROR checks below (M6/M7) a --nimcache dir would
+    # never get populated (the compile never reaches codegen) — same
+    # nimcache-free style `expectManifestCompileFail`'s own callers use.
+    let cBaseNoCache = "nim c --compileOnly --path:src --passC:-I. "
     # M0: no defines — control. Every predicate in genVerifyBlock's probe
     # logic is unreachable when both consts are at their default/empty
     # value, so this compile is byte-identical to pre-B2 emission by
@@ -752,6 +775,46 @@ task test, "Run tests":
     expectAnchor(probeOnlyM4, poExistGatedGated,
       "M4 existence-gated: existence reference sits inside its own verifyWhen gate", true)
     expectAnchor(probeOnlyM4, poAssertGated, "M4 existence-gated: testlib_gated assert", false)
+
+    # RFC-0001 §4 B.2, slice B7 (fast-path list support for
+    # -d:softlinkProbeOnly): a two-symbol list keeps BOTH members verified,
+    # suppressing every proc NOT named — the same suppression rule M2 above
+    # already proves for a singleton list, generalized.
+    exec cBase & probeOnlyM5 &
+      " -d:softlinkProbeOnly=testlib_add,testlib_noop tests/tcheck_probe_only.nim"
+    expectAnchor(probeOnlyM5, poAssertAdd, "M5 probe-list(add,noop): testlib_add assert", true)
+    expectAnchor(probeOnlyM5, poAssertNoop, "M5 probe-list(add,noop): testlib_noop assert", true)
+    expectAnchor(probeOnlyM5, poAssertFuture, "M5 probe-list(add,noop): testlib_future assert", false)
+    expectAnchor(probeOnlyM5, poAssertGated, "M5 probe-list(add,noop): testlib_gated assert", false)
+    expectAnchor(probeOnlyM5, poProtoDeclAdd, "M5 probe-list(add,noop): testlib_add prototype decl", true)
+
+    # M8: the whitespace-not-trimmed decision (see `softlinkProbeOnly`'s doc
+    # comment in src/softlink.nim) — a list element padded with a leading
+    # space is used VERBATIM, so it never equals the real C name and simply
+    # never matches (fails closed), rather than being trimmed or rejected.
+    exec cBase & probeOnlyM8 &
+      " \"-d:softlinkProbeOnly=testlib_add, testlib_noop\" tests/tcheck_probe_only.nim"
+    expectAnchor(probeOnlyM8, poAssertAdd, "M8 probe-list whitespace-not-trimmed: testlib_add assert", true)
+    expectAnchor(probeOnlyM8, poAssertNoop,
+      "M8 probe-list whitespace-not-trimmed: testlib_noop assert (untrimmed ' testlib_noop' never matches)", false)
+
+    # M6: a malformed list (empty element from a doubled comma) is a macro
+    # error naming the malformed define — never a silent partial match
+    # (same no-silent-degradation principle as every other malformed-input
+    # check in this file).
+    expectManifestCompileFail(
+      cBaseNoCache & " -d:softlinkProbeOnly=testlib_add,,testlib_noop tests/tcheck_probe_only.nim",
+      [poMalformedListAnchor])
+
+    # M7: a MULTI-symbol -d:softlinkProbeOnly list combined with
+    # -d:softlinkProbeExistence is a macro error — existence is a per-
+    # singleton stage of the standard three-probe pipeline; a group
+    # existence probe is meaningless (singleton + existence is UNCHANGED,
+    # already covered by M3/M4 above).
+    expectManifestCompileFail(
+      cBaseNoCache & " -d:softlinkProbeOnly=testlib_add,testlib_noop -d:softlinkProbeExistence " &
+        "tests/tcheck_probe_only.nim",
+      [poMultiExistenceAnchor])
 
     exec cBase & probeOnlyV0 & " tests/tcheck_probe_only_verifyprocs.nim"
     exec cBase & probeOnlyV1 & " -d:softlinkProbeOnly=testlib_magic tests/tcheck_probe_only_verifyprocs.nim"
