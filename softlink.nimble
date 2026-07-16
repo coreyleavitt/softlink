@@ -319,6 +319,14 @@ proc runHarvesterCheck() =
   ## macOS/windows-mingw branches: doubling this cost on every CI leg for a
   ## mechanism that doesn't vary by OS wasn't judged worth it; revisit if
   ## Stage B ships a regression those legs would have caught.
+  ##
+  ## RFC-0001 slice B8: `tests/tharvest_cli.nim` unit-tests
+  ## `tools/harvest/harvest_cli.nim`'s `parseHarvestCli` — a PURE function
+  ## over `seq[string]`, zero subprocess/filesystem access — so it costs
+  ## well under a second, unlike the ~1-minute real-compile suite above.
+  ## Run right alongside it (same `runHarvesterCheck` proc) so both of this
+  ## slice's suites are exercised by the one `task test` call site below.
+  exec "nim c -r --path:src tests/tharvest_cli.nim"
   exec "nim c -r --path:src tests/tharvest.nim"
 
 task test, "Run tests":

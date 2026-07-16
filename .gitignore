@@ -2,11 +2,19 @@
 tests/test_softlink
 tests/test_nimport
 tests/tharvest
+tests/tharvest_cli
 tests/tharvest_msvc_calibration_refusal
 # RFC-0001 slice B5: tests/tharvest.nim's drift-alarm exit-code integration
 # test compiles+runs the harvester CLI shim itself (`nim c -r
 # tools/harvest/harvester.nim ...`), which builds this binary in place.
 tools/harvest/harvester
+# RFC-0001 slice B8: the packaged CLI's own `bin` binary — built either by
+# `nim c --path:src tools/harvest/softlink_harvest.nim` (the
+# tests/tharvest.nim integration test) or `nimble build`/`nimble install`
+# inside tools/harvest (see tools/harvest/README.md's package-layout
+# section for the local-dependency story via the committed
+# tools/harvest/nimble.develop).
+tools/harvest/softlink_harvest
 tests/libtestlib.so
 tests/libtestlib.dylib
 tests/testlib.dll

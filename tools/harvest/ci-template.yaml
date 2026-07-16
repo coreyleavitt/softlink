@@ -1,0 +1,134 @@
+# softlink harvest -- B.6 manifest lifecycle CI TEMPLATE (RFC-0001 SS4 B.6)
+#
+# This is NOT this repo's own workflow (see ../../.github/workflows/ci.yaml
+# for that) -- it is a TEMPLATE for a BINDING repo (a package that uses
+# softlink's `dynlib` macro plus a `<lib>.compat.json` manifest committed
+# via `softlink harvest`). Copy this file into the binding repo as
+# `.github/workflows/harvest.yaml` and fill in every `TODO(binding)` marker.
+#
+# What this job proves, every time it runs: the committed manifest still
+# matches what a FRESH harvest of the current upstream corpus produces. A
+# committed artifact rots exactly like a hosted one if nothing regenerates
+# it (RFC-0001 SS4 B.6) -- this template is what makes that principle
+# honest, by running on a schedule / on upstream tag detection and FAILING
+# the moment the manifest would need to change, rather than silently
+# drifting until someone notices at runtime.
+#
+# Supply-chain note (RFC-0001 principle 4): this job fetches and COMPILES
+# upstream content (the header corpus) on a schedule. It runs in the
+# BINDING's CI, never on a consumer machine -- a `nimble install` of the
+# binding never triggers any of this; only this scheduled/manually-
+# triggered workflow does.
+
+name: softlink harvest (compat manifest lifecycle)
+
+on:
+  schedule:
+    # TODO(binding): pick a cadence appropriate to how often upstream cuts
+    # releases -- weekly is a reasonable default for most C libraries.
+    - cron: "0 6 * * 1"  # every Monday at 06:00 UTC
+  workflow_dispatch: {}
+  # TODO(binding, optional): trigger on upstream tag detection instead of
+  # (or in addition to) a bare schedule, e.g. a separate scheduled job that
+  # polls the upstream repo's tags via `gh api repos/<upstream>/tags` and
+  # only `workflow_dispatch`-triggers THIS workflow when a new tag appears
+  # that isn't yet in this repo's corpus. Sketch (adapt to your upstream):
+  #
+  # - name: Check for new upstream tags
+  #   run: |
+  #     latest=$(gh api repos/TODO_OWNER/TODO_REPO/tags --jq '.[0].name')
+  #     if ! grep -q "\"$latest\"" corpus/corpus.json; then
+  #       gh workflow run harvest.yaml
+  #     fi
+  #   env:
+  #     GH_TOKEN: ${{ github.token }}
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nim
+        run: |
+          curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
+      # TODO(binding): pin real version constraints once softlink_harvest
+      # is published; `nimble install` resolves `requires "softlink"`
+      # transitively, exactly like any other nimble dependency -- no local
+      # path/`nimble develop` trick needed here (that mechanism is only for
+      # building softlink_harvest FROM WITHIN the softlink monorepo itself;
+      # see tools/harvest/README.md's "Package layout" section).
+      - name: Install softlink_harvest
+        run: nimble install -y softlink_harvest
+
+      # TODO(binding): replace with the binding's own fetch script -- e.g.
+      # a script that `git clone`/`git fetch --tags` the upstream project
+      # into `corpus/<version>/`, running any per-version `prepare` command
+      # the library's headers need (configure/generate output, not
+      # checked-in files -- mbedtls is the RFC's own motivating example).
+      # IMPORTANT: `corpus/<version>/` is passed directly as the compiler's
+      # include dir (`-I corpus/<version>`) -- headers must resolve exactly
+      # the way your binding's `header: "..."` names expect. If upstream
+      # ships its public headers under its own `include/` subdirectory,
+      # copy THAT directory's contents into `corpus/<version>/`, not the
+      # wrapper (see tools/harvest/README.md's "What it does" section).
+      # This step OWNS deciding which upstream versions belong in the
+      # corpus (all released versions, or just the binding's claimed
+      # support range -- binding's call).
+      - name: Fetch upstream header corpus
+        run: ./TODO_binding_fetch_corpus.sh corpus/
+
+      # RFC-0001 SS4 B.1: dump per-baseName probe facts for the binding
+      # module(s) this repo ships. `-d:softlinkDumpProbes=<dir>` is a
+      # dedicated single-shot invocation (see the macro's own docs) -- not
+      # something left on in normal builds.
+      - name: Generate B.1 probe-facts dump
+        run: |
+          nim c --compileOnly -d:softlinkDumpProbes=probes TODO_binding_module.nim
+
+      # RFC-0001 SS4 B.2/B.4/B.8: run the harvester. Exit codes (documented
+      # in `softlink_harvest --help` and tools/harvest/README.md) are what
+      # make this job fail for the RIGHT reason:
+      #   0 = ok (no drift, manifest written)   1 = drift alarm tripped
+      #   2 = calibration refused (toothless toolchain -- NO manifest written)
+      #   3 = usage/input error (bad flags, missing dump/corpus, ...)
+      # TODO(binding): fill in the real probe-facts JSON filename (the
+      # `<Base>` derived from the binding's `dynlib "..."` pattern) and the
+      # desired `--out:` manifest path/`--support-range:`/`--fast-path` as
+      # appropriate for this binding.
+      - name: Run softlink harvest
+        run: |
+          softlink_harvest probes/TODO_Base.probes.json corpus/ \
+            --out:TODO_lib.compat.json
+
+      # Silent drift ALSO fails the job, not just the drift alarm above: a
+      # `harvest` run that completes with exit 0 (no `mismatch` in range)
+      # can still have produced a manifest that differs from the committed
+      # one (new versions appeared in the corpus, a symbol newly went
+      # `absent`, provenance/toolchain metadata changed, ...). Comparing
+      # against the committed file is what actually enforces "regenerate
+      # or fail" (RFC-0001 SS4 B.6) rather than only catching mismatches.
+      - name: Fail on any manifest drift (regenerated != committed)
+        run: git diff --exit-code TODO_lib.compat.json
+
+      # TODO(binding, optional): open a PR with the regenerated manifest
+      # instead of just failing, when the diff step above is expected (a
+      # real corpus/upstream change, not a false alarm). Sketch:
+      #
+      # - name: Open a PR with the regenerated manifest
+      #   if: failure()
+      #   uses: peter-evans/create-pull-request@v6
+      #   with:
+      #     commit-message: "chore: regenerate TODO_lib.compat.json"
+      #     title: "softlink harvest: compat manifest drift detected"
+      #     body: |
+      #       Scheduled `softlink harvest` run found the committed manifest
+      #       no longer matches a fresh harvest of the corpus. Review the
+      #       diff -- a real signature drift needs a decision (narrow the
+      #       binding's support range, or split the binding, per the F3
+      #       diagnosis), a corpus-only change (new version added) is
+      #       usually safe to accept as-is.
+      #     branch: softlink-harvest-drift
+      #     add-paths: TODO_lib.compat.json

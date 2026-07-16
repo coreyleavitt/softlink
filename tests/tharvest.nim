@@ -8,6 +8,7 @@
 ## dump-generation cost, one real compile per (version, symbol) probed).
 import std/[unittest, os, osproc, tables, strutils, json]
 import ../tools/harvest/harvester
+import ../tools/harvest/harvest_cli
 import softlink/versions
 
 # ---------------------------------------------------------------------------
@@ -482,31 +483,39 @@ suite "driftAlarm — integration against the real harvest (RFC-0001 SS4 B.4, sl
     check not tripped
     check diag.len == 0
 
-suite "harvester CLI shim — drift alarm exit code (RFC-0001 SS4 B.4, slice B5, integration)":
-  ## The slice is explicitly "(integration)": the RFC text says `softlink
-  ## harvest` "exits nonzero" — a claim about the actual CLI process, not
-  ## just the pure `driftAlarm` decision. This compiles AND RUNS the real
-  ## `when isMainModule` shim (`tools/harvest/harvester.nim`) against the
-  ## already-generated dump + the real fixture corpus (both still on disk
-  ## at this point — `dumpDir` is only removed at the very end of this
-  ## file) via one `nim c -r` invocation, exactly the usage line the
-  ## module's own doc comment gives: `harvester <dumpFile> <corpusDir>
-  ## [nimPath ...]`.
+suite "softlink_harvest CLI — packaged entry, drift alarm exit code (RFC-0001 SS4 B.8, integration)":
+  ## RFC-0001 SS4 B.8 packages the CLI as its own nimble package
+  ## (`tools/harvest/softlink_harvest.nimble`, `bin = @["softlink_harvest"]`)
+  ## with `tools/harvest/softlink_harvest.nim` as its thin I/O entry point
+  ## over the SAME `harvester.harvest`/`driftAlarm` this file already
+  ## exercises directly. This suite used to compile+run
+  ## `tools/harvest/harvester.nim`'s bare positional dev shim instead; it
+  ## now targets the packaged entry so the integration proof covers the
+  ## surface a real binding author actually installs and runs, per the
+  ## slice brief's explicit "may switch...if that keeps cost flat" note —
+  ## one `nim c -r` invocation either way, same ~1-minute-suite budget.
+  ## `harvester.nim`'s own bare shim is unchanged and still directly
+  ## runnable for dev-loop convenience (see its doc comment); it just isn't
+  ## what this integration test targets anymore.
   ##
-  ## Scoping (per the slice brief): only the nonzero-exit path is checked
-  ## here. A cheap "success path is still exit 0" fixture would need a
-  ## second, no-mismatch binding/corpus — a second real harvest, doubling
-  ## this already ~1-minute-of-wall-time suite's cost for a fact already
-  ## covered for free at the `driftAlarm` unit level above (the shim's
-  ## `quit(1)` is a direct, untested-in-isolation `if tripped: quit(1)` --
-  ## nothing about exit-0 behavior is specific to the CLI wiring). See the
-  ## slice brief's own explicit accept-nonzero-only instruction.
-  test "running the real CLI shim against the dump + corpus exits nonzero and prints the F3 diagnosis":
-    let harvesterModule = "tools" / "harvest" / "harvester.nim"
-    let shimCmd = "nim c -r --path:src " & harvesterModule & " " & dumpFile &
-      " " & ("tests" / "corpus")
-    let (output, exitCode) = execCmdEx(shimCmd)
-    check exitCode != 0
+  ## Scoping (per the slice brief, same as before): only the nonzero-exit
+  ## path is checked here — see the prior version of this comment (git
+  ## history) for why a second no-mismatch fixture isn't worth doubling
+  ## this suite's wall time for a fact already covered at the `driftAlarm`
+  ## unit level above.
+  ##
+  ## `--nim-path:src` is required here (but NOT by a real installed
+  ## consumer) because the packaged CLI's own default `nimPaths` is empty
+  ## (see `harvest_cli.defaultCliConfig`'s doc comment) — this repo's
+  ## `tests/tharvest_binding.nim` fixture does `import softlink` from a
+  ## checkout, not an installed nimble package, exactly the case that flag
+  ## exists for.
+  test "running the packaged CLI against the dump + corpus exits with exitDriftAlarm and prints the F3 diagnosis":
+    let cliModule = "tools" / "harvest" / "softlink_harvest.nim"
+    let cliCmd = "nim c -r --path:src " & cliModule & " " & dumpFile &
+      " " & ("tests" / "corpus") & " --nim-path:src"
+    let (output, exitCode) = execCmdEx(cliCmd)
+    check exitCode == exitDriftAlarm
     check f3Sentence in output
 
 removeDir(dumpDir)

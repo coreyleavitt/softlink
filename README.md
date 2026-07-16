@@ -309,6 +309,41 @@ error: 'mylib_ponit_t' undeclared; did you mean 'mylib_point_t'?
 
 Each type requires a `ctype` pragma mapping to the C struct name in the header. The types are defined as regular Nim objects (no `{.importc.}`) — this is what allows the size comparison to work, since the Nim and C structs are separate definitions that can be independently measured.
 
+## Verified version compat (Stage B)
+
+Header verification (above) proves your Nim signature matches *today's*
+header. It says nothing about last year's release, or next year's.
+`tools/harvest/` adds a `softlink harvest` CLI that recompiles your
+binding against a versioned corpus of upstream headers and records, per
+symbol per version, whether it was verified, absent, mismatched, or
+unclassifiable — then a `compatManifest` directive attaches the result to
+your `dynlib`/`verifyProcs` block for compile-time drift checks (a
+contradicted `{.since.}` claim is a hard error; a recorded `mismatch`
+warns; a bound symbol missing from the manifest hints).
+
+The one-screen happy path:
+
+```sh
+# 1. Dump probe facts for your binding module.
+nim c --compileOnly -d:softlinkDumpProbes=probes src/mylib_bindings.nim
+
+# 2. Harvest against your header corpus.
+softlink_harvest probes/Mylib.probes.json corpus/ --out:mylib.compat.json
+
+# 3. Commit the manifest, then attach it:
+```
+```nim
+dynlib "mylib":
+  compatManifest "mylib.compat.json"
+  proc mylib_init(): cint {.cdecl, header: "mylib.h".}
+```
+
+See **[`tools/harvest/README.md`](tools/harvest/README.md)** for the full
+classification table, the calibration preflight, the fast path, exit
+codes, the manifest schema, and a copy-paste CI template
+(`tools/harvest/ci-template.yaml`) for keeping a committed manifest from
+rotting.
+
 ## Comparison
 
 | Feature | `{.importc, dynlib.}` | `std/dynlib` manual | **softlink** |
