@@ -133,6 +133,40 @@ proc expectManifestCompileFail(cmd: string, mustContain: openArray[string]) =
       quit("softlink: RFC-0001 slice B6a expected compile output to " &
            "contain '" & s & "': " & cmd)
 
+proc expectWrapperBeforeLoad(cmd: string) =
+  ## RFC-0001 §9/§C.1, slice C1a pinning check: in the macro's expanded
+  ## output, the first wrapper proc (`proc foo(...)`) must textually precede
+  ## `proc loadFoo(): LoadResult`. This is the exact property C1b's future
+  ## `versionProbe:` directive depends on — its body is spliced INTO the
+  ## generated `loadX` and may call the block's own wrappers, which would be
+  ## a use-before-declaration at the Nim top level if `loadX` still emitted
+  ## first. `--expandMacro:dynlib` against the existing
+  ## `tests/thint_noverify.nim` fixture (derived base name "Foo", first proc
+  ## "foo") reliably reproduces the full expanded statement list in Nim's
+  ## `[ExpandMacro]` hint, so a plain substring-index comparison at the
+  ## NimScript level — no grep/findstr split needed, same trick
+  ## `expectManifestCompileOk` above already uses — works identically on all
+  ## three OS legs.
+  let (output, code) = gorgeEx(cmd)
+  if code != 0:
+    echo output
+    quit("softlink: RFC-0001 slice C1a expected a compile SUCCESS: " & cmd)
+  let wrapperIdx = output.find("\nproc foo(")
+  let loadIdx = output.find("\nproc loadFoo(")
+  if wrapperIdx < 0:
+    echo output
+    quit("softlink: RFC-0001 slice C1a expected to find wrapper proc " &
+         "'foo' in the macro expansion: " & cmd)
+  if loadIdx < 0:
+    echo output
+    quit("softlink: RFC-0001 slice C1a expected to find 'proc loadFoo' " &
+         "in the macro expansion: " & cmd)
+  if not (wrapperIdx < loadIdx):
+    echo output
+    quit("softlink: RFC-0001 slice C1a expected wrapper proc 'foo' to " &
+         "precede 'proc loadFoo' in the generated code (codegen order: " &
+         "vars -> wrappers -> loadX), but it didn't: " & cmd)
+
 proc corpusBaseName(path: string): string =
   ## Last path component of a NimScript `listDirs`/`listFiles` result
   ## (`"tests/corpus/1.0.0"` -> `"1.0.0"`). NimScript's directory walkers
@@ -998,6 +1032,14 @@ task test, "Run tests":
     "-d:softlinkProbeOnly=- tests/tfail_probe_existence_no_target.nim"
   const probeNoTargetAnchor =
     "requires -d:softlinkProbeOnly=<CName> naming a real probed symbol"
+
+  # RFC-0001 §9/§C.1, slice C1a: codegen-order pinning check (see
+  # `expectWrapperBeforeLoad`'s doc comment above). Runs once, unconditionally,
+  # like the `expectManifestCompileOk`/`expectManifestCompileFail` checks
+  # above it — no OS-specific wording involved, so no three-way split.
+  const wrapperOrderCheck =
+    "nim c --compileOnly --path:src --expandMacro:dynlib tests/thint_noverify.nim"
+  expectWrapperBeforeLoad(wrapperOrderCheck)
 
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   if dirExists(protoOnlyDir): rmDir(protoOnlyDir)

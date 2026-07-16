@@ -1760,6 +1760,83 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       newNimNode(nnkConstDef).add(factsConstName, factsTypeNode, factsInit)
     ))
 
+  # Wrapper procs — RFC-0001 §9/§C.1, slice C1a: emitted here, BEFORE loadXxx,
+  # so a future `versionProbe:` body spliced into loadXxx (slice C1b) can call
+  # the block's own wrappers without a use-before-declaration error at the Nim
+  # top level. Pure codegen reorder: no wrapper here references anything
+  # loadXxx defines (temp syms, missing-seq, etc.), so this move is invisible
+  # to every existing caller — loadXxx never calls a wrapper today.
+  for p in procs:
+    let nameStr = newStrLitNode(p.nameStr)
+
+    # Build arg list for forwarding call
+    var callNode = newCall(p.ptrName)
+    for i in 1 ..< p.formalParams.len:
+      let identDefs = p.formalParams[i]
+      for j in 0 ..< identDefs.len - 2:
+        callNode.add(identDefs[j].copy())
+
+    # nil check + call
+    var wrapperBody = newStmtList()
+    wrapperBody.add(newIfStmt((
+      newCall(ident("isNil"), p.ptrName),
+      newStmtList(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
+    )))
+
+    if p.hasReturn:
+      wrapperBody.add(newNimNode(nnkReturnStmt).add(callNode))
+    else:
+      wrapperBody.add(callNode)
+
+    var params: seq[NimNode]
+    for i in 0 ..< p.formalParams.len:
+      params.add(p.formalParams[i].copy())
+
+    var wrapperProc = newProc(
+      name = postfix(p.name.copy(), "*"),
+      params = params,
+      body = wrapperBody,
+    )
+    wrapperProc.addPragma(newNimNode(nnkExprColonExpr).add(
+      ident("raises"),
+      newNimNode(nnkBracket).add(ident("SoftlinkError"))
+    ))
+    result.add(wrapperProc)
+
+    # xxxAvailable*(): bool for optional symbols
+    if p.isOptional:
+      let availName = ident(p.nameStr & "Available")
+      result.add(newProc(
+        name = postfix(availName, "*"),
+        params = [ident("bool")],
+        body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
+      ))
+
+    # xxxPtr*(): proc type — typed function pointer for C callback passing.
+    # Returns the dlsym'd pointer directly (nil if not loaded). No nil
+    # check — the load function is the single enforcement point.
+    # Return type matches the function pointer variable's type (cdecl + raises: [])
+    # so callers get type safety without the wrapper's SoftlinkError raises.
+    let ptrAccessorName = ident(p.nameStr & "Ptr")
+    var ptrReturnType = newNimNode(nnkProcTy)
+    ptrReturnType.add(p.formalParams.copy())
+    ptrReturnType.add(newNimNode(nnkPragma).add(
+      ident(p.callConv),
+      newNimNode(nnkExprColonExpr).add(
+        ident("raises"), newNimNode(nnkBracket)
+      )
+    ))
+    var ptrAccessorProc = newProc(
+      name = postfix(ptrAccessorName, "*"),
+      params = [ptrReturnType],
+      body = newStmtList(p.ptrName),
+    )
+    ptrAccessorProc.addPragma(newNimNode(nnkExprColonExpr).add(
+      ident("raises"),
+      newNimNode(nnkBracket)
+    ))
+    result.add(ptrAccessorProc)
+
   # loadXxx*(): LoadResult
   block:
     var hasOptional = false
@@ -1952,78 +2029,6 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     params = [ident("bool")],
     body = newStmtList(prefix(newCall(ident("isNil"), handleName), "not")),
   ))
-
-  # Wrapper procs
-  for p in procs:
-    let nameStr = newStrLitNode(p.nameStr)
-
-    # Build arg list for forwarding call
-    var callNode = newCall(p.ptrName)
-    for i in 1 ..< p.formalParams.len:
-      let identDefs = p.formalParams[i]
-      for j in 0 ..< identDefs.len - 2:
-        callNode.add(identDefs[j].copy())
-
-    # nil check + call
-    var wrapperBody = newStmtList()
-    wrapperBody.add(newIfStmt((
-      newCall(ident("isNil"), p.ptrName),
-      newStmtList(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
-    )))
-
-    if p.hasReturn:
-      wrapperBody.add(newNimNode(nnkReturnStmt).add(callNode))
-    else:
-      wrapperBody.add(callNode)
-
-    var params: seq[NimNode]
-    for i in 0 ..< p.formalParams.len:
-      params.add(p.formalParams[i].copy())
-
-    var wrapperProc = newProc(
-      name = postfix(p.name.copy(), "*"),
-      params = params,
-      body = wrapperBody,
-    )
-    wrapperProc.addPragma(newNimNode(nnkExprColonExpr).add(
-      ident("raises"),
-      newNimNode(nnkBracket).add(ident("SoftlinkError"))
-    ))
-    result.add(wrapperProc)
-
-    # xxxAvailable*(): bool for optional symbols
-    if p.isOptional:
-      let availName = ident(p.nameStr & "Available")
-      result.add(newProc(
-        name = postfix(availName, "*"),
-        params = [ident("bool")],
-        body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
-      ))
-
-    # xxxPtr*(): proc type — typed function pointer for C callback passing.
-    # Returns the dlsym'd pointer directly (nil if not loaded). No nil
-    # check — the load function is the single enforcement point.
-    # Return type matches the function pointer variable's type (cdecl + raises: [])
-    # so callers get type safety without the wrapper's SoftlinkError raises.
-    let ptrAccessorName = ident(p.nameStr & "Ptr")
-    var ptrReturnType = newNimNode(nnkProcTy)
-    ptrReturnType.add(p.formalParams.copy())
-    ptrReturnType.add(newNimNode(nnkPragma).add(
-      ident(p.callConv),
-      newNimNode(nnkExprColonExpr).add(
-        ident("raises"), newNimNode(nnkBracket)
-      )
-    ))
-    var ptrAccessorProc = newProc(
-      name = postfix(ptrAccessorName, "*"),
-      params = [ptrReturnType],
-      body = newStmtList(p.ptrName),
-    )
-    ptrAccessorProc.addPragma(newNimNode(nnkExprColonExpr).add(
-      ident("raises"),
-      newNimNode(nnkBracket)
-    ))
-    result.add(ptrAccessorProc)
 
 proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: CompatManifestDirective] =
   ## Parse a block of proc declarations for verification. Each must carry a
