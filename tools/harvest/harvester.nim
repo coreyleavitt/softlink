@@ -21,7 +21,8 @@
 ## the macro already understands (`softlinkProbeOnly`/`softlinkProbeExistence`,
 ## slice B2) — this module never re-derives or re-parses a binding, it only
 ## drives the compiler against the one that already exists.
-import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times, sequtils]
+import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times,
+            sequtils, monotimes]
 import softlink/versions
 
 export FactKind, abiTag
@@ -127,6 +128,24 @@ type
       ## doc comment for the full algorithm and soundness argument. Default
       ## `false`: this is opt-in, never a silent behavior change for an
       ## existing caller.
+    compileTimeoutMs*: int
+      ## Code-review finding F6: the wall-clock budget (milliseconds) given
+      ## to ONE `runProcess` subprocess invocation (one probe compile).
+      ## `defaultHarvestOptions` sets this to a generous 300_000 (5 minutes)
+      ## — real probe compiles take seconds; this only exists to turn a
+      ## genuinely-hung compiler process into a clear `HarvestError` instead
+      ## of a harvest that never returns. A caller building a custom
+      ## `HarvestOptions` literal (rather than starting from
+      ## `defaultHarvestOptions()`) must set this explicitly — see
+      ## `tests/tharvest_msvc_calibration_refusal.nim`'s `msvcDefaultOpts`
+      ## for the pattern.
+    maxOutputBytes*: int
+      ## Code-review finding F6: the accumulated-output cap (bytes) for ONE
+      ## `runProcess` invocation — a runaway/misbehaving compiler process
+      ## dumping unbounded diagnostics must not be read into memory without
+      ## limit. `defaultHarvestOptions` sets this to 16 MiB, comfortably
+      ## above any real compiler diagnostic output this harvester expects to
+      ## see.
 
   HarvestMeta* = object
     ## The `<lib>.compat.json` manifest's `"harvest"` object (RFC-0001 SS4
@@ -174,6 +193,8 @@ func defaultHarvestOptions*(): HarvestOptions =
     extraFlags: @["--passC:-Werror=implicit-function-declaration"],
     includeFlagPrefix: "-I",
     scratchDir: getTempDir(),
+    compileTimeoutMs: 300_000,
+    maxOutputBytes: 16_777_216,
   )
 
 # ---------------------------------------------------------------------------
@@ -340,6 +361,25 @@ proc enumerateCorpusVersions*(corpusDir: string): seq[string] =
             "/ exists on disk but " & manifestPath & " has no entry for it")
 
   disk.sort(cmpVersion)
+  # Code-review finding F1(a): `cmpVersion`'s digit-run parsing does not
+  # preserve leading zeros ("1.09" and "1.9" both parse to the run-sequence
+  # @[1, 9]), so two DIFFERENT on-disk directory names can compare EQUAL
+  # under the B0 total order. `compressFacts` (this module, below) assumes
+  # the corpus' version sequence is STRICTLY increasing when it builds run
+  # boundaries — an aliasing pair would silently let one string's facts get
+  # attributed to the other. Checking every ADJACENT pair after the sort
+  # above catches this in O(n), naming BOTH strings so the fix (rename one
+  # on disk, and in corpus.json if present) is unambiguous.
+  for i in 1 ..< disk.len:
+    if cmpVersion(disk[i - 1], disk[i]) == 0:
+      raise newException(HarvestError, "softlink harvest: corpus directory " &
+        "names '" & disk[i - 1] & "' and '" & disk[i] & "' compare EQUAL " &
+        "under softlink/versions.cmpVersion even though they are different " &
+        "strings -- this corpus cannot be harvested safely: interval " &
+        "compression (compressFacts) assumes a strictly-increasing version " &
+        "sequence and would silently misclassify one of these two " &
+        "directories' facts onto the other. Rename one of the two on disk " &
+        "(and in corpus.json, if present) to a non-aliasing version string.")
   disk
 
 # ---------------------------------------------------------------------------
@@ -369,19 +409,117 @@ proc freshDir(base: string): string =
   result = base / ("sl_harvest_" & $genOid())
   createDir(result)
 
-proc runProcess(exe: string, args: seq[string]): tuple[output: string, exitCode: int] =
+type
+  ReaderMsgKind = enum rmkChunk, rmkDone, rmkExceeded
+  ReaderMsg = object
+    case kind: ReaderMsgKind
+    of rmkChunk: data: string
+    of rmkDone, rmkExceeded: discard
+
+  ReaderArgs = tuple[process: Process, maxOutputBytes: int, chan: ptr Channel[ReaderMsg]]
+
+proc readOutputThread(args: ReaderArgs) {.thread.} =
+  ## Code-review finding F6: runs on its own `Thread` so `runProcess`'s main
+  ## loop can enforce a wall-clock deadline independently of how long any
+  ## single blocking read takes (a read on the child's stdout pipe can
+  ## block indefinitely if the child goes silent without exiting — exactly
+  ## the hang this finding is about). Reads in bounded 64KiB chunks,
+  ## forwarding each over `chan` to the main thread; if the running total
+  ## exceeds `maxOutputBytes` this thread itself kills the process (so a
+  ## runaway writer stops producing more output) and reports `rmkExceeded`
+  ## instead of continuing to read. `Channel` (not a raw shared `ptr
+  ## string`) is used deliberately — it is the stdlib's own thread-safe
+  ## transfer mechanism for exactly this "send value data from a worker
+  ## thread to its owner" shape, avoiding any GC/ownership hazard from
+  ## sharing a Nim `string` across threads by hand.
+  var buf = newString(65536)
+  let outp = args.process.outputStream
+  var total = 0
+  while true:
+    let n = outp.readData(addr buf[0], buf.len)
+    if n <= 0:
+      break
+    total += n
+    args.chan[].send(ReaderMsg(kind: rmkChunk, data: buf[0 ..< n]))
+    if total > args.maxOutputBytes:
+      try:
+        if running(args.process): kill(args.process)
+      except OSError:
+        discard
+      args.chan[].send(ReaderMsg(kind: rmkExceeded))
+      return
+  args.chan[].send(ReaderMsg(kind: rmkDone))
+
+proc runProcess*(exe: string, args: seq[string], timeoutMs, maxOutputBytes: int):
+    tuple[output: string, exitCode: int] =
   ## `startProcess` with explicit `args` (never a shell command string) —
   ## no quoting hazards for paths/defines containing spaces or shell
   ## metacharacters. stderr is merged into stdout so the assert-message
   ## confirmation (`assertMismatchNeedle`) can see compiler diagnostics
   ## regardless of which stream the toolchain wrote them to.
+  ##
+  ## Code-review finding F6: this is the ONE place the harvester shells out
+  ## to a real compiler, and it previously had no bound on either wall time
+  ## (a hung/slow-to-terminate compile would hang the whole harvest forever)
+  ## or accumulated output (`Stream.readAll()` has no size limit — a
+  ## misbehaving toolchain dumping unbounded diagnostics could exhaust
+  ## memory). Both are now bounded: a background thread
+  ## (`readOutputThread`) does the actual (necessarily blocking, per-chunk)
+  ## reads and enforces `maxOutputBytes` itself (killing the process and
+  ## stopping early if exceeded); this proc's own loop polls for that
+  ## thread's progress against a `timeoutMs` deadline and kills the process
+  ## if the deadline passes first. Either bound trips -> `HarvestError`,
+  ## never a silent truncation and never an indefinite hang. Exported
+  ## (`*`) so its bounded-time/bounded-output CONTRACT can be tested
+  ## directly (`tests/tharvest.nim`) against real subprocesses (`sleep`,
+  ## `yes`), not only observed indirectly through a full `harvest()` run.
   var p = startProcess(exe, args = args, options = {poStdErrToStdOut, poUsePath})
-  try:
-    let output = p.outputStream.readAll()
-    let code = p.waitForExit()
-    (output, code)
-  finally:
-    p.close()
+  var chan: Channel[ReaderMsg]
+  chan.open()
+  var thr: Thread[ReaderArgs]
+  createThread(thr, readOutputThread, (p, maxOutputBytes, addr chan))
+
+  var output = ""
+  var exceeded = false
+  var finished = false
+  var timedOut = false
+  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
+  while not finished:
+    let tried = chan.tryRecv()
+    if tried.dataAvailable:
+      case tried.msg.kind
+      of rmkChunk: output.add tried.msg.data
+      of rmkDone: finished = true
+      of rmkExceeded:
+        exceeded = true
+        finished = true
+    else:
+      if not timedOut and getMonoTime() >= deadline:
+        timedOut = true
+        try:
+          if running(p): kill(p)
+        except OSError:
+          discard
+        # Fall through and keep polling: killing the process closes its
+        # stdout pipe, so `readOutputThread`'s blocked read returns EOF
+        # promptly and it sends `rmkDone` — the loop above still exits via
+        # the normal `finished = true` path, just with `timedOut` recorded.
+      sleep(5)
+
+  joinThread(thr)
+  chan.close()
+  let exitCode = waitForExit(p)
+  p.close()
+
+  if timedOut:
+    raise newException(HarvestError, "softlink harvest: probe compile did " &
+      "not finish within " & $timeoutMs & "ms (HarvestOptions." &
+      "compileTimeoutMs) and was killed: " & exe & " " & args.join(" "))
+  if exceeded:
+    raise newException(HarvestError, "softlink harvest: probe compile " &
+      "output exceeded " & $maxOutputBytes & " bytes (HarvestOptions." &
+      "maxOutputBytes) and was killed: " & exe & " " & args.join(" "))
+  (output, exitCode)
 
 proc compileProbe(nimExe, modulePath, nimcacheRoot: string, opts: HarvestOptions,
                    includeDirs, defines: seq[string]): CompileOutcome =
@@ -404,7 +542,7 @@ proc compileProbe(nimExe, modulePath, nimcacheRoot: string, opts: HarvestOptions
     args.add("-d:" & d)
   args.add(opts.extraFlags)
   args.add(modulePath)
-  let (output, code) = runProcess(nimExe, args)
+  let (output, code) = runProcess(nimExe, args, opts.compileTimeoutMs, opts.maxOutputBytes)
   CompileOutcome(exitCode: code, output: output)
 
 proc probeOutcomes(nimExe, modulePath, versionDir, cName, nimcacheRoot: string,

@@ -6,7 +6,7 @@
 ## test` task's Linux branch (harvester probing is real `nim c` subprocess
 ## work — kept out of the main suite's hot path, mirrors this file's own
 ## dump-generation cost, one real compile per (version, symbol) probed).
-import std/[unittest, os, osproc, tables, strutils, json]
+import std/[unittest, os, osproc, tables, strutils, json, times]
 import ../tools/harvest/harvester
 import ../tools/harvest/harvest_cli
 import softlink/versions
@@ -519,3 +519,81 @@ suite "softlink_harvest CLI — packaged entry, drift alarm exit code (RFC-0001 
     check f3Sentence in output
 
 removeDir(dumpDir)
+
+# ---------------------------------------------------------------------------
+# Code-review finding F1(a): enumerateCorpusVersions must fail loudly on a
+# cmpVersion-aliasing pair of on-disk directory names (e.g. "1.09" and "1.9"
+# both parse to the run-sequence @[1, 9] — see softlink/versions'
+# parseVersion doc comment), not silently let one of the two get
+# misclassified by compressFacts' strictly-increasing-run assumption.
+# ---------------------------------------------------------------------------
+suite "enumerateCorpusVersions — cmpVersion-aliasing guard (code-review finding F1)":
+  let aliasDir = getTempDir() / "sl_harvest_alias_test_corpus"
+
+  test "aliasing directory names ('1.09' vs '1.9') raise HarvestError naming both":
+    if dirExists(aliasDir): removeDir(aliasDir)
+    createDir(aliasDir / "1.09")
+    createDir(aliasDir / "1.9")
+    createDir(aliasDir / "2.0")
+    var raised = false
+    var msg = ""
+    try:
+      discard enumerateCorpusVersions(aliasDir)
+    except HarvestError as e:
+      raised = true
+      msg = e.msg
+    removeDir(aliasDir)
+    check raised
+    check "1.09" in msg
+    check "1.9" in msg
+
+  test "non-aliasing directory names are unaffected (control)":
+    if dirExists(aliasDir): removeDir(aliasDir)
+    createDir(aliasDir / "1.9")
+    createDir(aliasDir / "1.10")
+    createDir(aliasDir / "2.0")
+    let versions = enumerateCorpusVersions(aliasDir)
+    removeDir(aliasDir)
+    check versions == @["1.9", "1.10", "2.0"]
+
+# ---------------------------------------------------------------------------
+# Code-review finding F6: the harvester's real `nim c` subprocess invocation
+# (`runProcess`) must never hang forever nor accumulate unbounded output —
+# both are real DoS/resource-exhaustion risks for a tool that shells out to
+# a compiler dozens of times per harvest. `runProcess` takes explicit
+# `timeoutMs`/`maxOutputBytes` bounds and raises `HarvestError` (never just
+# silently truncates or hangs) when either is exceeded. `sleep`/`yes`/`echo`
+# (real subprocesses via the SAME `startProcess` machinery `compileProbe`
+# uses, not a mock) exercise all three outcomes directly, kept well under a
+# few seconds of wall time by construction (small timeouts, small caps).
+# ---------------------------------------------------------------------------
+suite "runProcess — bounded time and output (code-review finding F6)":
+  test "a hanging child is killed after compileTimeoutMs and raises HarvestError":
+    let t0 = epochTime()
+    var raised = false
+    var msg = ""
+    try:
+      discard runProcess("sleep", @["30"], 200, 16_777_216)
+    except HarvestError as e:
+      raised = true
+      msg = e.msg
+    let elapsed = epochTime() - t0
+    check raised
+    check msg.len > 0
+    check elapsed < 5.0  # nowhere near the 30s the child would otherwise run
+
+  test "unbounded output is capped and raises HarvestError":
+    var raised = false
+    var msg = ""
+    try:
+      discard runProcess("yes", @[], 5_000, 1024)
+    except HarvestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check msg.len > 0
+
+  test "a normal, fast command still returns its real output and exit code":
+    let (output, exitCode) = runProcess("echo", @["hello"], 5_000, 16_777_216)
+    check "hello" in output
+    check exitCode == 0

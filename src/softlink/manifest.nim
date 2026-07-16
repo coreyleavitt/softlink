@@ -18,7 +18,7 @@
 ## `softlinkCompatFacts<Base>: seq[SymbolFacts]` (RFC §B.5) — so that later
 ## slice reuses this parse verbatim rather than repeating it.
 
-import std/[json, algorithm, options]
+import std/[json, algorithm, options, sets, streams]
 import ./versions
 
 export versions
@@ -62,6 +62,42 @@ proc requireKey(node: JsonNode, key, path, ctx: string): JsonNode =
       ": " & ctx & " missing required key '" & key & "'")
   node[key]
 
+func humanJsonKind(k: JsonNodeKind): string =
+  ## Human-readable name for a `JsonNodeKind`, used only in `expectStr`/
+  ## `expectInt`'s diagnostic text (findings F2/F7) — never load-bearing
+  ## logic, just wording.
+  case k
+  of JString: "a string"
+  of JInt: "an integer"
+  of JFloat: "a float"
+  of JBool: "a boolean"
+  of JNull: "null"
+  of JObject: "an object"
+  of JArray: "an array"
+
+proc expectStr(node: JsonNode, path, keyPath: string): string =
+  ## Findings F2/F7: `JsonNode.getStr` silently returns `""` when `node`
+  ## isn't actually a `JString` (same for `getInt`/`getBool`/etc. — a
+  ## std/json quirk, not an error) — so a manifest with e.g. `{"lo": 4.16}`
+  ## or `{"schema": "1"}` would silently coerce to a wrong-but-plausible
+  ## default instead of failing loudly, exactly the "silent partial read"
+  ## this module's own doc comment says `parseManifest` must never produce.
+  ## `keyPath` is a human-readable locator (e.g. `"harvest.abi"`, `"symbol
+  ## 'foo'.header.verified[].lo"`) for the diagnostic, not a real JSONPath.
+  if node.kind != JString:
+    raise newException(ManifestError, "softlink: compat manifest " & path &
+      ": '" & keyPath & "' must be a string, got " & humanJsonKind(node.kind))
+  node.getStr
+
+proc expectInt(node: JsonNode, path, keyPath: string): int =
+  ## The `expectStr` twin for integer scalars (F2/F7) — `"schema"` is the
+  ## one call site today, but this stays general (any future integer-typed
+  ## manifest field gets the same guard for free).
+  if node.kind != JInt:
+    raise newException(ManifestError, "softlink: compat manifest " & path &
+      ": '" & keyPath & "' must be an integer, got " & humanJsonKind(node.kind))
+  node.getInt
+
 proc parseIntervalArray(node: JsonNode, path, cname, key: string): seq[VersionInterval] =
   if node.kind != JArray:
     raise newException(ManifestError, "softlink: compat manifest " & path &
@@ -71,9 +107,88 @@ proc parseIntervalArray(node: JsonNode, path, cname, key: string): seq[VersionIn
       raise newException(ManifestError, "softlink: compat manifest " & path &
         ": symbol '" & cname & "'.header." & key & " has a non-object interval entry")
     var iv: VersionInterval
-    if ivNode.hasKey("lo"): iv.lo = ivNode["lo"].getStr
-    if ivNode.hasKey("hi"): iv.hi = ivNode["hi"].getStr
+    let ivPath = "symbol '" & cname & "'.header." & key & "[]"
+    if ivNode.hasKey("lo"): iv.lo = expectStr(ivNode["lo"], path, ivPath & ".lo")
+    if ivNode.hasKey("hi"): iv.hi = expectStr(ivNode["hi"], path, ivPath & ".hi")
     result.add iv
+
+const maxManifestBreadth = 1_000_000
+  ## Finding F16: `validateDisjointExhaustive` is
+  ## O(symbols.len * corpus.len * FactKind.len * intervals-per-cell) with no
+  ## bound of its own — a huge (hostile or merely corrupted) manifest read
+  ## via `staticRead` at macro-expansion time could hang the compiler. This
+  ## cap is checked using ONLY `symbolsNode.len`/`result.corpus.len` (both
+  ## O(1) once the corpus array is parsed — `JsonNode.len` on a `JObject`/
+  ## `JArray` is the underlying table/seq's own stored count, not a walk),
+  ## so rejecting a hostile manifest never requires doing anything close to
+  ## the O(product) work the cap exists to prevent. A REAL manifest is
+  ## nowhere near this: even a sprawling C library rarely exceeds a few
+  ## thousand bound symbols, and a realistic harvested corpus is at most a
+  ## few hundred versions — `symbols.len * corpus.len` comfortably stays
+  ## under five figures in genuine use, so 1,000,000 can never reject a
+  ## real manifest, only a deliberately-inflated or corrupted one.
+
+proc checkNoDuplicateKeys(jsonText, path: string) =
+  ## Finding F8: `std/json`'s own parser silently folds duplicate object
+  ## keys before `parseJson` ever returns a tree — `JObject` is backed by an
+  ## ordered table whose `[]=` just overwrites, so a hand-merged manifest
+  ## with e.g. two `"verified"` facts under one symbol, or two `"lo"` keys
+  ## in one interval object, would silently lose data with no diagnostic
+  ## at all. This walks the RAW text as a flat token/event stream via
+  ## `std/parsejson` (re-exported through `std/json`, so no new import is
+  ## needed — see that module's `export parsejson.JsonEventKind, ...,
+  ## JsonParser, open, close, str, kind, next, ...` line), tracking the set
+  ## of keys seen at each currently-open object nesting level, and raises
+  ## `ManifestError` naming the first duplicate found.
+  ##
+  ## Deliberately does NOT diagnose malformed JSON itself: the loop simply
+  ## stops the instant the tokenizer reports `jsonError` (or hits `jsonEof`
+  ## early), leaving `parseJson` — called right after this, in
+  ## `parseManifest` — as the one place a syntax error is ever reported, so
+  ## the two checks never produce conflicting diagnoses for the same input.
+  type Frame = object
+    isObject: bool
+    expectKey: bool   ## only meaningful when `isObject`
+    keys: HashSet[string]
+  var stack: seq[Frame] = @[]
+  var p: JsonParser
+  var s = newStringStream(jsonText)
+  open(p, s, path)
+  try:
+    next(p)
+    while p.kind notin {jsonEof, jsonError}:
+      case p.kind
+      of jsonObjectStart:
+        stack.add Frame(isObject: true, expectKey: true, keys: initHashSet[string]())
+      of jsonArrayStart:
+        stack.add Frame(isObject: false)
+      of jsonObjectEnd, jsonArrayEnd:
+        if stack.len > 0: discard stack.pop()
+        if stack.len > 0 and stack[^1].isObject: stack[^1].expectKey = true
+      of jsonString, jsonInt, jsonFloat, jsonTrue, jsonFalse, jsonNull:
+        if stack.len > 0 and stack[^1].isObject and stack[^1].expectKey:
+          let key =
+            case p.kind
+            of jsonString: str(p)
+            of jsonInt: $getInt(p)
+            of jsonFloat: $getFloat(p)
+            of jsonTrue: "true"
+            of jsonFalse: "false"
+            of jsonNull: "null"
+            else: ""
+          if key in stack[^1].keys:
+            raise newException(ManifestError, "softlink: compat manifest " &
+              path & ": duplicate key '" & key & "' in the same JSON object " &
+              "-- softlink refuses to silently keep only the last one")
+          stack[^1].keys.incl key
+          stack[^1].expectKey = false
+        elif stack.len > 0 and stack[^1].isObject:
+          stack[^1].expectKey = true
+      else:
+        discard
+      next(p)
+  finally:
+    close(p)
 
 proc parseManifest*(jsonText, path: string): CompatManifest =
   ## Parses `jsonText` (the manifest file's contents; `path` is used only
@@ -82,6 +197,8 @@ proc parseManifest*(jsonText, path: string): CompatManifest =
   ## `CompatManifest`. Raises `ManifestError` — never returns a partially-
   ## populated manifest — on any structurally malformed input, per §B.3's
   ## "never a silent partial read".
+  checkNoDuplicateKeys(jsonText, path)
+
   var j: JsonNode
   try:
     j = parseJson(jsonText)
@@ -92,10 +209,11 @@ proc parseManifest*(jsonText, path: string): CompatManifest =
     raise newException(ManifestError,
       "softlink: compat manifest " & path & ": top level must be a JSON object")
 
-  result.schema = requireKey(j, "schema", path, "manifest").getInt
-  result.lib = requireKey(j, "lib", path, "manifest").getStr
+  result.schema = expectInt(requireKey(j, "schema", path, "manifest"), path, "schema")
+  result.lib = expectStr(requireKey(j, "lib", path, "manifest"), path, "lib")
   let harvestNode = requireKey(j, "harvest", path, "manifest")
-  result.abi = requireKey(harvestNode, "abi", path, "manifest.harvest").getStr
+  result.abi = expectStr(requireKey(harvestNode, "abi", path, "manifest.harvest"),
+    path, "harvest.abi")
 
   let corpusNode = requireKey(j, "corpus", path, "manifest")
   if corpusNode.kind != JArray:
@@ -103,14 +221,32 @@ proc parseManifest*(jsonText, path: string): CompatManifest =
       "softlink: compat manifest " & path & ": 'corpus' must be an array")
   var corpusVersions: seq[string] = @[]
   for entry in corpusNode:
-    corpusVersions.add requireKey(entry, "version", path, "manifest.corpus[]").getStr
+    corpusVersions.add expectStr(
+      requireKey(entry, "version", path, "manifest.corpus[]"), path, "corpus[].version")
   corpusVersions.sort(cmpVersion)
+  for i in 1 ..< corpusVersions.len:
+    if cmpVersion(corpusVersions[i - 1], corpusVersions[i]) == 0:
+      raise newException(ManifestError, "softlink: compat manifest " & path &
+        ": corpus versions '" & corpusVersions[i - 1] & "' and '" &
+        corpusVersions[i] & "' compare EQUAL under softlink/versions." &
+        "cmpVersion even though they are different strings (finding F1) -- " &
+        "compressFacts' interval-compression assumes a strictly-increasing " &
+        "version sequence and would silently misattribute one of these " &
+        "two versions' facts onto the other; rename one to a non-aliasing " &
+        "version string")
   result.corpus = corpusVersions
 
   let symbolsNode = requireKey(j, "symbols", path, "manifest")
   if symbolsNode.kind != JObject:
     raise newException(ManifestError,
       "softlink: compat manifest " & path & ": 'symbols' must be an object")
+  if symbolsNode.len * max(1, result.corpus.len) > maxManifestBreadth:
+    raise newException(ManifestError, "softlink: compat manifest " & path &
+      ": too large to validate safely (" & $symbolsNode.len & " symbols x " &
+      $result.corpus.len & " corpus versions = " &
+      $(symbolsNode.len * result.corpus.len) & " > " & $maxManifestBreadth &
+      ") -- refusing before running disjoint/exhaustive validation over it " &
+      "(finding F16)")
   for cname, symNode in symbolsNode:
     let headerNode = requireKey(symNode, "header", path, "manifest.symbols." & cname)
     if headerNode.kind != JObject:

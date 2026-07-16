@@ -1364,3 +1364,154 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
 
   test "formatInterval: unbounded both ways -> non-empty fallback text":
     check formatInterval(VersionInterval(lo: "", hi: "")).len > 0
+
+# Code-review findings (2026-07 round 1, RFC-0001 §B.3/§B.5 hardening;
+# IDs F1/F2/F7/F8/F16 refer to that review's ledger). Every test below
+# drives `parseManifest` directly against a
+# hand-built JSON string (never the golden fixture's `%*` construction,
+# which can't even EXPRESS a duplicate key), asserting the parse fails
+# loudly rather than silently corrupting/discarding data.
+suite "softlink/manifest — fail-loud hardening (code-review findings F1/F2/F7/F8/F16)":
+  test "parseManifest: cmpVersion-aliasing corpus versions raise ManifestError naming both (F1)":
+    # "1.09" and "1.9" both parse to the run-sequence @[1, 9] (leading zeros
+    # are not preserved by parseVersion's digit-run accumulation), so
+    # cmpVersion says they are EQUAL even though they are different corpus
+    # directory/version strings — compressFacts' run-boundary logic assumes
+    # a strictly-increasing sequence and would silently misattribute one
+    # string's facts to the other.
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[{"version":"1.09"},{"version":"1.9"},{"version":"2.0"}],
+      "symbols":{}}"""
+    var raised = false
+    var msg = ""
+    try:
+      discard parseManifest(text, "bogus.json")
+    except ManifestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "1.09" in msg
+    check "1.9" in msg
+
+  test "parseManifest: non-aliasing corpus versions are unaffected (F1 control)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[{"version":"1.9"},{"version":"1.10"},{"version":"2.0"}],
+      "symbols":{}}"""
+    let m = parseManifest(text, "bogus.json")
+    check m.corpus == @["1.9", "1.10", "2.0"]
+
+  test "parseManifest: wrong-kind interval 'lo' (a float) raises ManifestError naming the key (F2)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{"foo":{"header":{"verified":[{"lo":4.16}]}}}}"""
+    var raised = false
+    var msg = ""
+    try:
+      discard parseManifest(text, "bogus.json")
+    except ManifestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "lo" in msg
+
+  test "parseManifest: wrong-kind interval 'hi' (a bool) raises ManifestError naming the key (F2)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{"foo":{"header":{"verified":[{"hi":true}]}}}}"""
+    var raised = false
+    var msg = ""
+    try:
+      discard parseManifest(text, "bogus.json")
+    except ManifestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "hi" in msg
+
+  test "parseManifest: string schema (\"1\" instead of 1) raises ManifestError (F7)":
+    let text = """{"schema":"1","lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{}}"""
+    expect(ManifestError):
+      discard parseManifest(text, "bogus.json")
+
+  test "parseManifest: float schema (1.5) raises ManifestError (F7)":
+    let text = """{"schema":1.5,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{}}"""
+    expect(ManifestError):
+      discard parseManifest(text, "bogus.json")
+
+  test "parseManifest: non-string lib raises ManifestError (F7)":
+    let text = """{"schema":1,"lib":42,"harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{}}"""
+    expect(ManifestError):
+      discard parseManifest(text, "bogus.json")
+
+  test "parseManifest: non-string harvest.abi raises ManifestError (F7)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":123},
+      "corpus":[],"symbols":{}}"""
+    expect(ManifestError):
+      discard parseManifest(text, "bogus.json")
+
+  test "parseManifest: non-string corpus[].version raises ManifestError (F7)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[{"version":1.0}],"symbols":{}}"""
+    expect(ManifestError):
+      discard parseManifest(text, "bogus.json")
+
+  test "parseManifest: duplicate top-level key raises ManifestError naming it (F8)":
+    let text = """{"schema":1,"schema":2,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{}}"""
+    var raised = false
+    var msg = ""
+    try:
+      discard parseManifest(text, "bogus.json")
+    except ManifestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "schema" in msg
+
+  test "parseManifest: duplicate symbol key raises ManifestError naming it (F8)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{"foo":{"header":{}},"foo":{"header":{}}}}"""
+    var raised = false
+    var msg = ""
+    try:
+      discard parseManifest(text, "bogus.json")
+    except ManifestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "foo" in msg
+
+  test "parseManifest: duplicate fact key inside one symbol's header raises ManifestError naming it (F8)":
+    let text = """{"schema":1,"lib":"x","harvest":{"abi":"linux-lp64"},
+      "corpus":[],"symbols":{"foo":{"header":{"verified":[],"verified":[{"lo":"1.0.0"}]}}}}"""
+    var raised = false
+    var msg = ""
+    try:
+      discard parseManifest(text, "bogus.json")
+    except ManifestError as e:
+      raised = true
+      msg = e.msg
+    check raised
+    check "verified" in msg
+
+  test "parseManifest: hostile large-breadth manifest raises ManifestError before validation (F16)":
+    # `validateDisjointExhaustive` is O(symbols * corpus * FactKind * intervals)
+    # with no bound of its own; a hostile (or merely huge) manifest read via
+    # `staticRead` at macro-expansion time could hang the compiler. This
+    # builds a manifest whose symbols.len * corpus.len crosses 1_000_000
+    # using only ~2000 total JSON object entries (1000 corpus x 1001
+    # symbols) — a few actual bytes, not a multi-megabyte fixture — proving
+    # the cap check itself is cheap (it must reject BEFORE doing anything
+    # resembling the O(product) work it exists to prevent).
+    var corpusParts: seq[string] = @[]
+    for i in 0 ..< 1000:
+      corpusParts.add("{\"version\":\"1." & $i & ".0\"}")
+    var symbolParts: seq[string] = @[]
+    for i in 0 ..< 1001:
+      symbolParts.add("\"sym" & $i & "\":{\"header\":{}}")
+    let text = "{\"schema\":1,\"lib\":\"x\",\"harvest\":{\"abi\":\"linux-lp64\"}," &
+      "\"corpus\":[" & corpusParts.join(",") & "]," &
+      "\"symbols\":{" & symbolParts.join(",") & "}}"
+    expect(ManifestError):
+      discard parseManifest(text, "bogus.json")

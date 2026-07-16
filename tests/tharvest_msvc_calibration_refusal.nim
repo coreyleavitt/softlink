@@ -44,6 +44,14 @@ let msvcDefaultOpts = HarvestOptions(
   extraFlags: @["--cc:vcc"],
   includeFlagPrefix: "/I",
   scratchDir: getTempDir(),
+  # Code-review finding F6: HarvestOptions gained explicit compile-time/
+  # output-size bounds; a hand-built literal (unlike defaultHarvestOptions())
+  # must set them itself or every probe compile here would get a 0ms/0-byte
+  # budget and fail immediately. Same generous defaults as
+  # defaultHarvestOptions() — this test isn't exercising F6, so it should
+  # behave exactly as it did before that finding's fix.
+  compileTimeoutMs: 300_000,
+  maxOutputBytes: 16_777_216,
 )
 
 suite "runCalibration refuses under default-mode MSVC (RFC-0001 slice B3)":
