@@ -1783,6 +1783,74 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ## form) — see the design guidance's "one AST-generating helper" call.
     newAssignment(compatReportName, compatReportObjConstr(fields))
 
+  proc unwindStmt(unloadHandle: bool, resultKind: NimNode,
+                   resultFields: seq[(string, NimNode)] = @[],
+                   reportFields: seq[(string, NimNode)] = @[]): NimNode =
+    ## RFC-0001 §9/§C.3-C.4, slice C4a: the shared cleanup/unwind AST
+    ## helper — "Phase-1 early-fail, post-probe required unwind, optional
+    ## re-nil ... one generator, behavior-preserving for the existing path"
+    ## (RFC §9 C4a; motivating note at RFC §C.3 lines 641-645). A closure
+    ## over `handleName` (like `reentrancyRaiseStmt`/`assignCompatReportStmt`
+    ## above), building ONE statement-list shape:
+    ##   [unloadLib(handle); handle = nil]   -- only when `unloadHandle`
+    ##   softlinkCompatReport<Base> = CompatReport(reportFields...)
+    ##   return LoadResult(kind: resultKind, resultFields...)
+    ##
+    ## Two shapes are wired TODAY, both pure extractions of previously-inline
+    ## code (no behavior change):
+    ##   - lrLibNotFound (`loadLibPattern` returned nil — there is no handle
+    ##     to unload yet): unwindStmt(unloadHandle = false,
+    ##     resultKind = ident("lrLibNotFound"))
+    ##   - Phase-1 required-symbol early-fail (`symAddr` returned nil before
+    ##     any function pointer was assigned): unwindStmt(unloadHandle = true,
+    ##     resultKind = ident("lrSymbolNotFound"),
+    ##     resultFields = @[("symbol", symName)])
+    ## Both currently pass `reportFields = @[]` (the zero-state report is
+    ## correct pre-first-load / right after unloadX resets state) — already
+    ## threaded through so C4c can pass a non-empty (drift-story) report
+    ## without touching this proc.
+    ##
+    ## Future extensions (NOT implemented by this slice — nothing below may
+    ## call a code path this slice doesn't already exercise):
+    ##   - C4c's post-probe required unwind is the SAME return-path frame,
+    ##     firing later in the pipeline (after Phase 3 has assigned pointers
+    ##     and the probe has run), so it needs two more leading cleanup
+    ##     steps before the existing unload/report/return tail: nil every
+    ##     already-assigned function-pointer var, and reset the probe state
+    ##     vars (`softlinkProbedVersion<Base>`/`softlinkProbeFailed<Base>`,
+    ##     mirroring unloadX's own reset shape at its call site, without
+    ##     touching unloadX itself). Purely additive params, e.g.
+    ##     `resetPtrs: seq[NimNode] = @[]` and `resetProbeState: bool =
+    ##     false`, defaulting to today's exact behavior — shape-1/shape-2
+    ##     call sites need no change when these land.
+    ##   - C4b's optional re-nil (re-nil one already-resolved optional
+    ##     pointer + add its name to the `missing` set) is NOT a return-path
+    ##     cleanup: the pipeline keeps running to classify the remaining
+    ##     symbols, so neither the compat-report assignment nor the
+    ##     `return` at the tail of this shape may fire — only the leading
+    ##     cleanup steps should. Still the SAME domain problem (unwinding a
+    ##     symbol this load is walking back), so the read here is that it
+    ##     belongs in this SAME generator behind a `terminal: bool = true`
+    ##     toggle (false skips the report-assign + return, emitting only
+    ##     the cleanup prefix) plus a `missingAdd` piece (nil the one ptr,
+    ##     `missingVar.add(symName)`) — every existing and future shape is
+    ##     then a true subset of one ordered action list, not two
+    ##     unrelated things forced together. Flagged here as the part of
+    ##     this design I'm least sure of: if a future implementer's
+    ##     analysis disagrees once C4b's actual shape is in front of them,
+    ##     that's grounds to split it into a sibling helper instead — this
+    ##     doc comment is a proposal, not a locked contract.
+    result = newStmtList()
+    if unloadHandle:
+      result.add(newCall(ident("unloadLib"), handleName))
+      result.add(newAssignment(handleName, newNilLit()))
+    result.add(assignCompatReportStmt(reportFields))
+    var resultConstr = newNimNode(nnkObjConstr).add(ident("LoadResult"))
+    resultConstr.add(newNimNode(nnkExprColonExpr).add(ident("kind"), resultKind))
+    for (fieldName, valNode) in resultFields:
+      resultConstr.add(newNimNode(nnkExprColonExpr).add(ident(fieldName), valNode))
+    result.add(newNimNode(nnkReturnStmt).add(resultConstr))
+
   result = newStmtList()
 
   # Duplicate-block guard. Two dynlib blocks whose patterns derive the same
@@ -2180,15 +2248,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # here, not merely a placeholder) + return LoadResult(kind: lrLibNotFound)
     loadBody.add(newIfStmt((
       newCall(ident("isNil"), handleName),
-      newStmtList(
-        assignCompatReportStmt(),
-        newNimNode(nnkReturnStmt).add(
-          newNimNode(nnkObjConstr).add(
-            ident("LoadResult"),
-            newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrLibNotFound"))
-          )
-        )
-      )
+      unwindStmt(unloadHandle = false, resultKind = ident("lrLibNotFound"))
     )))
 
     # Collect temp sym names for deferred assignment
@@ -2221,17 +2281,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # if sym.isNil: unload + nil handle + zero-state compat report
       # (RFC-0001 §9/§C.2 — same "probe never ran" reasoning as the
       # lrLibNotFound early return above) + return lrSymbolNotFound
-      var cleanupBlock = newStmtList()
-      cleanupBlock.add(newCall(ident("unloadLib"), handleName))
-      cleanupBlock.add(newAssignment(handleName, newNilLit()))
-      cleanupBlock.add(assignCompatReportStmt())
-      cleanupBlock.add(newNimNode(nnkReturnStmt).add(
-        newNimNode(nnkObjConstr).add(
-          ident("LoadResult"),
-          newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrSymbolNotFound")),
-          newNimNode(nnkExprColonExpr).add(ident("symbol"), symName)
-        )
-      ))
+      let cleanupBlock = unwindStmt(unloadHandle = true,
+        resultKind = ident("lrSymbolNotFound"), resultFields = @[("symbol", symName)])
       loadBody.add(newIfStmt((newCall(ident("isNil"), tempSym), cleanupBlock)))
 
       syms.add(SymInfo(ptrName: p.ptrName, tempSym: tempSym, procTy: procTy, isOptional: false))
