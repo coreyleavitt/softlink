@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "lib": "testlib",
+  "harvest": {
+    "toolchain": "fixture",
+    "tier": "builtin-compat",
+    "abi": "${ABI}",
+    "date": "2026-01-01"
+  },
+  "corpus": [
+    { "version": "1.0.0", "source": "git:example/testlib@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "version": "2.0.0", "source": "git:example/testlib@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    { "version": "3.0.0", "source": "git:example/testlib@cccccccccccccccccccccccccccccccccccccccc" },
+    { "version": "4.0.0", "source": "git:example/testlib@dddddddddddddddddddddddddddddddddddddddd" }
+  ],
+  "symbols": {
+    "testlib_add": {
+      "header": {
+        "verified": [{}]
+      }
+    },
+    "testlib_gated": {
+      "header": {
+        "verified": [{ "hi": "4.0.0" }],
+        "mismatch": [{ "lo": "4.0.0" }]
+      }
+    },
+    "testlib_magic": {
+      "header": {
+        "verified": [{ "hi": "4.0.0" }],
+        "mismatch": [{ "lo": "4.0.0" }]
+      }
+    },
+    "testlib_future": {
+      "header": {
+        "absent": [{}]
+      }
+    }
+  }
+}

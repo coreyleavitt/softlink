@@ -8,6 +8,11 @@ tests/tharvest_msvc_calibration_refusal
 # runtime binary (built by `runCompatReportManifestChecks` in the nimble
 # test task).
 tests/tcompat_report_manifest
+# RFC-0001 §C.3, slice C4c: tests/tcompat_drift_required.nim's and
+# tests/tcompat_drift_refuse_false.nim's own runtime binaries (built by
+# `runDriftRequiredChecks` in the nimble test task).
+tests/tcompat_drift_required
+tests/tcompat_drift_refuse_false
 # RFC-0001 slice B5: tests/tharvest.nim's drift-alarm exit-code integration
 # test compiles+runs the harvester CLI shim itself (`nim c -r
 # tools/harvest/harvester.nim ...`), which builds this binary in place.

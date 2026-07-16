@@ -1129,6 +1129,33 @@ const softlinkProbeExistence {.booldefine.} = false
   ## meaningless (the fast path's bisection only ever runs multi-symbol
   ## compiles in verify mode).
 
+const softlinkNoDriftRefusal {.booldefine.} = false
+  ## RFC-0001 §C.3, slice C4c: `-d:softlinkNoDriftRefusal` — the
+  ## downstream-consumer-scoped escape hatch ("a vendor rebuilding a
+  ## patched library under the same version string the manifest classified
+  ## as mismatched"). Disables RUNTIME drift refusal build-wide: every
+  ## `dynlib` block in this compile behaves as if EVERY `compatManifest`
+  ## directive carried `refuse = false`, regardless of what any individual
+  ## block's own directive says (this define wins — see
+  ## `driftRefusalEnabled`'s computation in the `dynlib` macro).
+  ##
+  ## Read at MACRO-EXPANSION time via `{.booldefine.}`, exactly like
+  ## `softlinkProbeExistence` immediately above (and `softlinkProbeOnly`,
+  ## `softlinkDumpProbes`, `softlinkStrictVerify` elsewhere in this file) —
+  ## NOT emitted as a `when defined(...)` into the generated code. `dynlib`
+  ## expands as part of the SAME single `nim c -d:...` compiler invocation
+  ## that compiles the consuming module (Nim compiles a whole program in
+  ## one process), so a build-wide `-d:` flag is exactly as visible to a
+  ## `{.booldefine.}` const evaluated during macro expansion as it is
+  ## anywhere else — this is proven, not assumed: every one of those
+  ## existing consts already relies on the identical mechanism, and their
+  ## own tests (this file's `nimble test` task) already pass under
+  ## `-d:softlinkStrictVerify`/`-d:softlinkProbeOnly=...` today. Gating at
+  ## macro time additionally means refusal codegen is skipped ENTIRELY
+  ## under the define — no dead `when` branch, no doubled candidate lists —
+  ## the same "cleanest degradation" property `refuse = false` gets per
+  ## block (see `driftRefusalEnabled`).
+
 proc parseProbeOnlyList(raw: string, posNode: NimNode): seq[string] =
   ## RFC-0001 §4 B.2, slice B7: parses a non-empty, non-`"-"`
   ## `softlinkProbeOnly` value into its list of target C names. Callers
@@ -1863,7 +1890,9 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
   proc unwindStmt(unloadHandle: bool, resultKind: NimNode,
                    resultFields: seq[(string, NimNode)] = @[],
-                   reportFields: seq[(string, NimNode)] = @[]): NimNode =
+                   reportFields: seq[(string, NimNode)] = @[],
+                   resetPtrs: seq[NimNode] = @[],
+                   resetProbeState: bool = false): NimNode =
     ## RFC-0001 §9/§C.3-C.4, slice C4a: the shared cleanup/unwind AST
     ## helper — "Phase-1 early-fail, post-probe required unwind, optional
     ## re-nil ... one generator, behavior-preserving for the existing path"
@@ -1888,37 +1917,57 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ## threaded through so C4c can pass a non-empty (drift-story) report
     ## without touching this proc.
     ##
-    ## Future extensions (NOT implemented by this slice — nothing below may
-    ## call a code path this slice doesn't already exercise):
-    ##   - C4c's post-probe required unwind is the SAME return-path frame,
-    ##     firing later in the pipeline (after Phase 3 has assigned pointers
-    ##     and the probe has run), so it needs two more leading cleanup
-    ##     steps before the existing unload/report/return tail: nil every
-    ##     already-assigned function-pointer var, and reset the probe state
-    ##     vars (`softlinkProbedVersion<Base>`/`softlinkProbeFailed<Base>`,
-    ##     mirroring unloadX's own reset shape at its call site, without
-    ##     touching unloadX itself). Purely additive params, e.g.
-    ##     `resetPtrs: seq[NimNode] = @[]` and `resetProbeState: bool =
-    ##     false`, defaulting to today's exact behavior — shape-1/shape-2
-    ##     call sites need no change when these land.
-    ##   - C4b's optional re-nil (re-nil one already-resolved optional
-    ##     pointer + add its name to the `missing` set) is NOT a return-path
-    ##     cleanup: the pipeline keeps running to classify the remaining
-    ##     symbols, so neither the compat-report assignment nor the
-    ##     `return` at the tail of this shape may fire — only the leading
-    ##     cleanup steps should. Still the SAME domain problem (unwinding a
-    ##     symbol this load is walking back), so the read here is that it
-    ##     belongs in this SAME generator behind a `terminal: bool = true`
-    ##     toggle (false skips the report-assign + return, emitting only
-    ##     the cleanup prefix) plus a `missingAdd` piece (nil the one ptr,
-    ##     `missingVar.add(symName)`) — every existing and future shape is
-    ##     then a true subset of one ordered action list, not two
-    ##     unrelated things forced together. Flagged here as the part of
-    ##     this design I'm least sure of: if a future implementer's
-    ##     analysis disagrees once C4b's actual shape is in front of them,
-    ##     that's grounds to split it into a sibling helper instead — this
-    ##     doc comment is a proposal, not a locked contract.
+    ## RFC-0001 §C.3, slice C4c: a THIRD shape is now wired, additively —
+    ## the post-probe REQUIRED-symbol drift-refusal unwind (see the
+    ## `dynlib` macro's `requiredDriftCandidates` loop, inside the
+    ## `atAttested` branch of `loadXxx`): unwindStmt(unloadHandle = true,
+    ## resultKind = ident("lrSymbolNotFound"), resultFields = @[("symbol",
+    ## symName)], reportFields = @[("runtimeVersion", ...), ("attestation",
+    ## ident("atAttested")), ("missing", ...)], resetPtrs = <every proc's
+    ## ptrName in this block>, resetProbeState = true). Firing later in the
+    ## pipeline than the other two shapes (after Phase 3 has assigned every
+    ## pointer and the probe has run) is exactly why the two NEW leading
+    ## cleanup steps below exist: nil every already-assigned function-
+    ## pointer var (`resetPtrs`, mirroring unloadX's own per-proc reset
+    ## loop), and reset the probe state vars (`resetProbeState`, mirroring
+    ## unloadX's own `softlinkProbedVersion<Base>`/`softlinkProbeFailed
+    ## <Base>` reset) — both purely additive params defaulting to `@[]`/
+    ## `false`, so shape-1/shape-2 call sites (`unloadHandle = false` for
+    ## `lrLibNotFound`; the Phase-1 required-symbol early-fail) need no
+    ## change and their generated output stays token-identical (see
+    ## `tests/tcompat_drift_required.nim`'s use of this third shape, and
+    ## the C4c handoff for the `expandMacro` diff proving shapes 1/2 are
+    ## unaffected).
+    ##
+    ## `resetProbeState`'s ordering here — leading cleanup, BEFORE the
+    ## report assignment below — means a caller must never pass the LIVE
+    ## `softlinkProbedVersion<Base>` node itself as a `reportFields`
+    ## `runtimeVersion` value when also passing `resetProbeState = true`:
+    ## by the time the report-assign statement executes, that var has
+    ## already been reset to `""`. Callers needing both must snapshot the
+    ## probed version into their OWN `let` BEFORE calling this proc, and
+    ## pass that snapshot instead — a plain Nim `string` `let` copies the
+    ## value, so the snapshot is unaffected by the reset that follows it
+    ## (this is the "report snapshots the string value — safe" resolution
+    ## flagged in the C4c slice brief). See the required-refusal call site
+    ## for the snapshot in practice.
+    ##
+    ## Historical note: C4b's optional re-nil (re-nil one already-resolved
+    ## optional pointer + add its name to the `missing` set) does NOT go
+    ## through this proc — it is not a return-path cleanup at all (the
+    ## pipeline keeps running to classify the remaining symbols, so neither
+    ## a compat-report assignment nor a `return` may fire for it), so C4b
+    ## implemented it inline in the `dynlib` macro's `atAttested` branch
+    ## instead of forcing it through a `terminal: bool` toggle here, as an
+    ## earlier draft of this comment had proposed. This proc stays scoped
+    ## to genuine return-path unwinds (all three shapes above share exactly
+    ## that structure); C4c's required-refusal shape confirms the fit.
     result = newStmtList()
+    for ptrNode in resetPtrs:
+      result.add(newAssignment(ptrNode, newNilLit()))
+    if resetProbeState:
+      result.add(newAssignment(probedVersionName, newStrLitNode("")))
+      result.add(newAssignment(probeFailedName, newLit(false)))
     if unloadHandle:
       result.add(newCall(ident("unloadLib"), handleName))
       result.add(newAssignment(handleName, newNilLit()))
@@ -2196,33 +2245,53 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   if appliedManifest.attached and hasProbe and mismatchCNames.len > 0:
     discard scanProbeBodyForDriftCalls(versionProbeDirective.bodyStmts, mismatchCNames)
 
-  # RFC-0001 §C.3, slice C4b: the OPTIONAL subset of `mismatchCNames` —
-  # the only symbols eligible for the RUNTIME drift refusal this slice
-  # implements (required-symbol refusal is C4c's). Refusal also requires
-  # a probe (no probed version, no refusal is ever possible), so this
-  # list is empty whenever `hasProbe` is false even if the manifest has
-  # mismatch facts on optional symbols — there is nothing to compare them
-  # against yet.
+  # RFC-0001 §C.3, slice C4c: the refusal policy gate — "escape hatches,
+  # scoped to who holds them". Absent or `refuse = true` on this block's
+  # own `compatManifest` directive means refusal is enabled UNLESS the
+  # build-wide `-d:softlinkNoDriftRefusal` override wins regardless (the
+  # downstream-consumer knob always takes precedence over what the
+  # binding author wrote, by construction: it's a build-wide `and not`).
+  # Gating BOTH candidate-list computations below on this one flag is the
+  # "cleanest degradation" the slice brief calls for: `refuse = false` (or
+  # the build-wide define) means driftCandidates/requiredDriftCandidates
+  # are simply never populated, so every downstream `.len > 0` check
+  # degrades to emitting NO refusal code at all — not merely disabled at
+  # runtime, but literally absent from the generated program.
+  let driftRefusalEnabled = not softlinkNoDriftRefusal and
+    not (manifestDirective.refuseGiven and not manifestDirective.refuse)
+
+  # RFC-0001 §C.3, slice C4b/C4c: split `mismatchCNames` into its OPTIONAL
+  # subset (`driftCandidates`, C4b) and REQUIRED subset
+  # (`requiredDriftCandidates`, C4c) — the two runtime drift-refusal
+  # candidate lists. Both require a probe (no probed version, no refusal
+  # is ever possible) AND `driftRefusalEnabled` (see above) — empty
+  # whenever any of those is false, even if the manifest has mismatch
+  # facts on procs of the relevant kind, since there is either nothing to
+  # compare them against yet or refusal is deliberately disabled for this
+  # compile.
   var driftCandidates: seq[SoftlinkProc]
-  if appliedManifest.attached and hasProbe:
+  var requiredDriftCandidates: seq[SoftlinkProc]
+  if appliedManifest.attached and hasProbe and driftRefusalEnabled:
     for p in procs:
-      if p.isOptional and p.nameStr in mismatchCNames:
-        driftCandidates.add(p)
+      if p.nameStr in mismatchCNames:
+        if p.isOptional: driftCandidates.add(p)
+        else: requiredDriftCandidates.add(p)
   var driftCandidateNames: HashSet[string]
   for p in driftCandidates: driftCandidateNames.incl(p.nameStr)
+  for p in requiredDriftCandidates: driftCandidateNames.incl(p.nameStr)
 
-  # RFC-0001 §C.3, slice C4b design guidance: one drift-story seq per
-  # block — `softlinkDriftStories<Base>: seq[tuple[symbol, story: string]]`
-  # — populated at refusal time inside loadXxx below, scanned (linearly,
+  # RFC-0001 §C.3, slice C4b design guidance (extended by C4c to the
+  # required subset too): one drift-story seq per block —
+  # `softlinkDriftStories<Base>: seq[tuple[symbol, story: string]]` —
+  # populated at refusal time inside loadXxx below, scanned (linearly,
   # error-path only) by the wrapper's nil-pointer branch, and reset by
-  # unloadXxx. Zero footprint when nothing could ever be refused
-  # (`driftCandidates.len == 0`): gated on the ACTUAL refusal-candidate
-  # list, not merely `appliedManifest.attached`, since a manifest with
-  # mismatch facts but no probe, or mismatch facts only on required
-  # symbols, generates no refusal code at all and would leave this var
-  # write-only.
+  # unloadXxx. Zero footprint when nothing could ever be refused (both
+  # candidate lists empty): gated on the ACTUAL refusal-candidate lists,
+  # not merely `appliedManifest.attached`, since a manifest with mismatch
+  # facts but no probe, or `refuse = false`/`-d:softlinkNoDriftRefusal`,
+  # generates no refusal code at all and would leave this var write-only.
   let driftStoriesName = ident("softlinkDriftStories" & baseName)
-  if driftCandidates.len > 0:
+  if driftCandidates.len > 0 or requiredDriftCandidates.len > 0:
     result.add(newNimNode(nnkVarSection).add(
       newNimNode(nnkIdentDefs).add(
         driftStoriesName,
@@ -2578,6 +2647,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # handoff for the full rationale).
       let corpusLit = newLit(appliedManifest.manifest.corpus)
 
+      # RFC-0001 §C.3, slice C4c: every proc's own pointer var in this
+      # block, for the required-refusal unwind's `resetPtrs` — a required
+      # refusal walks back the ENTIRE load (mirroring unloadX's own
+      # per-proc reset loop), not just the one drifted symbol's pointer.
+      var allPtrNames: seq[NimNode] = @[]
+      for p in procs: allPtrNames.add(p.ptrName)
+
       # RFC-0001 §9/§C.2, slice C3: the absence partition (`mrExpected`/
       # `mrAnomalous`), computed AT MOST once per successful, manifest-
       # attested load — only when there is something to partition at all
@@ -2640,6 +2716,77 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # an `mrDriftRefused` partition entry.
       var attestedStmts = newStmtList()
       var attestedMissingFields = missingPartitionFields
+
+      # RFC-0001 §C.3, slice C4c: REQUIRED-symbol drift refusal — checked
+      # FIRST, in declaration order, "first hit wins" (mirrors Phase 1's
+      # own first-required-symbol-missing-wins early-fail): a hit unwinds
+      # the WHOLE load via `unwindStmt`'s third shape (see its own doc
+      # comment) rather than re-nilling one pointer, preserving `lrOk` ⟹
+      # every required wrapper is safe to call. `requiredDriftCandidates`
+      # is by construction resolved (Phase 1 guarantees every required
+      # symbol resolved before this point ever runs), so — unlike the
+      # OPTIONAL loop just below — no `if not isNil(ptr)` guard is needed;
+      # the RFC's own wording ("Phase 1 guarantees all resolved") makes
+      # that guard always-true, hence a no-op if added, so it is omitted
+      # rather than emitted as dead-but-harmless ceremony.
+      for p in requiredDriftCandidates:
+        let symNameLit = newStrLitNode(p.nameStr)
+        let mismatchSym = genSym(nskLet, "reqMismatch")
+        let versionSnapshotSym = genSym(nskLet, "reqDriftVersion")
+        let reqMissingSym = genSym(nskVar, "reqMissingPartition")
+        let storyExpr = newNimNode(nnkInfix).add(ident("&"),
+          newNimNode(nnkInfix).add(ident("&"),
+            newStrLitNode(p.nameStr & ": signature drift at "),
+            newCall(bindSym("formatInterval"), newCall(bindSym("get"), mismatchSym))),
+          newStrLitNode(" per compat manifest; refusing unsafe dispatch"))
+        var hitStmts = newStmtList()
+        # Snapshot the probed version into its OWN let BEFORE calling
+        # unwindStmt with resetProbeState = true: a plain Nim `string` let
+        # copies the value, so the report below carries the REAL probed
+        # version even though `softlinkProbedVersion<Base>` itself gets
+        # reset to "" as part of the same unwind (see unwindStmt's own
+        # doc comment for why this ordering matters).
+        hitStmts.add(newLetStmt(versionSnapshotSym, probedVersionName))
+        hitStmts.add(newCall(newDotExpr(driftStoriesName, ident("add")),
+          newNimNode(nnkTupleConstr).add(
+            newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+            newNimNode(nnkExprColonExpr).add(ident("story"), storyExpr))))
+        # RFC-0001 §C.3, slice C4c design guidance: the report's `missing`
+        # on a required refusal includes the C3 partition entries already
+        # computed for THIS load (more honest than a minimal one-entry
+        # report, and free — the partition was already computed above),
+        # plus this symbol's own `mrDriftRefused` entry.
+        hitStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
+          reqMissingSym,
+          seqOfTupleType([("symbol", "string"), ("reason", "MissingReason")]),
+          newEmptyNode())))
+        if hasOptional:
+          # `missingPartitionFields[0][1]` is the `missingPartitionSym`
+          # NimNode built above — referenced through the seq (rather than
+          # the macro-time Nim identifier `missingPartitionSym` itself,
+          # which is scoped to the `if hasOptional:` block it was declared
+          # in and is not visible here), exactly like the existing C4b
+          # code's own `baseMissingNode = missingPartitionFields[0][1]`
+          # does a little further below.
+          hitStmts.add(newAssignment(reqMissingSym, missingPartitionFields[0][1]))
+        hitStmts.add(newCall(newDotExpr(reqMissingSym, ident("add")),
+          newNimNode(nnkTupleConstr).add(
+            newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+            newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")))))
+        hitStmts.add(unwindStmt(
+          unloadHandle = true,
+          resultKind = ident("lrSymbolNotFound"),
+          resultFields = @[("symbol", symNameLit)],
+          reportFields = @[
+            ("runtimeVersion", versionSnapshotSym),
+            ("attestation", ident("atAttested")),
+            ("missing", reqMissingSym)],
+          resetPtrs = allPtrNames,
+          resetProbeState = true))
+        attestedStmts.add(newLetStmt(mismatchSym, newCall(bindSym("firstMismatchInterval"),
+          ident("softlinkCompatFacts" & baseName), symNameLit, probedVersionName)))
+        attestedStmts.add(newIfStmt((newCall(bindSym("isSome"), mismatchSym), hitStmts)))
+
       if driftCandidates.len > 0:
         let driftPartitionSym = genSym(nskVar, "driftRefusedPartition")
         attestedStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
@@ -2777,29 +2924,49 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
       )
     ))
-    # RFC-0001 §9/§C.2: reset the compat report to its zero state alongside
-    # every other piece of per-load state above — `fooCompat()` called
-    # after `unloadFoo()` must never serve a previous load's trust signals.
-    # Unconditional, like the report var's own declaration (every dynlib
-    # block gets a report, not just probe-declaring ones).
-    ifBody.add(assignCompatReportStmt())
-    if hasProbe:
-      # RFC-0001 §9/§C.1: reset the probe's outcome alongside every other
-      # piece of per-load state above — `fooCompat()` (RFC-0001 §C.2)
-      # called after `unloadFoo()` must never serve a previous load's
-      # probe result.
-      ifBody.add(newAssignment(probedVersionName, newStrLitNode("")))
-      ifBody.add(newAssignment(probeFailedName, newLit(false)))
-    if driftCandidates.len > 0:
-      # RFC-0001 §C.3, slice C4b design guidance: reset the drift-story
-      # seq alongside every other piece of per-load state above — a
-      # reload must re-run refusal fresh, never carry forward a previous
-      # load's stories.
-      ifBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
     unloadBody.add(newIfStmt((
       prefix(newCall(ident("isNil"), handleName), "not"),
       ifBody
     )))
+
+    # RFC-0001 §9/§C.2/§C.3, slice C4c: the report/probe-state/drift-story
+    # resets below are UNCONDITIONAL — deliberately NOT nested inside the
+    # `if not handle.isNil` guard above (where they lived pre-C4c). C4c's
+    # required-drift-refusal unwind can leave `handle` ALREADY nil (the
+    # unwind itself unloads the library, see the `dynlib` macro's
+    # `requiredDriftCandidates` loop) while `softlinkCompatReport<Base>`
+    # still carries THAT failure's drift story — calling unloadXxx() after
+    # such a failure must still zero the report (RFC-0001 §C.2:
+    # `fooCompat()` after `unloadFoo()` must never serve a previous load's
+    # trust signals), which the OLD handle-guarded placement could not do,
+    # since `not handle.isNil` is false in exactly that state.
+    #
+    # This is a behavior-preserving generalization, not a new runtime
+    # effect, for every block reachable before C4c: every OTHER path that
+    # leaves `handle` nil (the initial zero state; a Phase-1 early-fail,
+    # whose own `unwindStmt` call already writes the zero-state report
+    # directly) already has these vars at exactly these same zero values
+    # by the time unloadXxx would run, so re-assigning them here is an
+    # idempotent no-op in every one of those cases — only C4c's new
+    # non-zero-report-with-nil-handle state makes the distinction
+    # observable at all.
+    # RFC-0001 §9/§C.2: reset the compat report to its zero state —
+    # `fooCompat()` called after `unloadFoo()` must never serve a previous
+    # load's trust signals. Unconditional wrt `hasProbe` too, like the
+    # report var's own declaration (every dynlib block gets a report, not
+    # just probe-declaring ones) — unchanged from pre-C4c.
+    unloadBody.add(assignCompatReportStmt())
+    if hasProbe:
+      # RFC-0001 §9/§C.1: reset the probe's outcome alongside the report
+      # above — `fooCompat()` (RFC-0001 §C.2) called after `unloadFoo()`
+      # must never serve a previous load's probe result.
+      unloadBody.add(newAssignment(probedVersionName, newStrLitNode("")))
+      unloadBody.add(newAssignment(probeFailedName, newLit(false)))
+    if driftCandidates.len > 0 or requiredDriftCandidates.len > 0:
+      # RFC-0001 §C.3, slice C4b/C4c: reset the drift-story seq alongside
+      # every other piece of per-load state above — a reload must re-run
+      # refusal fresh, never carry forward a previous load's stories.
+      unloadBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
 
     result.add(newProc(
       name = postfix(unloadProcName, "*"),

@@ -1046,6 +1046,38 @@ task test, "Run tests":
     exec runCmd & " tests/tcompat_report_manifest.nim"
     rmFile(mdir & base & ".compat.json")
 
+  proc runDriftRequiredChecks(runCmd: string) =
+    ## RFC-0001 §C.3, slice C4c: drift refusal for REQUIRED symbols — a
+    ## real `versionProbe` load, exactly like `runCompatReportManifestChecks`
+    ## above, needed for the same reason (the `--compileOnly` fixtures
+    ## `runManifestChecks` drives can't exercise a real load). Two new
+    ## modules, each its own `dynlib` block on `libtestlib.so` (per-module
+    ## duplicate-block-guard scoping, same reasoning as
+    ## `tests/tcompat_report_manifest.nim`'s own doc comment):
+    ##   - `tests/tcompat_drift_required.nim`: `testlib_gated` bound
+    ##     REQUIRED (C4b's own fixture binds the identical .so symbol
+    ##     `optional`) — the happy path, lrOk-implies-safe, out-of-corpus,
+    ##     and unload/reload behaviors (TDD items 1-4).
+    ##   - `tests/tcompat_drift_refuse_false.nim`: `compatManifest(...,
+    ##     refuse = false)` — proves the per-block escape hatch disables
+    ##     BOTH the required unwind (C4c) and the optional re-nil (C4b)
+    ##     (item 5).
+    ## `tests/tcompat_drift_required.nim` is ALSO compiled and run a SECOND
+    ## time with `-d:softlinkNoDriftRefusal` (item 6, the build-wide
+    ## downstream-consumer override) — that file's own
+    ## `driftRefusalOverridden` const flips the one assertion the define
+    ## changes, so both invocations share one test body.
+    const mdir = "tests/manifests/"
+    const reqBase = "testlib_drift_required"
+    const refuseFalseBase = "testlib_refuse_false"
+    writeManifestFromTemplate(mdir & reqBase & ".tmpl.json", mdir & reqBase & ".compat.json")
+    writeManifestFromTemplate(mdir & refuseFalseBase & ".tmpl.json", mdir & refuseFalseBase & ".compat.json")
+    exec runCmd & " tests/tcompat_drift_required.nim"
+    exec runCmd & " -d:softlinkNoDriftRefusal tests/tcompat_drift_required.nim"
+    exec runCmd & " tests/tcompat_drift_refuse_false.nim"
+    rmFile(mdir & reqBase & ".compat.json")
+    rmFile(mdir & refuseFalseBase & ".compat.json")
+
   # RFC-0001 §4 B.2, classification-table discriminators: the heart of the
   # RFC's harvester classification table, proven directly against the
   # shipped mechanism (no harvester exists yet — that's slice B3):
@@ -1190,6 +1222,7 @@ task test, "Run tests":
     runManifestChecks()
     runVersionProbeChecks()
     runCompatReportManifestChecks("nim c -r --path:src --passC:-I.")
+    runDriftRequiredChecks("nim c -r --path:src --passC:-I.")
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -1257,6 +1290,7 @@ task test, "Run tests":
     runManifestChecks()
     runVersionProbeChecks()
     runCompatReportManifestChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
+    runDriftRequiredChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -1330,6 +1364,7 @@ task test, "Run tests":
     runManifestChecks()
     runVersionProbeChecks()
     runCompatReportManifestChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
+    runDriftRequiredChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runHarvesterCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
