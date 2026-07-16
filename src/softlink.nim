@@ -94,6 +94,33 @@ proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
     msg: library & ": library not loaded, cannot call: " & symbol,
     library: library, symbol: symbol)
 
+# RFC-0001 §C.3, slice C4b: raised by a wrapper INSTEAD OF `raiseNotLoaded`
+# above when its symbol resolved at load time but was then re-nilled for
+# known signature drift (`findDriftStory` below found a stored story) —
+# `story` IS the message (the full "<symbol>: signature drift at
+# <interval> per compat manifest; refusing unsafe dispatch" text, built
+# once at refusal time in loadXxx and stashed in
+# `softlinkDriftStories<Base>`). Exported and called via a plain ident
+# from generated code, exactly like `raiseNotLoaded`.
+proc raiseDriftRefused*(library, symbol, story: string) {.noreturn, noinline.} =
+  raise SoftlinkError(msg: story, library: library, symbol: symbol)
+
+proc findDriftStory(stories: seq[tuple[symbol: string, story: string]],
+                     symbol: string): string =
+  ## RFC-0001 §C.3, slice C4b design guidance: a linear scan of one
+  ## block's `softlinkDriftStories<Base>` for `symbol` — error-path only (a
+  ## wrapper already found its function pointer nil), so cost is
+  ## irrelevant. `""` means "no stored story for this symbol" (either it
+  ## was never refused, or refusal never happens in this block at all) —
+  ## the wrapper's generated call site falls back to the ordinary
+  ## `raiseNotLoaded` message on a miss, unchanged. Not exported (like
+  ## `computeMissingPartition` below): generated code resolves it via
+  ## `bindSym`, forcing THIS module's definition regardless of what else
+  ## is in scope at the call site.
+  for entry in stories:
+    if entry.symbol == symbol: return entry.story
+  ""
+
 proc computeMissingPartition(symbols: seq[SymbolFacts], missingSymbols: seq[string],
                               sinceCNames, sinceVersions: seq[string],
                               probedVersion: string):
@@ -1680,6 +1707,57 @@ proc dumpProbeFacts(kind, modulePath, libPattern, baseName: string,
   else:
     discard staticExec("mv -f " & quoteShell(tmp) & " " & quoteShell(target))
 
+proc seqOfTupleType(fields: openArray[(string, string)]): NimNode =
+  ## Build the NimNode for `seq[tuple[<name1>: <type1>, <name2>: <type2>,
+  ## ...]]` — RFC-0001 §C.3, slice C4b needs this for
+  ## `softlinkDriftStories<Base>`'s and the per-load drift-refused
+  ## partition var's types. `quote do: seq[tuple[symbol: string, ...]]`
+  ## looks like the idiomatic route but was VERIFIED to mis-resolve the
+  ## field name `symbol` against `std/macros`' own (deprecated)
+  ## `proc symbol*(n: NimNode): NimSym` — `tuple[symbol: ...]`'s field
+  ## list, reparsed by `quote`, hits ordinary overload resolution for the
+  ## identifier `symbol` instead of being treated as a field declaration,
+  ## and `macros.symbol` is in scope (this module imports `std/macros`),
+  ## producing "cannot use symbol of kind 'proc' as a 'field'" at the call
+  ## site. Building the `nnkTupleTy` node directly — the same way
+  ## `procTy`/`ptrReturnType` elsewhere in this file build proc-type nodes
+  ## — sidesteps `quote` (and this whole class of accidental-capture
+  ## bugs) entirely.
+  var tupleTy = newNimNode(nnkTupleTy)
+  for (fname, tname) in fields:
+    tupleTy.add(newNimNode(nnkIdentDefs).add(ident(fname), ident(tname), newEmptyNode()))
+  newNimNode(nnkBracketExpr).add(ident("seq"), tupleTy)
+
+proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string]): bool =
+  ## RFC-0001 §C.1/§C.3, slice C4b: "the version probe may only call
+  ## symbols with no known drift ranges" (RFC §C.1: "the probe must not be
+  ## the drift"). Walks `stmts` (the versionProbe body, still raw AST at
+  ## macro-expansion time — the manifest is already parsed by now) looking
+  ## for a DIRECT call (`nnkCall`/`nnkCommand`) whose callee is a bare
+  ## ident matching `mismatchCNames` — this block's own symbols (required
+  ## OR optional; required-symbol RUNTIME refusal is C4c's territory, but
+  ## the call-safety risk this scan guards against exists for both) that
+  ## carry ANY `mismatch` interval in the attached manifest. Emits ONE
+  ## macro error at the offending call node and stops (returns `true`) — a
+  ## probe with several such calls gets one diagnostic, not a pile-up.
+  ## Indirect calls (through a variable, a closure, a method) can't be
+  ## seen statically; that residual risk is accepted and documented here,
+  ## not pretended away, per the RFC's own words.
+  if stmts.kind in {nnkCall, nnkCommand} and stmts.len > 0 and stmts[0].kind == nnkIdent:
+    let callee = $stmts[0]
+    if callee in mismatchCNames:
+      error("softlink: dynlib: versionProbe directly calls '" & callee &
+            "', which has a recorded 'mismatch' interval in the attached " &
+            "compat manifest — the version probe may only call symbols " &
+            "with no known drift ranges (RFC-0001 §C.1: \"the probe must " &
+            "not be the drift\"); indirect calls cannot be detected " &
+            "statically and remain a documented residual risk", stmts)
+      return true
+  for child in stmts:
+    if scanProbeBodyForDriftCalls(child, mismatchCNames):
+      return true
+  false
+
 macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## Generate type-safe, runtime-optional bindings for a dynamic library.
   ## The generated ``loadXxx``/``unloadXxx`` procs are **not thread-safe**.
@@ -2096,6 +2174,63 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       newNimNode(nnkConstDef).add(factsConstName, factsTypeNode, factsInit)
     ))
 
+  # RFC-0001 §C.1/§C.3, slice C4b: symbols (any pragma kind — required OR
+  # optional) whose header facts include ANY `mismatch` interval, per the
+  # attached manifest. Feeds both the probe-body static scan just below
+  # (every proc, since a probe dispatching a drift-mismatched REQUIRED
+  # symbol is the same "probe must not be the drift" risk) and the
+  # runtime refusal candidate list (`driftCandidates`, the OPTIONAL
+  # subset — required-symbol refusal is C4c's territory). Empty when no
+  # manifest is attached: nothing to check facts against.
+  var mismatchCNames: HashSet[string]
+  if appliedManifest.attached:
+    for p in procs:
+      let symOpt = findSymbol(appliedManifest.manifest, p.nameStr)
+      if symOpt.isSome and symOpt.get.header[fkMismatch].len > 0:
+        mismatchCNames.incl(p.nameStr)
+
+  # RFC-0001 §C.1: the macro-time-only probe-body scan. No manifest
+  # attached, no (well-formed) probe at all, or no symbol in this block
+  # ever carries a mismatch fact: nothing to scan, matching the RFC's own
+  # "no manifest -> no facts -> no scan" wording.
+  if appliedManifest.attached and hasProbe and mismatchCNames.len > 0:
+    discard scanProbeBodyForDriftCalls(versionProbeDirective.bodyStmts, mismatchCNames)
+
+  # RFC-0001 §C.3, slice C4b: the OPTIONAL subset of `mismatchCNames` —
+  # the only symbols eligible for the RUNTIME drift refusal this slice
+  # implements (required-symbol refusal is C4c's). Refusal also requires
+  # a probe (no probed version, no refusal is ever possible), so this
+  # list is empty whenever `hasProbe` is false even if the manifest has
+  # mismatch facts on optional symbols — there is nothing to compare them
+  # against yet.
+  var driftCandidates: seq[SoftlinkProc]
+  if appliedManifest.attached and hasProbe:
+    for p in procs:
+      if p.isOptional and p.nameStr in mismatchCNames:
+        driftCandidates.add(p)
+  var driftCandidateNames: HashSet[string]
+  for p in driftCandidates: driftCandidateNames.incl(p.nameStr)
+
+  # RFC-0001 §C.3, slice C4b design guidance: one drift-story seq per
+  # block — `softlinkDriftStories<Base>: seq[tuple[symbol, story: string]]`
+  # — populated at refusal time inside loadXxx below, scanned (linearly,
+  # error-path only) by the wrapper's nil-pointer branch, and reset by
+  # unloadXxx. Zero footprint when nothing could ever be refused
+  # (`driftCandidates.len == 0`): gated on the ACTUAL refusal-candidate
+  # list, not merely `appliedManifest.attached`, since a manifest with
+  # mismatch facts but no probe, or mismatch facts only on required
+  # symbols, generates no refusal code at all and would leave this var
+  # write-only.
+  let driftStoriesName = ident("softlinkDriftStories" & baseName)
+  if driftCandidates.len > 0:
+    result.add(newNimNode(nnkVarSection).add(
+      newNimNode(nnkIdentDefs).add(
+        driftStoriesName,
+        seqOfTupleType([("symbol", "string"), ("story", "string")]),
+        newEmptyNode()
+      )
+    ))
+
   # Wrapper procs — RFC-0001 §9/§C.1, slice C1a: emitted here, BEFORE loadXxx,
   # so a future `versionProbe:` body spliced into loadXxx (slice C1b) can call
   # the block's own wrappers without a use-before-declaration error at the Nim
@@ -2114,9 +2249,27 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
     # nil check + call
     var wrapperBody = newStmtList()
+    # RFC-0001 §C.3, slice C4b design guidance: for a symbol eligible for
+    # drift refusal (`p.nameStr in driftCandidateNames` — always false,
+    # hence a no-op addition, when this block has no such symbol), check
+    # `softlinkDriftStories<Base>` FIRST: a hit means this pointer was
+    # resolved once and then re-nilled for known drift, and the wrapper
+    # must raise the FULL drift story, not the generic "not loaded"
+    # message. A miss (never refused, or refused-but-not-THIS-symbol)
+    # falls through to the unchanged `raiseNotLoaded` call below.
+    var nilBranch = newStmtList()
+    if p.nameStr in driftCandidateNames:
+      let storySym = genSym(nskLet, "driftStory")
+      nilBranch.add(newLetStmt(storySym,
+        newCall(bindSym("findDriftStory"), driftStoriesName, nameStr)))
+      nilBranch.add(newIfStmt((
+        newNimNode(nnkInfix).add(ident(">"), newDotExpr(storySym, ident("len")), newIntLitNode(0)),
+        newStmtList(newCall(ident("raiseDriftRefused"), libPatternLit, nameStr, storySym))
+      )))
+    nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
     wrapperBody.add(newIfStmt((
       newCall(ident("isNil"), p.ptrName),
-      newStmtList(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
+      nilBranch
     )))
 
     if p.hasReturn:
@@ -2459,12 +2612,81 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         ))
         missingPartitionFields.add(("missing", missingPartitionSym))
 
+      # RFC-0001 §C.3, slice C4b: drift refusal. Fires ONLY in the
+      # atAttested branch below — policy: "refusal only on known
+      # mismatch; out-of-corpus versions load normally" (§C.3). Built as
+      # its own statement list (`attestedStmts`) rather than folding into
+      # the shared `missingPartitionFields` directly, so the
+      # atOutOfCorpus branch below is completely untouched by it.
+      # `driftCandidates` is the OPTIONAL subset of `mismatchCNames`
+      # (computed earlier, alongside the wrapper loop) — empty whenever
+      # this block has no manifest, no probe, or no optional symbol with
+      # a recorded `mismatch` interval, in which case this degrades to
+      # exactly today's atAttested body (`attestedMissingFields ==
+      # missingPartitionFields`, unchanged).
+      #
+      # Per-candidate shape (only emitted for symbols in
+      # `driftCandidates`): if the pointer is still non-nil (Phase 3
+      # resolved it — an ALREADY-nil pointer, e.g. absent at runtime, is
+      # Phase 2's concern and is skipped here BY CONSTRUCTION, which is
+      # exactly the "no double-count" guarantee: an absent symbol's own
+      # `mismatch` fact is folded into `mrAnomalous` by
+      # `computeMissingPartition`/`classifyAbsence` above, never touched
+      # by this block at all) AND `firstMismatchInterval` finds a
+      # matching interval at the probed version: re-nil the pointer, add
+      # the symbol to the SAME `missing` seq Phase 2 built (turning an
+      # otherwise-`lrOk` load `lrOkPartial`, and feeding
+      # `LoadResult.missing` for free), stash the drift story, and record
+      # an `mrDriftRefused` partition entry.
+      var attestedStmts = newStmtList()
+      var attestedMissingFields = missingPartitionFields
+      if driftCandidates.len > 0:
+        let driftPartitionSym = genSym(nskVar, "driftRefusedPartition")
+        attestedStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
+          driftPartitionSym,
+          seqOfTupleType([("symbol", "string"), ("reason", "MissingReason")]),
+          newEmptyNode())))
+        for p in driftCandidates:
+          let symNameLit = newStrLitNode(p.nameStr)
+          let mismatchSym = genSym(nskLet, "mismatch")
+          let storyExpr = newNimNode(nnkInfix).add(ident("&"),
+            newNimNode(nnkInfix).add(ident("&"),
+              newStrLitNode(p.nameStr & ": signature drift at "),
+              newCall(bindSym("formatInterval"), newCall(bindSym("get"), mismatchSym))),
+            newStrLitNode(" per compat manifest; refusing unsafe dispatch"))
+          var refuseStmts = newStmtList()
+          refuseStmts.add(newAssignment(p.ptrName, newNilLit()))
+          refuseStmts.add(newCall(newDotExpr(missingName, ident("add")), symNameLit))
+          refuseStmts.add(newCall(newDotExpr(driftStoriesName, ident("add")),
+            newNimNode(nnkTupleConstr).add(
+              newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+              newNimNode(nnkExprColonExpr).add(ident("story"), storyExpr))))
+          refuseStmts.add(newCall(newDotExpr(driftPartitionSym, ident("add")),
+            newNimNode(nnkTupleConstr).add(
+              newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+              newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")))))
+          let candBlock = newStmtList(
+            newLetStmt(mismatchSym, newCall(bindSym("firstMismatchInterval"),
+              ident("softlinkCompatFacts" & baseName), symNameLit, probedVersionName)),
+            newIfStmt((newCall(bindSym("isSome"), mismatchSym), refuseStmts)))
+          attestedStmts.add(newIfStmt((
+            prefix(newCall(ident("isNil"), p.ptrName), "not"),
+            candBlock)))
+        # missingPartitionFields has exactly one entry, ("missing", <sym>),
+        # whenever driftCandidates is nonempty (its members are all
+        # optional, so hasOptional is necessarily true here too) — extend
+        # THAT node with `& driftPartitionSym` for this branch only.
+        let baseMissingNode = missingPartitionFields[0][1]
+        attestedMissingFields = @[("missing",
+          newNimNode(nnkInfix).add(ident("&"), baseMissingNode, driftPartitionSym))]
+      attestedStmts.add(assignCompatReportStmt(@[
+        ("runtimeVersion", probedVersionName),
+        ("attestation", ident("atAttested"))] & attestedMissingFields))
+
       var corpusIf = newNimNode(nnkIfStmt)
       corpusIf.add(newNimNode(nnkElifBranch).add(
         newNimNode(nnkInfix).add(ident("in"), probedVersionName, corpusLit),
-        newStmtList(assignCompatReportStmt(@[
-          ("runtimeVersion", probedVersionName),
-          ("attestation", ident("atAttested"))] & missingPartitionFields))
+        attestedStmts
       ))
       corpusIf.add(newNimNode(nnkElse).add(newStmtList(
         assignCompatReportStmt(@[
@@ -2568,6 +2790,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # probe result.
       ifBody.add(newAssignment(probedVersionName, newStrLitNode("")))
       ifBody.add(newAssignment(probeFailedName, newLit(false)))
+    if driftCandidates.len > 0:
+      # RFC-0001 §C.3, slice C4b design guidance: reset the drift-story
+      # seq alongside every other piece of per-load state above — a
+      # reload must re-run refusal fresh, never carry forward a previous
+      # load's stories.
+      ifBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
     unloadBody.add(newIfStmt((
       prefix(newCall(ident("isNil"), handleName), "not"),
       ifBody

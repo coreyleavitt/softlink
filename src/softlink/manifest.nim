@@ -342,6 +342,44 @@ func mismatchedSymbols*(m: CompatManifest, boundCNames: seq[string]): seq[string
     if symOpt.isSome and symOpt.get.header[fkMismatch].len > 0:
       result.add cname
 
+func firstMismatchInterval*(symbols: seq[SymbolFacts], cname, probedVersion: string):
+                             Option[VersionInterval] =
+  ## RFC-0001 §C.3, slice C4b: the runtime drift-refusal lookup — given
+  ## this block's embedded header facts (`softlinkCompatFacts<Base>`) and
+  ## one symbol that DID resolve at load time, does `probedVersion` fall
+  ## in any `mismatch` interval this manifest recorded for it? Returns the
+  ## matching interval itself (not just a bool) — the wrapper's drift
+  ## story needs the interval's bound text (`formatInterval` below), not
+  ## merely "yes/no". Mirrors `classifyAbsence`'s per-symbol lookup shape
+  ## (linear scan, stop at the matching `cname`) but is a NARROWER
+  ## question: only `mismatch` facts matter here — a symbol that resolved
+  ## and is `verified`/`absent`/`unknown` at this version was never in
+  ## danger; refusal exists solely for "resolved, but the headers already
+  ## know this version's signature drifted." First match wins (a
+  ## well-formed, `validateDisjointExhaustive`-passing manifest never has
+  ## two overlapping `mismatch` entries for the same symbol at the same
+  ## version; this function doesn't re-derive that invariant, only
+  ## answers the membership question).
+  for sf in symbols:
+    if sf.cname == cname:
+      for iv in sf.header[fkMismatch]:
+        if iv.contains(probedVersion): return some(iv)
+      break
+  none(VersionInterval)
+
+func formatInterval*(iv: VersionInterval): string =
+  ## RFC-0001 §C.3, slice C4b: render one `VersionInterval` for a drift
+  ## story, e.g. `lo == "4.16.0"`/`hi == ""` -> `">=4.16.0"` — the exact
+  ## wording the RFC's own worked example uses ("signature drift at
+  ## >=4.16.0 per compat manifest"). An open bound renders as a one-sided
+  ## comparison; a fully-bounded interval renders both sides; the
+  ## degenerate (manifest-writer-error) unbounded-both-ways case still
+  ## renders something sensible rather than an empty string.
+  if iv.lo.len > 0 and iv.hi.len > 0: ">=" & iv.lo & ", <" & iv.hi
+  elif iv.lo.len > 0: ">=" & iv.lo
+  elif iv.hi.len > 0: "<" & iv.hi
+  else: "any version"
+
 func notInManifest*(m: CompatManifest, boundCNames: seq[string]): seq[string] =
   ## RFC-0001 §B.5 not-in-manifest hint: which of `boundCNames` are
   ## entirely absent from the manifest's own symbol table — a stale

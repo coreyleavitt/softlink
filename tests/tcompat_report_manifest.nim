@@ -15,6 +15,17 @@
 ## symbol added here purely to exercise the since-without-manifest-facts
 ## path — it carries no header facts in the manifest at all).
 ##
+## RFC-0001 §C.3, slice C4b extends this file again: drift refusal for an
+## OPTIONAL symbol that DOES resolve at runtime — `testlib_gated` (present
+## in libtestlib.so, see tests/testlib.c/h; bound `optional` HERE only —
+## its OWN separate dynlib block elsewhere in the suite binds it
+## required). The fixture manifest gives it `verified` through "4.0.0"
+## then `mismatch` from "4.0.0" onward; `testlib_future`'s own facts grow
+## a `mismatch` interval at "4.0.0" too (while it stays unimplemented,
+## i.e. never resolves) — the "already-absent symbol whose facts ALSO
+## carry a mismatch interval" no-double-count case. A new corpus point,
+## "4.0.0" (`cpmMismatchInterval`), exercises both at once.
+##
 ## `tests/manifests/testlib_compat_report.tmpl.json` is materialized to its
 ## real, gitignored `*.compat.json` path by the nimble test task
 ## immediately before this file is compiled (the same `${ABI}` templating
@@ -27,15 +38,20 @@
 ## `softlinkHandleTestlib` var entirely).
 ##
 ## NOT compiled by the regular test suite; see the `nimble test` task.
-import std/[unittest, sequtils]
+import std/[unittest, sequtils, strutils]
 import softlink
 
 type CorpusProbeMode = enum
   cpmAbsentInterval    ## "1.0.0" — testlib_future's headers do NOT declare it here
   cpmVerifiedInterval  ## "2.0.0" — testlib_future's headers DO declare it here (also: in-corpus)
   cpmUnknownInterval   ## "3.0.0" — testlib_future's facts are unknown here (also: in-corpus)
-  cpmOutOfCorpus       ## "9.9.9" — parseable, not literally harvested; both symbols fall in
-                       ## their own "unknown"/uncovered tail range here
+  cpmMismatchInterval  ## "4.0.0" — in-corpus: testlib_gated's headers record a MISMATCH here
+                       ## (RFC-0001 §C.4b drift refusal) while testlib_future ALSO carries a
+                       ## mismatch fact here (the "already-absent, no double-count" case)
+  cpmOutOfCorpus       ## "9.9.9" — parseable, not literally harvested; testlib_future falls in
+                       ## its own "unknown" tail here, and testlib_gated's mismatch interval is
+                       ## unbounded (covers "9.9.9" too) — the §C.4b "out-of-corpus is never
+                       ## refused" policy test
 
 var corpusProbeMode = cpmVerifiedInterval
 
@@ -45,7 +61,10 @@ dynlib "libtestlib.so":
   # testlib_future: declared in tests/testlib.h, never implemented in
   # tests/testlib.c — always in LoadResult.missing on lrOkPartial. Its
   # manifest facts (see the fixture) are absent/[1.0.0], verified/[2.0.0],
-  # unknown/[3.0.0..) — exactly the three C3 partition outcomes.
+  # unknown/[3.0.0,4.0.0), mismatch/[4.0.0..5.0.0), unknown/[5.0.0..) —
+  # the three C3 partition outcomes, PLUS (at "4.0.0") the C4b
+  # no-double-count case: absent at runtime AND carrying a mismatch fact
+  # at the probed version.
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
   # testlib_future_nv: ALSO never implemented, but {.noverify.} (no header
   # facts tracked in the manifest at all — RFC-0001 §C.2's "symbol not in
@@ -54,11 +73,20 @@ dynlib "libtestlib.so":
   # since-ALONE contribution to the partition (item 4 of the slice) from
   # testlib_future's own header-fact coverage.
   proc testlib_future_nv(): cint {.cdecl, optional, noverify, since: "9.5.0".}
+  # testlib_gated: RFC-0001 §C.3/§C.4b — present in libtestlib.so (see
+  # tests/testlib.c/h), bound `optional` HERE (a SEPARATE dynlib block
+  # elsewhere in the suite binds the same underlying symbol required —
+  # legal, different module). Its manifest facts are verified through
+  # "4.0.0", then mismatch from "4.0.0" onward (unbounded) — a symbol
+  # that DOES resolve at runtime but whose signature this manifest already
+  # knows drifted starting at the probed corpus point.
+  proc testlib_gated(): cint {.cdecl, optional, header: "tests/testlib.h".}
   versionProbe:
     case corpusProbeMode
     of cpmAbsentInterval: "1.0.0"
     of cpmVerifiedInterval: "2.0.0"
     of cpmUnknownInterval: "3.0.0"
+    of cpmMismatchInterval: "4.0.0"
     of cpmOutOfCorpus: "9.9.9"
 
 suite "CompatReport (RFC-0001 C2) — manifest attached, in/out of corpus (item 4)":
@@ -87,6 +115,13 @@ suite "CompatReport (RFC-0001 C2) — manifest attached, in/out of corpus (item 
     # either (9.9.9 >= 9.5.0) -- no entry from since. Both missing
     # symbols, therefore, contribute nothing to the partition here.
     check c.missing.len == 0
+    # RFC-0001 §C.3/§C.4b policy test: "9.9.9" ALSO falls inside
+    # testlib_gated's unbounded `mismatch` interval (lo: "4.0.0") -- but
+    # refusal fires ONLY on a KNOWN (attested) mismatch; an out-of-corpus
+    # version must load normally regardless of which fact interval it
+    # happens to fall in. testlib_gated stays resolved and callable.
+    check testlib_gatedAvailable()
+    check testlib_gated() == 21
 
 # RFC-0001 §9/§C.2, slice C3: the absence partition itself —
 # `mrExpected` vs `mrAnomalous` against header facts, and the `{.since.}`
@@ -148,3 +183,70 @@ suite "CompatReport (RFC-0001 C3) — absence partition":
     check testlibCompat().missing.len > 0
     unloadTestlib()
     check testlibCompat().missing.len == 0
+
+# RFC-0001 §C.3, slice C4b: drift refusal for OPTIONAL symbols —
+# `testlib_gated` resolves at runtime but the fixture manifest records a
+# `mismatch` interval starting at "4.0.0"; `testlib_future` is already
+# absent at runtime (never implemented) AND also grows a `mismatch` fact
+# at "4.0.0", isolating the no-double-count guarantee.
+suite "CompatReport (RFC-0001 C4b) — drift refusal, optional symbols":
+  test "probed version inside a mismatch interval, in-corpus -> refused":
+    corpusProbeMode = cpmMismatchInterval
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
+    check "testlib_gated" in r.missing
+    check not testlib_gatedAvailable()
+    let c = testlibCompat()
+    check c.attestation == atAttested
+    check (symbol: "testlib_gated", reason: mrDriftRefused) in c.missing
+
+  test "wrapper raises SoftlinkError naming the symbol, interval, and refusal":
+    corpusProbeMode = cpmMismatchInterval
+    unloadTestlib()
+    discard loadTestlib()
+    var caught: SoftlinkError
+    try:
+      discard testlib_gated()
+      fail()
+    except SoftlinkError as e:
+      caught = e
+    check caught != nil
+    check "testlib_gated" in caught.msg
+    check ">=4.0.0" in caught.msg
+    check "refus" in caught.msg
+
+  test "non-refusing mode (verified) -> resolved, available, callable, unchanged":
+    corpusProbeMode = cpmVerifiedInterval
+    unloadTestlib()
+    let r = loadTestlib()
+    check "testlib_gated" notin r.missing
+    check testlib_gatedAvailable()
+    check testlib_gated() == 21
+    let c = testlibCompat()
+    check not c.missing.anyIt(it.symbol == "testlib_gated")
+
+  test "no double-count: an already-absent symbol whose facts also carry " &
+       "a mismatch interval at the probed version -> single mrAnomalous entry":
+    corpusProbeMode = cpmMismatchInterval
+    unloadTestlib()
+    discard loadTestlib()
+    let c = testlibCompat()
+    let entries = c.missing.filterIt(it.symbol == "testlib_future")
+    check entries.len == 1
+    check entries[0].reason == mrAnomalous
+
+  test "unload resets drift state; reload in a non-refusing mode restores usability":
+    corpusProbeMode = cpmMismatchInterval
+    unloadTestlib()
+    discard loadTestlib()
+    check not testlib_gatedAvailable()
+    unloadTestlib()
+    let zero = testlibCompat()
+    check zero.attestation == atNoProbe
+    check zero.missing.len == 0
+    corpusProbeMode = cpmVerifiedInterval
+    discard loadTestlib()
+    check testlib_gatedAvailable()
+    check testlib_gated() == 21
+    check not testlibCompat().missing.anyIt(it.symbol == "testlib_gated")

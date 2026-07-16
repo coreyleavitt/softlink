@@ -940,6 +940,18 @@ task test, "Run tests":
     expectManifestCompileOk(mcBase & "tests/tcheck_manifest_mismatch_warning.nim",
       ["recorded a 'mismatch' interval"], [])
 
+    # RFC-0001 §9/§C.1/§C.4b: the version-probe static drift-call scan —
+    # a probe directly calling a wrapper whose symbol carries any
+    # `mismatch` interval in the attached manifest is a macro error
+    # ("testlib_noop" is recorded `mismatch` across the whole corpus, same
+    # fixture the mismatch-warning check directly above uses); a probe
+    # calling a wrapper with NO mismatch interval (`testlib_add`, recorded
+    # `verified`) compiles fine.
+    expectManifestCompileFail(mcBase & "tests/tfail_probe_drift_call.nim",
+      ["the version probe may only call symbols with no known drift ranges"])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_versionprobe_drift_free.nim", [], [])
+
     expectManifestCompileOk(mcBase & "tests/tcheck_manifest_not_in_manifest_hint.nim",
       ["not in compat manifest"], [])
 

@@ -1,0 +1,19 @@
+## RFC-0001 §9/§C.1/§C.4b, positive counterpart to
+## tests/tfail_probe_drift_call.nim: a versionProbe body directly calling
+## a wrapper whose symbol carries NO `mismatch` interval in the attached
+## manifest must compile fine — the static scan only rejects calls to
+## symbols with a recorded drift range. `tests/manifests/testlib.compat.json`
+## records `testlib_add` as `verified` across the whole corpus (no
+## `mismatch` entry at all).
+##
+## Run by the nimble test task (`--compileOnly`), which expects
+## compilation to SUCCEED.
+##
+## NOT compiled by the regular test suite; see the `nimble test` task.
+import softlink
+
+dynlib "libtestlib.so":
+  compatManifest "manifests/testlib.compat.json"
+  proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
+  versionProbe:
+    $testlib_add(1, 2)

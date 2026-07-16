@@ -1270,3 +1270,39 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
   test "classifyAbsence: symbol entirely absent from manifest, since covers it -> acExpected":
     let m = parseManifest(fixtureText, fixturePath)
     check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "5.0.0") == acExpected
+
+  # RFC-0001 §C.3, slice C4b: `firstMismatchInterval`/`formatInterval` —
+  # the pure runtime drift-refusal lookup and its story-text renderer,
+  # tested directly against the same golden fixture (`corpuslib_changed`:
+  # verified/hi:2.0.0, mismatch/[2.0.0,3.0.0), unknown/lo:3.0.0), no
+  # macro/loadX involved — mirrors `classifyAbsence`'s own suite shape
+  # directly above.
+  test "firstMismatchInterval: version inside the mismatch interval -> some(iv)":
+    let m = parseManifest(fixtureText, fixturePath)
+    let iv = firstMismatchInterval(m.symbols, "corpuslib_changed", "2.5.0")
+    check iv.isSome
+    check iv.get == VersionInterval(lo: "2.0.0", hi: "3.0.0")
+
+  test "firstMismatchInterval: version outside the mismatch interval -> none":
+    let m = parseManifest(fixtureText, fixturePath)
+    check firstMismatchInterval(m.symbols, "corpuslib_changed", "1.0.0").isNone
+
+  test "firstMismatchInterval: symbol has no mismatch facts at all -> none":
+    let m = parseManifest(fixtureText, fixturePath)
+    check firstMismatchInterval(m.symbols, "corpuslib_stable", "1.0.0").isNone
+
+  test "firstMismatchInterval: symbol entirely absent from manifest -> none":
+    let m = parseManifest(fixtureText, fixturePath)
+    check firstMismatchInterval(m.symbols, "not_a_real_symbol", "1.0.0").isNone
+
+  test "formatInterval: lower bound only -> \">=lo\"":
+    check formatInterval(VersionInterval(lo: "4.16.0", hi: "")) == ">=4.16.0"
+
+  test "formatInterval: upper bound only -> \"<hi\"":
+    check formatInterval(VersionInterval(lo: "", hi: "5.0.0")) == "<5.0.0"
+
+  test "formatInterval: both bounds -> \">=lo, <hi\"":
+    check formatInterval(VersionInterval(lo: "2.0.0", hi: "3.0.0")) == ">=2.0.0, <3.0.0"
+
+  test "formatInterval: unbounded both ways -> non-empty fallback text":
+    check formatInterval(VersionInterval(lo: "", hi: "")).len > 0
