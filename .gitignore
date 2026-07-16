@@ -1,6 +1,8 @@
 # Compiled binaries
 tests/test_softlink
 tests/test_nimport
+tests/tharvest
+tests/tharvest_msvc_calibration_refusal
 tests/libtestlib.so
 tests/libtestlib.dylib
 tests/testlib.dll

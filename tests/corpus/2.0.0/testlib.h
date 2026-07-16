@@ -8,9 +8,11 @@
  * version changes exactly two things relative to 1.0.0:
  *
  *   corpuslib_changed -- signature CHANGED from 1.0.0 (`int (int)` here
- *                        becomes `double (int, int)`): a binding pinned
- *                        to the 1.0.0 signature classifies `mismatch`
- *                        against this version's header.
+ *                        becomes `double (int)` — RETURN TYPE ONLY, same
+ *                        arity; see 1.0.0/testlib.h's header comment for
+ *                        why an arity change isn't used here): a binding
+ *                        pinned to the 1.0.0 signature classifies
+ *                        `mismatch` against this version's header.
  *
  *   corpuslib_added   -- newly declared in this version (absent from
  *                        1.0.0): a binding classifies `verified` here
@@ -26,7 +28,7 @@ extern "C" {
 
 int corpuslib_stable(int a, int b);
 
-double corpuslib_changed(int a, int b);
+double corpuslib_changed(int a);
 
 int corpuslib_added(int x);
 

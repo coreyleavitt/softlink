@@ -41,7 +41,7 @@ reachable:
 | symbol              | 1.0.0                        | 2.0.0                              | 3.0.0     |
 |----------------------|-------------------------------|--------------------------------------|-----------|
 | `corpuslib_stable`   | `int corpuslib_stable(int a, int b);` | same signature, byte-identical | unreachable (broken include) |
-| `corpuslib_changed`  | `int corpuslib_changed(int a);` | `double corpuslib_changed(int a, int b);` (return type AND arity changed) | unreachable |
+| `corpuslib_changed`  | `int corpuslib_changed(int a);` | `double corpuslib_changed(int a);` (return type changed, arity unchanged) | unreachable |
 | `corpuslib_added`    | not declared at all | `int corpuslib_added(int x);` (newly added) | unreachable |
 
 A binding pinned to `corpuslib_stable`'s signature classifies `verified`
@@ -50,7 +50,16 @@ at both 1.0.0 and 2.0.0.
 A binding pinned to `corpuslib_changed`'s **1.0.0** signature
 (`int corpuslib_changed(int a)`) classifies `verified` at 1.0.0 and
 `mismatch` at 2.0.0, since the header now declares a different return
-type and arity for the same C name.
+type for the same C name (arity is deliberately UNCHANGED — RFC-0001
+slice B3's harvester classifies a verify-stage compile failure as
+`mismatch` only when softlink's own fixed assert message appears in the
+output; an arity change makes the verify TU's call expression itself a
+raw "too few/many arguments" compiler error that preempts the assert
+entirely, which would misclassify as `unknown` instead. A return-type-
+only drift is the one signature-drift shape the shipped call-based
+`_Static_assert` chain can distinguish from an unrelated compile
+failure, so it's the shape this fixture — and every other mismatch
+fixture in this project — uses).
 
 A binding declaring `corpuslib_added` classifies `absent` at 1.0.0 (the
 header simply doesn't mention it) and `verified` at 2.0.0.

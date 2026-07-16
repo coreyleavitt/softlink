@@ -227,7 +227,7 @@ proc runCorpusChecks() =
   let text2 = readFile(corpusDir & "/2.0.0/testlib.h")
   const stableDecl = "int corpuslib_stable(int a, int b);"
   const changedDecl1 = "int corpuslib_changed(int a);"
-  const changedDecl2 = "double corpuslib_changed(int a, int b);"
+  const changedDecl2 = "double corpuslib_changed(int a);"
   if stableDecl notin text1 or stableDecl notin text2:
     quit(b3aTag & "expected the IDENTICAL corpuslib_stable declaration in " &
          "both 1.0.0/testlib.h and 2.0.0/testlib.h")
@@ -241,6 +241,35 @@ proc runCorpusChecks() =
 
   echo "softlink: RFC-0001 slice B3a: validated tests/corpus (" &
        $diskVersions.len & " versions, prepare-hook on 1)"
+
+proc runHarvesterCheck() =
+  ## RFC-0001 slice B3: the harvester classification loop, real end to end —
+  ## `tests/tharvest.nim` (a compiled Nim program, NOT a NimScript check like
+  ## every other `run*Checks` proc in this file) generates its own B.1
+  ## probe-facts dump for `tests/tharvest_binding.nim` via a real
+  ## `-d:softlinkDumpProbes=<dir>` compile, then feeds that dump to
+  ## `tools/harvest/harvester.nim`'s `harvest()` and asserts the full
+  ## classification matrix against `tests/corpus` (slice B3a) via
+  ## `std/unittest` `check`s — plus the pure `classify()` decision table
+  ## (every row, including the row this integration can't cheaply reach:
+  ## a verify failure WITHOUT softlink's own assert message -> `unknown`)
+  ## and the calibration preflight. `std/unittest` sets a nonzero program
+  ## exit on any failed `check` (same mechanism `nim c -r ... test_softlink`
+  ## already relies on above), so `exec` here fails the task exactly like
+  ## every other check in this file.
+  ##
+  ## Real cost, unlike this file's other (compile-only or single-compile)
+  ## checks: each `harvest()`/`runCalibration()` call is a handful of REAL
+  ## `nim c --noLinking` subprocess compiles (baseline once per corpus
+  ## version, existence+verify per probed symbol) — roughly 20 compiles for
+  ## this fixture, on the order of a minute of wall time. Linux/gcc only
+  ## (the slice's stated required minimum leg; RFC-0001 §9 B3's MSVC
+  ## coverage is the calibration-REFUSAL check in `task testMsvcExitCodes`
+  ## below, a much cheaper single-preflight run) — not wired into the
+  ## macOS/windows-mingw branches: doubling this cost on every CI leg for a
+  ## mechanism that doesn't vary by OS wasn't judged worth it; revisit if
+  ## Stage B ships a regression those legs would have caught.
+  exec "nim c -r --path:src tests/tharvest.nim"
 
 task test, "Run tests":
   # testlib.c is compiled under several names to exercise deriveLibPattern:
@@ -960,6 +989,7 @@ task test, "Run tests":
     exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
     runCorpusChecks()
+    runHarvesterCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
   ## `task test`'s `when defined(windows):` branch always builds the
@@ -992,3 +1022,18 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
   expectCompileFailure("nim cpp" & vccFlags & "tests/tfail_prototype_conflict.nim")
   expectCompileFailure("nim c" & vccFlags & "tests/tfail_verifyprocs_prototype_conflict.nim")
   expectCompileFailure("nim cpp" & vccFlags & "tests/tfail_verifyprocs_prototype_conflict.nim")
+
+  # RFC-0001 slice B3: the harvester's calibration preflight must REFUSE
+  # under MSVC's DEFAULT compile mode (`--cc:vcc`, no `/std:clatest`) — the
+  # structural guard against a degraded verification tier silently
+  # poisoning a harvest with false `verified` facts. Unlike the four
+  # checks above (which assert a raw COMPILE fails), this asserts a
+  # successful compile-and-RUN whose own `std/unittest` checks are the
+  # actual assertion — `tests/tharvest_msvc_calibration_refusal.nim` sets
+  # a nonzero program result if any of its checks fail (same mechanism
+  # `runHarvesterCheck` in `task test` above relies on), so `exec` here
+  # fails this task exactly like every other check does. The ORCHESTRATING
+  # `nim c -r` below deliberately does NOT pass `--cc:vcc` itself — only
+  # the harvester's INTERNAL probe compiles (configured inside that test
+  # file) target vcc; see its doc comment for the full rationale.
+  exec "nim c -r --path:src tests/tharvest_msvc_calibration_refusal.nim"

@@ -20,9 +20,20 @@
  *
  *   corpuslib_changed -- declared HERE with one signature
  *                        (`int corpuslib_changed(int a)`); 2.0.0 changes
- *                        both the return type and the arity. A binding
- *                        pinned to the 1.0.0 signature classifies
- *                        `verified` at 1.0.0 and `mismatch` at 2.0.0.
+ *                        the return type only (arity is unchanged — a
+ *                        return-type-only drift is deliberate: it's the
+ *                        one drift shape the shipped call-based
+ *                        `_Static_assert` chain can actually distinguish
+ *                        from an unrelated compile failure. An arity
+ *                        change makes the call expression itself a raw
+ *                        "too few/many arguments" compiler error, which
+ *                        preempts softlink's own assert and would
+ *                        misclassify as `unknown`, not `mismatch` — see
+ *                        RFC-0001 slice B3's harvester, whose
+ *                        `assertMismatchNeedle` confirmation depends on
+ *                        the assert actually running). A binding pinned
+ *                        to the 1.0.0 signature classifies `verified` at
+ *                        1.0.0 and `mismatch` at 2.0.0.
  *
  *   corpuslib_added   -- NOT declared in this version at all; added in
  *                        2.0.0 (see that version's header). A binding
