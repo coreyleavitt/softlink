@@ -991,6 +991,33 @@ task test, "Run tests":
     for base in manifestTmplBases:
       rmFile(mdir & base & ".compat.json")
 
+  proc runVersionProbeChecks() =
+    ## RFC-0001 §9/§C.1, slice C1b: the `versionProbe` directive's negative
+    ## compile checks — grammar misuse (duplicate, malformed shapes),
+    ## outside-block stub, and verifyProcs rejection — plus the
+    ## `declared()` proof that no directive means no state vars at all.
+    ## Same `expectManifestCompileFail`/`gorgeEx` pattern as
+    ## `runManifestChecks` above (OS-agnostic: plain `in` substring checks
+    ## against softlink's OWN diagnostic text, not compiler-wording greps).
+    const vpBase = "nim c --compileOnly --path:src --passC:-I. "
+
+    expectManifestCompileFail(vpBase & "tests/tfail_versionprobe_duplicate.nim",
+      ["duplicate versionProbe directive"])
+
+    expectManifestCompileFail(vpBase & "tests/tfail_versionprobe_bare.nim",
+      ["versionProbe requires a statement body"])
+
+    expectManifestCompileFail(vpBase & "tests/tfail_versionprobe_empty_call.nim",
+      ["versionProbe requires a statement body"])
+
+    expectManifestCompileFail(vpBase & "tests/tfail_versionprobe_outside_block.nim",
+      ["versionProbe is a body directive"])
+
+    expectManifestCompileFail(vpBase & "tests/tfail_versionprobe_verifyprocs.nim",
+      ["versionProbe has no meaning in verifyProcs"])
+
+    expectManifestCompileOk(vpBase & "tests/tcheck_versionprobe_absent.nim", [], [])
+
   # RFC-0001 §4 B.2, classification-table discriminators: the heart of the
   # RFC's harvester classification table, proven directly against the
   # shipped mechanism (no harvester exists yet — that's slice B3):
@@ -1133,6 +1160,7 @@ task test, "Run tests":
     runProbeOnlyChecks()
     runCorpusChecks()
     runManifestChecks()
+    runVersionProbeChecks()
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -1198,6 +1226,7 @@ task test, "Run tests":
     runProbeOnlyChecks()
     runCorpusChecks()
     runManifestChecks()
+    runVersionProbeChecks()
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -1269,6 +1298,7 @@ task test, "Run tests":
     runProbeOnlyChecks()
     runCorpusChecks()
     runManifestChecks()
+    runVersionProbeChecks()
     runHarvesterCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":

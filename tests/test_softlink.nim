@@ -59,11 +59,39 @@ when defined(linux):
     proc sqrt(x: cdouble): cdouble {.cdecl, header: "math.h".}
     proc pow(base: cdouble, exp: cdouble): cdouble {.cdecl, header: "math.h".}
     proc round(x: cdouble): cdouble {.cdecl, header: "<math.h>".}  # angle-bracket syntax
+    # RFC-0001 §9/§C.1, slice C1b, TDD suite item 2: a DELIBERATELY-raising
+    # probe. loadM() must still return its normal LoadResult (every
+    # required symbol here always resolves) with no exception escaping;
+    # the probed-version var stays empty and the probe-failed flag is set.
+    versionProbe:
+      raise newException(ValueError, "deliberate versionProbe failure (RFC-0001 C1b test)")
 
   dynlib "libc.so(.6|)":
     proc srand(seed: cuint) {.cdecl, header: "stdlib.h".}
     proc rand(): cint {.cdecl, header: "stdlib.h".}
+    # RFC-0001 §9/§C.1, slice C1b, TDD suite item 3: a probe that calls
+    # loadC() RECURSIVELY. The reentrancy guard converts the resulting
+    # raise into a failed probe — this outer loadC() call still returns
+    # its normal LoadResult, with no exception escaping.
+    versionProbe:
+      discard loadC()
+      "unreachable — loadC() above always raises reentrantly"
 
+
+# RFC-0001 §9/§C.1, slice C1b: a single, mode-controlled `versionProbe` on
+# the cross-platform TestLib block below, covering every remaining
+# behavior from this slice's TDD suite that doesn't need its OWN dedicated
+# library (a dynlib block may declare at most one versionProbe, so a
+# single library can't host more than one FIXED probe body — a controlled
+# "mode" variable, set by each test before calling loadTestlib(), is the
+# standard seam for this).
+type ProbeMode = enum
+  pmNormal          ## returns a real, parseable version built from a bound wrapper (item 1)
+  pmUnparseable     ## returns a string with NO digit/alpha runs at all (item 4)
+  pmReentrantUnload ## calls unloadTestlib() recursively (item 3, unload variant)
+
+var probeMode = pmNormal
+var probeRunCount = 0  ## bumped once per ACTUAL probe run — item 8 (idempotency)
 
 # Test library — cross-platform (built from tests/testlib.c)
 when defined(windows):
@@ -148,6 +176,19 @@ dynlib TestLib:
   proc testlib_proto_gated_false(): cint
     {.cdecl, prototype: "void testlib_proto_gated_false(double a, double b, double c)",
       verifyWhen: "TESTLIB_VERSION >= 99".}
+
+  # RFC-0001 §9/§C.1, slice C1b: the mode-controlled probe (see `ProbeMode`
+  # above). `pmNormal` calls the block's OWN bound wrapper `testlib_add` —
+  # the TDD suite's item 1 ("probe calling a bound wrapper"), proving the
+  # wrapper-before-load codegen order (C1a) actually lets a probe do this.
+  versionProbe:
+    inc probeRunCount
+    case probeMode
+    of pmNormal: "1." & $testlib_add(2, 3)
+    of pmUnparseable: "---"
+    of pmReentrantUnload:
+      unloadTestlib()
+      "unreachable — unloadTestlib() above always raises reentrantly"
 
 # verifyProcs: compile-time signature verification ONLY (no loading, no
 # wrappers). Correct signatures must compile; the const-return case (#11)
@@ -489,6 +530,28 @@ suite "softlink":
     test "optional: all-required lib returns lrOk not lrOkPartial":
       check loadM().kind == lrOk
 
+    # RFC-0001 §9/§C.1, slice C1b — TDD suite item 2: a deliberately-
+    # raising probe (declared on the libm.so block above) must not escape
+    # loadM(); the LoadResult, probed-version var, and failed flag all
+    # reflect the failure correctly.
+    test "versionProbe: deliberately-raising probe degrades to a failed probe, loadX unaffected":
+      unloadM()
+      let r = loadM()
+      check r.kind == lrOk
+      check softlinkProbedVersionM == ""
+      check softlinkProbeFailedM == true
+
+    # TDD suite item 3 — reentrancy: a probe calling loadC() recursively
+    # (declared on the libc.so block above). The reentrancy guard converts
+    # the raise to a failed probe; this OUTER, non-reentrant loadC() call
+    # still returns its normal LoadResult with no exception escaping.
+    test "versionProbe: reentrant loadC() call from inside its own probe is converted, not escaped":
+      unloadC()
+      let r = loadC()
+      check r.kind == lrOk
+      check softlinkProbedVersionC == ""
+      check softlinkProbeFailedC == true
+
   # Cross-platform tests using testlib
   test "testlib: required symbols work":
     let r = loadTestlib()
@@ -628,6 +691,63 @@ suite "softlink":
     except SoftlinkError as e:
       check e.symbol == "testlib_add"
       check e.library == TestLib
+
+  # RFC-0001 §9/§C.1, slice C1b: versionProbe behaviors exercised through
+  # TestLib's single, mode-controlled probe (see `ProbeMode`/`probeMode`
+  # above the `dynlib TestLib:` block). Probe outcome never affects
+  # `LoadResult.kind`/`.missing` (proven throughout this whole file's
+  # OTHER testlib: tests, which keep passing no matter what `probeMode` a
+  # prior test left behind) — so test-order independence only requires
+  # each test to set its OWN mode before acting, not to reset it
+  # afterward; done anyway, for hygiene.
+  test "versionProbe: probe calling a bound wrapper — version parses, failed flag clear (item 1)":
+    probeMode = pmNormal
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
+    check softlinkProbedVersionTestlib == "1.5"
+    check softlinkProbeFailedTestlib == false
+    probeMode = pmNormal
+
+  test "versionProbe: unparseable returned string -> failed flag set, version empty (item 4)":
+    probeMode = pmUnparseable
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
+    check softlinkProbedVersionTestlib == ""
+    check softlinkProbeFailedTestlib == true
+    probeMode = pmNormal
+
+  test "versionProbe: reentrant unloadTestlib() call from its own probe is converted, not escaped (item 3, unload variant)":
+    probeMode = pmReentrantUnload
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
+    check softlinkProbedVersionTestlib == ""
+    check softlinkProbeFailedTestlib == true
+    probeMode = pmNormal
+
+  test "versionProbe: unloadTestlib() resets probed version and failed flag to zero values, reload still works (item 5)":
+    probeMode = pmNormal
+    unloadTestlib()
+    discard loadTestlib()
+    check softlinkProbedVersionTestlib == "1.5"
+    check softlinkProbeFailedTestlib == false
+    unloadTestlib()
+    check softlinkProbedVersionTestlib == ""
+    check softlinkProbeFailedTestlib == false
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
+    check softlinkProbedVersionTestlib == "1.5"
+
+  test "versionProbe: idempotent (already-loaded) call does not re-run the probe (item 8)":
+    probeMode = pmNormal
+    unloadTestlib()
+    discard loadTestlib()
+    let before = probeRunCount
+    discard loadTestlib()
+    discard loadTestlib()
+    check probeRunCount == before
 
   # Compile-time validation tests
   test "compile-time: rejects proc without calling convention":

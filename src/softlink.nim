@@ -656,6 +656,32 @@ const compatManifestStubMsg =
 
 proc compatManifest*(path: string, refuse: bool = false) {.error: compatManifestStubMsg.}
 
+## RFC-0001 §9/§C.1, slice C1b: the analogous "erroring stub" for
+## `versionProbe`, so a misplaced `versionProbe: ...` outside any `dynlib`
+## block gets a softlink-authored diagnostic instead of a raw compiler
+## error. Unlike `compatManifest` (an ordinary call, `compatManifest("path")`),
+## the `versionProbe: <body>` call site uses colon-block syntax, which only
+## type-checks against a parameter typed `untyped` — and `untyped`
+## parameters are only legal on templates/macros, never plain procs (unlike
+## `compatManifest`'s stub above). A `template` carrying the same
+## `{.error.}` pragma reproduces the identical "diagnostic fires at the USE
+## site, not the definition site" behavior (verified empirically: Nim's
+## `{.error.}` on a template behaves exactly like on a proc). Correctly-
+## placed directives never reach this template at all — `dynlib` recognizes
+## and consumes the `versionProbe` statement structurally (see
+## `isVersionProbeStmt` below) before it is ever resolved as an identifier;
+## `verifyProcs` does the same, but ALWAYS rejects it with its own
+## directive-specific error (no runtime footprint there — see
+## `collectVProcs`).
+const versionProbeStubMsg =
+  "softlink: versionProbe is a body directive of dynlib blocks (RFC-0001 " &
+  "§9/§C.1) — it must appear directly inside a `dynlib \"lib\": ...` " &
+  "block (e.g. `versionProbe: parseFooVersion($Foo_get_version())`), not " &
+  "called outside one."
+
+template versionProbe*(body: untyped) {.error: versionProbeStubMsg.} =
+  discard
+
 type
   CompatManifestDirective = object
     ## RFC-0001 §B.5/§B.5a, slice B6a: one parsed `compatManifest` body
@@ -725,6 +751,68 @@ proc compatManifestDupError(macroName: string, first, second: CompatManifestDire
   "block ('" & first.pathLit & "' and '" & second.pathLit & "') — merge " &
   "them into a single compatManifest directive; a dynlib/verifyProcs " &
   "block may attach at most one compat manifest."
+
+type
+  VersionProbeDirective = object
+    ## RFC-0001 §9/§C.1, slice C1b: one parsed `versionProbe` body
+    ## directive — at most one per `dynlib` block, any position (mirrors
+    ## `CompatManifestDirective` above). `present == false` is the zero
+    ## value (no directive in this block). A malformed shape (see
+    ## `parseVersionProbeDirective`) still sets `present = true` — having
+    ## already reported its own directive-specific error — but leaves
+    ## `bodyStmts` as an empty `nnkStmtList`, so every downstream check
+    ## keyed on "does this block have a REAL probe to splice/guard for"
+    ## tests `present and bodyStmts.len > 0` rather than crashing on a nil
+    ## node or double-reporting the same mistake.
+    present: bool
+    bodyStmts: NimNode
+    node: NimNode
+
+func isVersionProbeStmt(stmt: NimNode): bool =
+  ## True when `stmt` is a `versionProbe` directive statement in ANY shape:
+  ## bare `versionProbe` (parses as a plain `nnkIdent`), `versionProbe()`
+  ## (an `nnkCall` with no further arguments), or the well-formed
+  ## `versionProbe: <body>` (an `nnkCall` whose last argument is a
+  ## `nnkStmtList` — Nim's colon-block call sugar). Checked structurally
+  ## against the bare identifier text, exactly like `isCompatManifestCall`
+  ## above — the block's body is `untyped`, so nothing has been resolved to
+  ## an actual symbol yet; that only happens (deliberately) for a directive
+  ## written OUTSIDE any block, via the erroring stub template above.
+  (stmt.kind == nnkIdent and $stmt == "versionProbe") or
+  (stmt.kind == nnkCall and stmt.len >= 1 and stmt[0].kind == nnkIdent and
+   $stmt[0] == "versionProbe")
+
+proc parseVersionProbeDirective(stmt: NimNode, macroName: string): VersionProbeDirective =
+  ## RFC-0001 §9/§C.1: parse one recognized `versionProbe` directive
+  ## statement. The only well-formed shape is `versionProbe: <stmts>` — an
+  ## `nnkCall` of exactly two children, the second an `nnkStmtList`. Every
+  ## other shape reaching here (bare `versionProbe`, empty-parens
+  ## `versionProbe()`, or a plain call `versionProbe(someArg)`) is a
+  ## directive-specific macro error, never the generic "body must contain
+  ## only proc declarations" error `dynlib` raises for an unrecognized
+  ## statement shape.
+  result.present = true
+  result.node = stmt
+  result.bodyStmts = newStmtList()
+  if stmt.kind == nnkCall and stmt.len == 2 and stmt[1].kind == nnkStmtList:
+    result.bodyStmts = stmt[1]
+  else:
+    error(macroName & ": versionProbe requires a statement body returning " &
+          "a version string — write `versionProbe: <expr-or-stmts>` (e.g. " &
+          "`versionProbe: parseZ3Version($Z3_get_full_version())`); bare " &
+          "`versionProbe` or `versionProbe()` with no block is not a " &
+          "valid probe", stmt)
+
+## RFC-0001 §9/§C.1: "at most one versionProbe per block, any position."
+## Voiced like `compatManifestDupError` above (itself voiced like the #14
+## dup-block guard) — softlink-authored, tells the author what to do,
+## never an opaque redeclaration error. Only `dynlib` ever reaches this —
+## `verifyProcs` rejects EVERY `versionProbe` occurrence outright (see
+## `collectVProcs`), so there is no separate "duplicate" concept there.
+const versionProbeDupErrorMsg =
+  "softlink: dynlib: duplicate versionProbe directive in one block — " &
+  "merge the probes into a single versionProbe: body; a dynlib block may " &
+  "contain at most one version probe."
 
 type
   AppliedManifest = object
@@ -1566,6 +1654,37 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   let handleName = ident("softlinkHandle" & baseName)
   let cachedResultName = ident("softlinkResult" & baseName)
   let libPatternLit = newStrLitNode(resolvedPattern)
+  # RFC-0001 §9/§C.1, slice C1b: the probe's outcome state (read by Stage
+  # C2's future CompatReport, not yet wired) and the internal reentrancy
+  # flag — named alongside `softlinkHandle<Base>`/`softlinkResult<Base>`
+  # above, following the same convention. All three are emitted only when
+  # this block declares a (well-formed) `versionProbe` — see `hasProbe`
+  # below, computed after the body loop that finds out.
+  let probedVersionName = ident("softlinkProbedVersion" & baseName)
+  let probeFailedName = ident("softlinkProbeFailed" & baseName)
+  let loadInProgressName = ident("softlinkLoadInProgress" & baseName)
+  # Hygienic proc name for the versionProbe body's own generated proc (see
+  # its emission point below, alongside the unloadX forward declaration) —
+  # `genSym` rather than a derived-from-baseName ident since this proc is
+  # purely an implementation detail, never referenced outside this macro's
+  # own generated code.
+  let probeProcSym = genSym(nskProc, "versionProbeBody")
+
+  proc reentrancyRaiseStmt(procNameStr: string): NimNode =
+    ## RFC-0001 §9/§C.1: "`loadX` and `unloadX` raise `SoftlinkError`
+    ## (\"loadX called reentrantly from its own versionProbe\")" — built
+    ## here (a closure over `libPatternLit`) so both `loadX`'s and
+    ## `unloadX`'s own reentrancy checks share one wording, adapted per the
+    ## actual generated proc name (`procNameStr`).
+    newNimNode(nnkRaiseStmt).add(
+      newNimNode(nnkObjConstr).add(
+        ident("SoftlinkError"),
+        newNimNode(nnkExprColonExpr).add(ident("msg"), newStrLitNode(
+          procNameStr & " called reentrantly from its own versionProbe")),
+        newNimNode(nnkExprColonExpr).add(ident("library"), libPatternLit),
+        newNimNode(nnkExprColonExpr).add(ident("symbol"), newStrLitNode(""))
+      )
+    )
 
   result = newStmtList()
 
@@ -1617,6 +1736,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var procs: seq[SoftlinkProc]
   var seenNames: HashSet[string]
   var manifestDirective: CompatManifestDirective
+  var versionProbeDirective: VersionProbeDirective
 
   for stmt in body:
     # RFC-0001 §B.5, slice B6a: the `compatManifest` body directive — at
@@ -1631,6 +1751,18 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         error(compatManifestDupError("dynlib", manifestDirective, d), stmt)
       else:
         manifestDirective = d
+      continue
+
+    # RFC-0001 §9/§C.1, slice C1b: the `versionProbe` body directive — at
+    # most one per block, any position. Consumed here (never re-emitted
+    # verbatim — its statements are spliced into `loadXxx` below), exactly
+    # like `compatManifest` above.
+    if isVersionProbeStmt(stmt):
+      let d = parseVersionProbeDirective(stmt, "dynlib")
+      if versionProbeDirective.present:
+        error(versionProbeDupErrorMsg, stmt)
+      else:
+        versionProbeDirective = d
       continue
 
     if stmt.kind != nnkProcDef:
@@ -1679,6 +1811,32 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newEmptyNode()
       )
     ))
+
+  # RFC-0001 §9/§C.1, slice C1b: true iff this block declared a WELL-FORMED
+  # `versionProbe` — a malformed shape already reported its own error above
+  # and leaves `bodyStmts` empty, so every check below gated on `hasProbe`
+  # degrades to "as if no probe were declared" rather than crashing or
+  # emitting a second, confusing diagnostic for the same mistake.
+  let hasProbe = versionProbeDirective.present and versionProbeDirective.bodyStmts.len > 0
+
+  # RFC-0001 §9/§C.2 design guidance (C2 itself — CompatReport — is a later
+  # slice): the probe's outcome needs a home for that future query proc to
+  # read. Two unexported module-level vars, following the
+  # `softlinkHandle<Base>` naming convention, emitted ONLY when this block
+  # declares a versionProbe — mirrors slice B6b's "no directive → no
+  # const" precedent (provable via `declared()`; see
+  # tests/tcheck_versionprobe_absent.nim). `softlinkLoadInProgress<Base>`
+  # is a third, purely-internal var backing the reentrancy guard below —
+  # gated the same way, since it would be meaningless without a probe (no
+  # other user code ever runs inside loadX/unloadX, per the existing
+  # no-thread-safety stance).
+  if hasProbe:
+    result.add(newNimNode(nnkVarSection).add(
+      newNimNode(nnkIdentDefs).add(probedVersionName, ident("string"), newEmptyNode())))
+    result.add(newNimNode(nnkVarSection).add(
+      newNimNode(nnkIdentDefs).add(probeFailedName, ident("bool"), newEmptyNode())))
+    result.add(newNimNode(nnkVarSection).add(
+      newNimNode(nnkIdentDefs).add(loadInProgressName, ident("bool"), newEmptyNode())))
 
   # RFC-0001 §4 B.1: dump this block's probe facts (no-op unless
   # -d:softlinkDumpProbes=<dir> is given). `libPattern` (the macro's
@@ -1837,6 +1995,39 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ))
     result.add(ptrAccessorProc)
 
+  # RFC-0001 §9/§C.1: a versionProbe body may legitimately call the block's
+  # own `loadX`/`unloadX` (the reentrancy guard below must reject the
+  # attempt, but rejecting still requires the CALL to type-check in the
+  # first place). The probe's OWN statements are emitted as a separate
+  # top-level proc below (`probeProcSym`), positioned BEFORE `loadX` itself
+  # — so, unlike the wrapper-before-load reorder C1a made (where a
+  # self-recursive `loadX` call from ITS OWN body needs no forward decl),
+  # a call to `loadX`/`unloadX` from WITHIN the probe proc needs both
+  # forward-declared here first. Real bodies for both still follow below,
+  # unchanged.
+  if hasProbe:
+    result.add(newProc(name = postfix(loadProcName, "*"),
+                        params = [ident("LoadResult")], body = newEmptyNode()))
+    result.add(newProc(name = postfix(unloadProcName, "*"), body = newEmptyNode()))
+
+    # RFC-0001 §9/§C.1: the probe's own statements are emitted as a
+    # dedicated proc returning `string`, called (once) from inside loadX
+    # below — NOT spliced directly as a `block: <stmts>` EXPRESSION.
+    # Empirically, Nim cannot infer a type for a bare `block:` whose ONLY
+    # content is a `raise` (`Error: ... has no type (or is ambiguous)`,
+    # verified directly) — exactly the shape a "deliberately-raising
+    # probe" (this slice's own test suite requires one) produces. An
+    # ordinary proc with a DECLARED return type has no such problem: Nim
+    # already accepts a proc body whose sole statement is `raise` (its
+    # return type comes from the signature, not from inferring a common
+    # type across the body), so routing through a real proc sidesteps the
+    # block-expression inference gap entirely.
+    result.add(newProc(
+      name = probeProcSym,
+      params = [ident("string")],
+      body = versionProbeDirective.bodyStmts.copy()
+    ))
+
   # loadXxx*(): LoadResult
   block:
     var hasOptional = false
@@ -1844,6 +2035,24 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       if p.isOptional: hasOptional = true; break
     var loadBody = newStmtList()
     let missingName = ident("softlinkMissing")
+
+    # RFC-0001 §9/§C.1: reentrancy guard — must run BEFORE the idempotent
+    # handle-check below. By the time a versionProbe body could call
+    # loadX again, `handle` is already non-nil (assigned further down in
+    # THIS very call, well before Phase 3/the probe runs) but
+    # `cachedResult` has not yet been written for THIS load — so the
+    # ordinary idempotent check below would return a FABRICATED default
+    # LoadResult (the zero-value `lrOk`) before real classification ever
+    # ran. Checking the load-in-progress flag first turns that into a
+    # raised SoftlinkError instead, which the probe's own try/except
+    # (spliced in below, after Phase 3) converts to a failed probe — the
+    # caller that triggered the ORIGINAL, non-reentrant loadX call still
+    # gets a real, correctly-classified LoadResult.
+    if hasProbe:
+      loadBody.add(newIfStmt((
+        loadInProgressName,
+        newStmtList(reentrancyRaiseStmt("load" & baseName))
+      )))
 
     # if not handle.isNil: return cachedResult
     loadBody.add(newIfStmt((
@@ -1954,6 +2163,61 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         # Required: guaranteed non-nil by Phase 1 early-return on failure
         loadBody.add(newAssignment(s.ptrName, newNimNode(nnkCast).add(s.procTy, s.tempSym)))
 
+    # RFC-0001 §9/§C.1: the version probe. Runs AFTER Phase 3 (every
+    # resolved pointer — including optional ones — is live, so the probe
+    # may call any of the block's own wrappers) and BEFORE the cached
+    # LoadResult is written below (a failing probe must never change that
+    # cached result — loadX's total, non-raising contract). ANY exception
+    # (a wrapper raising on an unresolved optional symbol, the reentrancy
+    # raise above, or anything else the probe body does) degrades to
+    # probeFailed/"" — never escapes. A successfully-returned string that
+    # fails to parse under the C0 grammar (`parseVersion`, the same parser
+    # `{.since.}` uses) is ALSO a failed probe. The load-in-progress flag
+    # is set for exactly this window (RFC: "while it is set, loadX and
+    # unloadX raise") — narrower than the whole pipeline, since the only
+    # reachable caller during it is the probe body itself (no other user
+    # code ever runs inside loadX/unloadX, per the existing
+    # no-thread-safety stance) — reset via `finally` so it clears on every
+    # exit from the probe, including a raise.
+    if hasProbe:
+      loadBody.add(newAssignment(loadInProgressName, newLit(true)))
+
+      let probeValSym = genSym(nskLet, "probeVal")
+      let probeParsedSym = genSym(nskLet, "probeParsed")
+
+      var tryBody = newStmtList()
+      # let probeVal = <the versionProbe's own statements, as a proc call>
+      tryBody.add(newLetStmt(probeValSym, newCall(probeProcSym)))
+      tryBody.add(newLetStmt(probeParsedSym,
+        newCall(bindSym("parseVersion"), probeValSym)))
+
+      var classifyIf = newNimNode(nnkIfStmt)
+      classifyIf.add(newNimNode(nnkElifBranch).add(
+        newCall(bindSym("isSome"), probeParsedSym),
+        newStmtList(
+          newAssignment(probedVersionName, probeValSym),
+          newAssignment(probeFailedName, newLit(false))
+        )
+      ))
+      classifyIf.add(newNimNode(nnkElse).add(newStmtList(
+        newAssignment(probedVersionName, newStrLitNode("")),
+        newAssignment(probeFailedName, newLit(true))
+      )))
+      tryBody.add(classifyIf)
+
+      let exceptBody = newStmtList(
+        newAssignment(probedVersionName, newStrLitNode("")),
+        newAssignment(probeFailedName, newLit(true))
+      )
+
+      var tryStmt = newNimNode(nnkTryStmt)
+      tryStmt.add(tryBody)
+      tryStmt.add(newNimNode(nnkExceptBranch).add(ident("CatchableError"), exceptBody))
+      tryStmt.add(newNimNode(nnkFinally).add(newStmtList(
+        newAssignment(loadInProgressName, newLit(false))
+      )))
+      loadBody.add(tryStmt)
+
     # Cache and return result
     if hasOptional:
       # if missing.len > 0: cache lrOkPartial else: cache lrOk
@@ -2000,6 +2264,19 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # unloadXxx*()
   block:
     var unloadBody = newStmtList()
+
+    # RFC-0001 §9/§C.1: the same reentrancy guard as loadX above — a probe
+    # calling unloadX() recursively must raise, not silently unload the
+    # library out from under the still-in-progress loadX pipeline that is
+    # running it. Unconditional (checked before the `handle.isNil` test
+    # below): the RFC's guard applies "while it is set", regardless of
+    # load state.
+    if hasProbe:
+      unloadBody.add(newIfStmt((
+        loadInProgressName,
+        newStmtList(reentrancyRaiseStmt("unload" & baseName))
+      )))
+
     var ifBody = newStmtList()
     ifBody.add(newCall(ident("unloadLib"), handleName))
     ifBody.add(newAssignment(handleName, newNilLit()))
@@ -2013,6 +2290,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
       )
     ))
+    if hasProbe:
+      # RFC-0001 §9/§C.1: reset the probe's outcome alongside every other
+      # piece of per-load state above — a future `fooCompat()` (Stage C2,
+      # not yet wired) called after `unloadFoo()` must never serve a
+      # previous load's probe result.
+      ifBody.add(newAssignment(probedVersionName, newStrLitNode("")))
+      ifBody.add(newAssignment(probeFailedName, newLit(false)))
     unloadBody.add(newIfStmt((
       prefix(newCall(ident("isNil"), handleName), "not"),
       ifBody
@@ -2044,6 +2328,15 @@ proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: Co
         error(compatManifestDupError("verifyProcs", manifestDirective, d), stmt)
       else:
         manifestDirective = d
+      continue
+    if isVersionProbeStmt(stmt):
+      # RFC-0001 §9/§C.1, judgment call (not stated explicitly by the
+      # RFC): verifyProcs has no library identity, no loadX, no runtime
+      # footprint at all — there is no pipeline for a probe to run inside.
+      # Rejected outright, in every shape, analogous to how `noverify` is
+      # rejected in verifyProcs mode above ("meaningless... simply omit").
+      error("versionProbe has no meaning in verifyProcs — it has no " &
+            "runtime footprint (no loadX to run it inside); omit it", stmt)
       continue
     if stmt.kind != nnkProcDef:
       error("verifyProcs body must contain only proc declarations (or a compatManifest directive)", stmt)
