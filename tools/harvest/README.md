@@ -356,11 +356,13 @@ below) but has no library identity to check, no loaded pointers, and no
 runtime footprint to refuse.
 
 `compatManifest` also accepts an optional `refuse = true/false` named
-argument on `dynlib` blocks (`compatManifest("z3.compat.json", refuse = false)`)
-— parsed and stored today, scoping Stage C's future drift-refusal policy
-per block. It has **no runtime effect yet**: drift refusal itself
-(unloading/failing a load whose live version falls in a `mismatch` range)
-is Stage C, not yet shipped (see the note at the end of this section).
+argument on `dynlib` blocks (`compatManifest("z3.compat.json", refuse = false)`),
+scoping the per-block drift-refusal escape hatch: with a `versionProbe`
+also on the block, `refuse = false` disables drift refusal — no symbol is
+ever refused; the recorded `mismatch` still warns at compile time (above).
+See the runtime half of this feature —
+`versionProbe`, `fooCompat()`/`CompatReport`, and drift refusal itself —
+in the main **[README](../../README.md#runtime-versionprobe-foocompat-and-drift-refusal)**.
 
 With a manifest attached, at compile time:
 
@@ -395,11 +397,12 @@ With a manifest attached, at compile time:
   pinned `softlink/versions` types the harvester uses), for future
   load-time use.
 
-**Not yet implemented** (RFC-0001 Stage C, a separate, later release):
-runtime version probing (`versionProbe:`), the generated `fooCompat()` /
-`CompatReport` load-time attestation, and drift *refusal* (unloading a
-library whose live version falls in a `mismatch` range). Everything
-above is compile-time-only today — attaching a manifest changes what the
-compiler checks and warns about, not what `loadFoo()` does at runtime.
-Without a `compatManifest` directive at all, behavior is unchanged
-(purely additive).
+Everything above is compile-time-only: attaching a manifest, by itself,
+changes what the compiler checks and warns about, not what `loadFoo()`
+does at runtime. Runtime version probing (`versionProbe:`), the generated
+`fooCompat()`/`CompatReport` load-time attestation, and drift *refusal*
+(re-nilling or failing a load whose live version falls in a `mismatch`
+range) are RFC-0001 Stage C — shipped, but a separate opt-in on top of
+this one (a block needs its own `versionProbe` for any of it to engage;
+see the README section linked above). Without a `compatManifest`
+directive at all, behavior is unchanged (purely additive).

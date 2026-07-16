@@ -309,10 +309,16 @@ error: 'mylib_ponit_t' undeclared; did you mean 'mylib_point_t'?
 
 Each type requires a `ctype` pragma mapping to the C struct name in the header. The types are defined as regular Nim objects (no `{.importc.}`) — this is what allows the size comparison to work, since the Nim and C structs are separate definitions that can be independently measured.
 
-## Verified version compat (Stage B)
+## Verified version compat
 
 Header verification (above) proves your Nim signature matches *today's*
-header. It says nothing about last year's release, or next year's.
+header. It says nothing about last year's release, or next year's — that's
+what this section covers, in two halves: a **compile-time** check against
+a harvested header corpus, and a **runtime** check against the version of
+the library your program actually loads.
+
+### Compile-time: harvest + `compatManifest`
+
 `tools/harvest/` adds a `softlink harvest` CLI that recompiles your
 binding against a versioned corpus of upstream headers and records, per
 symbol per version, whether it was verified, absent, mismatched, or
@@ -343,6 +349,139 @@ classification table, the calibration preflight, the fast path, exit
 codes, the manifest schema, and a copy-paste CI template
 (`tools/harvest/ci-template.yaml`) for keeping a committed manifest from
 rotting.
+
+### Runtime: `versionProbe`, `fooCompat()`, and drift refusal
+
+A manifest only helps if the loader knows *which* version it actually
+loaded. `versionProbe` supplies that: a body directive that runs after a
+block's own symbols resolve and returns the runtime library's version as
+a string. It's a body, not a pragma, because real probes are
+heterogeneous — Z3 uses out-params, mbedtls returns a string, some
+libraries need arithmetic on an int — so softlink asks for a string and
+stays out of the parsing business:
+
+```nim
+dynlib "z3":
+  compatManifest "z3.compat.json"
+  proc Z3_get_full_version(): cstring {.cdecl, header: "z3.h".}
+  versionProbe:
+    parseZ3Version($Z3_get_full_version())   # may call the block's own wrappers
+```
+
+Any exception out of the probe body (a parse failure, a wrapper raising on
+an unresolved optional symbol) degrades to `attestation = atProbeFailed` —
+`loadZ3()` itself never raises. Calling `loadZ3()`/`unloadZ3()` from
+*inside* the probe (directly or transitively, e.g. through a helper) is a
+reentrancy bug caught at runtime: it raises into the probe's own
+`try/except`, which converts it to `atProbeFailed` instead of returning a
+fabricated `lrOk`. And at compile time, the probe body is scanned for
+direct calls to symbols the attached manifest already records a
+`mismatch` interval for — "the probe must not be the drift" — which is a
+macro error, not a runtime surprise (indirect calls can't be seen
+statically; that residual risk is documented, not defended against).
+
+Every block generates a query proc unconditionally, whether or not it
+declares a probe or a manifest at all:
+
+```nim
+proc z3Compat*(): CompatReport
+```
+
+```nim
+type
+  Attestation* = enum
+    atNoProbe      ## no versionProbe declared, or the probe never ran
+                   ## (the load failed before symbols resolved)
+    atProbeFailed  ## probe ran and raised, or returned an unparseable string
+    atNoManifest   ## probe succeeded, but no compatManifest is attached
+    atOutOfCorpus  ## probed version outside the manifest's harvested corpus
+    atAttested     ## probed version inside the manifest's harvested corpus
+
+  CompatReport* = object
+    runtimeVersion*: string   ## "" unless the probe succeeded
+    attestation*: Attestation
+    missing*: seq[tuple[symbol: string, reason: MissingReason]]
+```
+
+`missing` partitions *why* each symbol in `LoadResult.missing` didn't
+resolve, against the manifest's header facts:
+
+| `MissingReason` | Meaning |
+|---|---|
+| `mrExpected` | this runtime predates the symbol (manifest facts or `{.since.}`) |
+| `mrAnomalous` | this version's headers declare it, yet it did not resolve |
+| `mrDriftRefused` | it resolved, but was refused for known signature drift |
+
+`unloadX()` resets the report to its zero value (`atNoProbe`, `""`, no
+missing entries) alongside its other resets — `fooCompat()` after
+`unloadFoo()` never serves a previous load's trust signals.
+
+#### Drift refusal
+
+With a manifest *and* a probe both present: if the runtime version falls
+inside a symbol's recorded `mismatch` interval, that symbol is **refused**
+— treated as absent, because it's unusable:
+
+- **Optional symbol:** the pointer is re-nilled, `xxxAvailable()` returns
+  `false`, the symbol lands in `LoadResult.missing` and in the report as
+  `mrDriftRefused`. The wrapper raises `SoftlinkError` with the story
+  (`"testlib_gated: signature drift at >=4.0.0 per compat manifest;
+  refusing unsafe dispatch"`).
+- **Required symbol:** the whole load fails as if the symbol were
+  missing — library unloaded, `lrSymbolNotFound` with the symbol name,
+  `fooCompat()` carries the drift explanation. This preserves the
+  existing invariant **`lrOk` ⟹ every required wrapper is safe to call**.
+
+Refusal only fires on a **known** mismatch: a probed version outside the
+manifest's corpus (`atOutOfCorpus`) loads normally, because refusing on a
+guess would be worse than not checking at all — a distro-patched version
+string could easily land inside a recorded interval it doesn't actually
+share the bug with.
+
+#### Escape hatches, scoped to who holds them
+
+- **Binding author** (knows a specific build is locally patched):
+  `compatManifest("mylib.compat.json", refuse = false)` — per block.
+  Nothing gets refused: drifted-on-paper symbols stay resolved and
+  callable, and `fooCompat()` reports them as present (there's no
+  "resolved but drifted" entry to serve). Drift visibility stays at
+  compile time, where the manifest's recorded `mismatch` already warns.
+- **Downstream consumer** (can't edit the binding's source; needs an
+  override for a vendor rebuild under an old version string):
+  `-d:softlinkNoDriftRefusal` — build-wide, wins over every block's own
+  directive.
+
+`xxxPtr()` reads the same pointer variable a wrapper dispatches through,
+so it's also nil under refusal — the two knobs above are the override,
+not `xxxPtr()`.
+
+#### Degradation
+
+| Probe? | Manifest? | Result |
+|---|---|---|
+| No | No | Pre-Stage-C behavior, unchanged |
+| No | Yes | Manifest is completely inert at runtime — no partition, no refusal |
+| Yes | No | `atNoManifest`; `runtimeVersion` populated, nothing to check it against |
+| Yes | Yes | Full attestation, absence partition, and drift refusal |
+
+#### Example
+
+```nim
+dynlib "mylib":
+  compatManifest "mylib.compat.json"
+  proc mylib_init(): cint {.cdecl, header: "mylib.h".}
+  proc mylib_new_thing(): cint {.cdecl, optional, header: "mylib.h".}
+  proc mylib_version(): cstring {.cdecl, header: "mylib.h".}
+  versionProbe:
+    parseMylibVersion($mylib_version())   # calls the block's own wrapper
+
+let r = loadMylib()
+if r.kind in {lrOk, lrOkPartial}:
+  let c = mylibCompat()
+  echo c.attestation, " @ ", c.runtimeVersion
+  for (symbol, reason) in c.missing:
+    echo symbol, ": ", reason
+```
 
 ## Comparison
 
