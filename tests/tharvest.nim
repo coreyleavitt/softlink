@@ -63,6 +63,16 @@ let dumpFile = dumpDir / "Corpuslib.probes.json"
 doAssert fileExists(dumpFile),
   "softlink: RFC-0001 slice B3: expected dump file to exist: " & dumpFile
 
+# Hoisted to file scope (rather than a suite-local `let`) so BOTH the
+# "harvest — full classification matrix" suite below AND the slice-B5
+# "driftAlarm — integration" suite further down can reuse this ONE real
+# harvest — `unittest.suite` is `{.dirty.}` but still wraps its body in a
+# `block:`, so a suite-local `let` is invisible from a sibling suite; only
+# a genuinely file-scope binding is shared. Never re-harvested (real `nim
+# c --noLinking` subprocess work, ~1 minute wall time — see
+# `runHarvesterCheck`'s doc comment in softlink.nimble).
+let r = harvest(dumpFile, "tests" / "corpus")
+
 suite "runCalibration — preflight (RFC-0001 SS4 B.2)":
   test "the dev toolchain's own known-answer trio classifies correctly":
     let outcome = runCalibration()
@@ -172,8 +182,81 @@ suite "buildManifest — pure manifest JSON (RFC-0001 SS4 B.3, slice B4)":
     check j["corpus"][0]["source"].getStr == "git:example/foo@aaaa"
     check j["corpus"][1]["version"].getStr == "2.0.0"
 
+suite "driftAlarm — pure decision (RFC-0001 SS4 B.4, slice B5)":
+  ## Synthetic `HarvestResult`s — no real compiles. Pins the spec-gap
+  ## resolution the slice brief hands down: the default support range is
+  ## the ENTIRE harvested corpus (an unbounded `VersionInterval`), and an
+  ## explicit narrowed range uses the SAME half-open, ""-unbounded
+  ## semantics as B0/B4 (`cmpVersion`-compared, lo inclusive, hi exclusive).
+
+  test "no mismatch anywhere -> not tripped, empty diagnosis":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo"]
+    hr.versions = @["1.0.0", "2.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkVerified}.toTable
+    let (tripped, diag) = driftAlarm(hr)
+    check not tripped
+    check diag.len == 0
+
+  test "one mismatch, default (whole-corpus) range -> tripped; names symbol + version + verbatim F3 sentence":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo"]
+    hr.versions = @["1.0.0", "2.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkMismatch}.toTable
+    let (tripped, diag) = driftAlarm(hr)
+    check tripped
+    check "foo" in diag
+    check "2.0.0" in diag
+    check f3Sentence in diag
+
+  test "mismatch OUTSIDE an explicit narrowed range -> not tripped":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo"]
+    hr.versions = @["1.0.0", "2.0.0", "3.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkMismatch, "3.0.0": fkVerified}.toTable
+    let (tripped, diag) = driftAlarm(hr, VersionInterval(hi: "2.0.0"))
+    check not tripped
+    check diag.len == 0
+
+  test "mismatch exactly AT lo (inclusive) -> tripped":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo"]
+    hr.versions = @["1.0.0", "2.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkMismatch}.toTable
+    let (tripped, _) = driftAlarm(hr, VersionInterval(lo: "2.0.0"))
+    check tripped
+
+  test "mismatch exactly AT hi (exclusive) -> NOT tripped":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo"]
+    hr.versions = @["1.0.0", "2.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkMismatch}.toTable
+    let (tripped, _) = driftAlarm(hr, VersionInterval(hi: "2.0.0"))
+    check not tripped
+
+  test "unknown inside range -> not tripped (inconclusive is not an alarm)":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo"]
+    hr.versions = @["1.0.0", "2.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkUnknown}.toTable
+    let (tripped, _) = driftAlarm(hr)
+    check not tripped
+
+  test "multiple offending symbols -> all named in the diagnosis":
+    var hr: HarvestResult
+    hr.probedSymbols = @["foo", "bar"]
+    hr.versions = @["1.0.0", "2.0.0"]
+    hr.facts["foo"] = {"1.0.0": fkVerified, "2.0.0": fkMismatch}.toTable
+    hr.facts["bar"] = {"1.0.0": fkMismatch, "2.0.0": fkVerified}.toTable
+    let (tripped, diag) = driftAlarm(hr)
+    check tripped
+    check "foo" in diag
+    check "bar" in diag
+
 suite "harvest — full classification matrix against the B3a fixture corpus":
-  let r = harvest(dumpFile, "tests" / "corpus")
+  ## `r` is the file-scope real harvest defined above (shared with the
+  ## slice-B5 `driftAlarm` integration suite further down) — not a
+  ## suite-local `let` (see that binding's own doc comment for why).
 
   test "corpus versions enumerated in version order":
     check r.versions == @["1.0.0", "2.0.0", "3.0.0"]
@@ -226,5 +309,49 @@ suite "harvest — full classification matrix against the B3a fixture corpus":
     let manifest = buildManifest(r, corpus, meta)
     let golden = parseJson(readFile("tests" / "corpus" / "expected.compat.json"))
     check golden == manifest
+
+suite "driftAlarm — integration against the real harvest (RFC-0001 SS4 B.4, slice B5)":
+  ## Reuses the real `r` harvested in the suite above — no second harvest.
+  ## `tests/corpus/README.md`: `corpuslib_changed` is `mismatch` at 2.0.0,
+  ## the only mismatch anywhere in this fixture corpus.
+
+  test "default (whole-corpus) range trips on corpuslib_changed's 2.0.0 mismatch":
+    let (tripped, diag) = driftAlarm(r)
+    check tripped
+    check "corpuslib_changed" in diag
+    check "2.0.0" in diag
+    check f3Sentence in diag
+
+  test "narrowed range excluding the mismatch version -> not tripped":
+    let (tripped, diag) = driftAlarm(r, VersionInterval(hi: "2.0.0"))
+    check not tripped
+    check diag.len == 0
+
+suite "harvester CLI shim — drift alarm exit code (RFC-0001 SS4 B.4, slice B5, integration)":
+  ## The slice is explicitly "(integration)": the RFC text says `softlink
+  ## harvest` "exits nonzero" — a claim about the actual CLI process, not
+  ## just the pure `driftAlarm` decision. This compiles AND RUNS the real
+  ## `when isMainModule` shim (`tools/harvest/harvester.nim`) against the
+  ## already-generated dump + the real fixture corpus (both still on disk
+  ## at this point — `dumpDir` is only removed at the very end of this
+  ## file) via one `nim c -r` invocation, exactly the usage line the
+  ## module's own doc comment gives: `harvester <dumpFile> <corpusDir>
+  ## [nimPath ...]`.
+  ##
+  ## Scoping (per the slice brief): only the nonzero-exit path is checked
+  ## here. A cheap "success path is still exit 0" fixture would need a
+  ## second, no-mismatch binding/corpus — a second real harvest, doubling
+  ## this already ~1-minute-of-wall-time suite's cost for a fact already
+  ## covered for free at the `driftAlarm` unit level above (the shim's
+  ## `quit(1)` is a direct, untested-in-isolation `if tripped: quit(1)` --
+  ## nothing about exit-0 behavior is specific to the CLI wiring). See the
+  ## slice brief's own explicit accept-nonzero-only instruction.
+  test "running the real CLI shim against the dump + corpus exits nonzero and prints the F3 diagnosis":
+    let harvesterModule = "tools" / "harvest" / "harvester.nim"
+    let shimCmd = "nim c -r --path:src " & harvesterModule & " " & dumpFile &
+      " " & ("tests" / "corpus")
+    let (output, exitCode) = execCmdEx(shimCmd)
+    check exitCode != 0
+    check f3Sentence in output
 
 removeDir(dumpDir)

@@ -644,6 +644,85 @@ proc writeManifest*(path: string, manifest: JsonNode) =
   ## whitespace brittleness).
   writeFile(path, manifest.pretty)
 
+# ---------------------------------------------------------------------------
+# Drift alarm (RFC-0001 SS4 B.4, slice B5)
+#
+# The manifest (above) is Stage B's honest artifact: it records mismatch
+# intervals right alongside verified/absent/unknown ones, no editorializing.
+# This section is the CI TRIPWIRE layered on top of it — a pure decision
+# (`driftAlarm`) over an already-produced `HarvestResult`, wired into the
+# `when isMainModule` shim below to turn "a mismatch exists in the support
+# range" into a nonzero process exit, which is what actually stops a CI
+# pipeline (the RFC's own framing: "before any process loaded anything").
+# ---------------------------------------------------------------------------
+
+const f3Sentence* =
+  "one Nim signature cannot be sound across this range — narrow the " &
+  "range or split the binding."
+  ## RFC-0001 SS4 B.4's diagnosis sentence, verbatim — the ONE piece of
+  ## prose `driftAlarm`'s diagnosis is required to contain, and what the
+  ## CLI exit-code integration test (`tests/tharvest.nim`) greps stdout/
+  ## stderr for.
+
+func versionInSupportRange(v: string, r: VersionInterval): bool =
+  ## Half-open range membership, IDENTICAL semantics to B0's
+  ## `VersionInterval`/B4's manifest intervals: `lo` inclusive, `hi`
+  ## exclusive, either bound `""` meaning unbounded in that direction.
+  ## Reuses `cmpVersion`, never raw string comparison — see B0's own
+  ## "4.9.0" < "4.10.0" property this must not silently violate.
+  (r.lo.len == 0 or cmpVersion(v, r.lo) >= 0) and
+  (r.hi.len == 0 or cmpVersion(v, r.hi) < 0)
+
+func driftAlarm*(r: HarvestResult,
+                  supportRange: VersionInterval = VersionInterval(lo: "", hi: "")
+                  ): tuple[tripped: bool, diagnosis: string] =
+  ## RFC-0001 SS4 B.4 (slice B5): the CI drift-alarm decision. Scans every
+  ## `(symbol, version)` pair `harvest` classified and trips iff at least
+  ## one is `fkMismatch` AND inside `supportRange`.
+  ##
+  ## `supportRange` defaults to the fully-unbounded interval, i.e. "the
+  ## binding's claimed support range is the entire harvested corpus" — the
+  ## RFC never defines "claimed support range" at Stage B (that's Stage
+  ## C3's `{.since.}`, not this slice), and the corpus IS exactly the
+  ## version set the maintainer chose to harvest, so any `mismatch`
+  ## anywhere in it trips the alarm by default. A caller may narrow this
+  ## explicitly (e.g. a corpus deliberately extended with ancient versions
+  ## harvested purely for `absent` provenance, outside the real support
+  ## window) — NOT exposed as a CLI flag in this slice (B8's UX question).
+  ##
+  ## `unknown`/`absent`/`verified` never trip this — ONLY `mismatch` (the
+  ## F3 signal: a pinned Nim signature provably conflicts with a supported
+  ## version's header). `unknown` is inconclusive, not evidence of
+  ## anything, and must not fail CI on its own (a 3.0.0-style broken corpus
+  ## snapshot is already visible in the manifest, not silently swallowed,
+  ## but it does not itself trip THIS alarm).
+  ##
+  ## `tripped == false` implies `diagnosis == ""`. When tripped, the
+  ## diagnosis names EVERY offending symbol together with every in-range
+  ## mismatched version (not merely the first one found), followed by the
+  ## RFC's own F3 sentence verbatim (`f3Sentence`) — the CI log must be
+  ## self-sufficient: "which symbol(s), which version(s), what to do."
+  var offenders: seq[tuple[cname: string, versions: seq[string]]] = @[]
+  for cname in r.probedSymbols:
+    var hits: seq[string] = @[]
+    for v in r.versions:
+      if r.facts[cname][v] == fkMismatch and versionInSupportRange(v, supportRange):
+        hits.add v
+    if hits.len > 0:
+      offenders.add (cname, hits)
+
+  if offenders.len == 0:
+    return (tripped: false, diagnosis: "")
+
+  var lines: seq[string] = @[
+    "softlink harvest: DRIFT ALARM (RFC-0001 SS4 B.4) — " & $offenders.len &
+    " symbol(s) have a `mismatch` classification inside the claimed " &
+    "support range:"]
+  for o in offenders:
+    lines.add("  " & o.cname & ": mismatch at " & o.versions.join(", "))
+  lines.add(f3Sentence)
+  (tripped: true, diagnosis: lines.join("\n"))
+
 func abiTag*(): string =
   ## Best-effort OS + data-model tag for `HarvestMeta.abi` (RFC-0001 SS4
   ## B.3's round-2 addition — "a manifest is valid for exactly one ABI
@@ -721,6 +800,19 @@ when isMainModule:
     let manifestPath = args[0].parentDir / (r.baseName.toLowerAscii() & ".compat.json")
     writeManifest(manifestPath, manifest)
     echo "softlink harvest: wrote " & manifestPath
+    # RFC-0001 SS4 B.4 (slice B5): the drift alarm runs AFTER the manifest
+    # is written, never gating it — the manifest is Stage B's honest
+    # artifact (mismatch intervals included, nothing hidden); the alarm is
+    # the CI exit-code tripwire layered on top of it. This ordering is
+    # what makes the RFC's "before any process loaded anything" claim true
+    # in a CI pipeline: the artifact still gets produced/committed-review-
+    # able, but the CI *step* that ran this shim fails loudly. Default
+    # (whole-corpus) support range — narrowing is not a CLI flag in this
+    # slice, see `driftAlarm`'s own doc comment.
+    let (tripped, diagnosis) = driftAlarm(r)
+    if tripped:
+      stderr.writeLine(diagnosis)
+      quit(1)
   except CalibrationRefusedError as e:
     stderr.writeLine("softlink harvest: REFUSED — calibration preflight failed:\n" & e.msg)
     quit(1)
