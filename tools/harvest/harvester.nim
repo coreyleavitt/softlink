@@ -21,7 +21,7 @@
 ## the macro already understands (`softlinkProbeOnly`/`softlinkProbeExistence`,
 ## slice B2) — this module never re-derives or re-parses a binding, it only
 ## drives the compiler against the one that already exists.
-import std/[os, osproc, json, oids, strutils, tables, algorithm, streams]
+import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times]
 import softlink/versions
 
 export FactKind
@@ -102,6 +102,21 @@ type
     scratchDir*: string
       ## Base directory for unique per-invocation nimcaches and any
       ## runtime-generated calibration fixture.
+
+  HarvestMeta* = object
+    ## The `<lib>.compat.json` manifest's `"harvest"` object (RFC-0001 SS4
+    ## B.3, round-2 additions) — explicit and caller-injectable (design
+    ## guidance point 3) rather than computed inline in `buildManifest`, so
+    ## a golden-fixture test can PIN it and get a byte-for-byte-stable
+    ## comparison regardless of which machine or day a harvest runs on.
+    ## `defaultHarvestMeta` supplies best-effort real-use values; nothing
+    ## here is auto-detected when a caller supplies its own `HarvestMeta`.
+    toolchain*: string  ## e.g. first line of `gcc --version` (best-effort).
+    tier*: string        ## Verification tier, e.g. "builtin-compat" (the
+                          ## `__builtin_types_compatible_p` tier — the RFC's
+                          ## own example value for the gcc/`nim c` pipeline).
+    abi*: string          ## Normalized OS + data-model tag, see `abiTag`.
+    date*: string         ## `yyyy-MM-dd`, best-effort "today".
 
   CalibrationOutcome* = object
     ok*: bool
@@ -489,6 +504,199 @@ proc harvest*(dumpFile, corpusDir: string,
 
   result.report = renderReport(result)
 
+# ---------------------------------------------------------------------------
+# Manifest emission (RFC-0001 SS4 B.3, slice B4)
+#
+# Two pure functions plus a thin I/O wrapper, mirroring this module's own
+# decision/IO split (see the module doc comment): `compressFacts` (ordered
+# versions + per-version FactKind -> the four VersionInterval seqs) and
+# `buildManifest` (HarvestResult + explicit provenance/meta -> JsonNode) do
+# no I/O at all and are unit-tested directly; `writeManifest` is the one
+# place this section touches a filesystem.
+# ---------------------------------------------------------------------------
+
+func factKindKey(k: FactKind): string =
+  ## The manifest's JSON key for one `FactKind` (RFC-0001 SS4 B.3: `header`
+  ## facts are namespaced by these four names, dropping the `fk` prefix
+  ## `FactKind`'s Nim identifiers carry).
+  case k
+  of fkVerified: "verified"
+  of fkAbsent: "absent"
+  of fkMismatch: "mismatch"
+  of fkUnknown: "unknown"
+
+func compressFacts*(versions: seq[string],
+                     perVersion: Table[string, FactKind]
+                     ): array[FactKind, seq[VersionInterval]] =
+  ## RFC-0001 SS4 B.3 interval compression. `versions` arrives already
+  ## `cmpVersion`-ordered (as `HarvestResult.versions` is — `harvest`'s own
+  ## loop never reorders it) and `perVersion` carries EXACTLY one `FactKind`
+  ## per version (`harvest`'s classification loop always assigns one,
+  ## `fkUnknown` when the baseline itself failed — see `HarvestResult.facts`'
+  ## doc comment) — so `perVersion` is TOTAL over `versions`, and walking it
+  ## once, grouping maximal runs of consecutive equal `FactKind`s, partitions
+  ## the corpus EXHAUSTIVELY by construction: every version lands in exactly
+  ## one run, and every run becomes exactly one interval of exactly one fact
+  ## key. That is the whole disjoint/exhaustive invariant (RFC-0001 SS4 B.3's
+  ## round-2 addition) — it is not a separate property to prove, it falls
+  ## out of "every version has one classification, runs partition a
+  ## sequence."
+  ##
+  ## Each run becomes one half-open `VersionInterval` (`lo` inclusive, `hi`
+  ## exclusive, either omissible as `""` == unbounded, per B0): `lo` is the
+  ## run's own first version, `hi` is the FIRST VERSION OF THE NEXT RUN —
+  ## so one interval's exclusive `hi` and the next run's inclusive `lo` are
+  ## the identical string, the boundary version is claimed by both sides of
+  ## the split exactly once, and the two intervals are disjoint (never an
+  ## off-by-one on which side "owns" the shared version). The FIRST run
+  ## omits `lo` (unbounded start — matches the RFC's own example, whose
+  ## first-seen fact omits `lo`); the LAST run omits `hi` (unbounded end,
+  ## matches the example's last-seen fact). A single run spanning the WHOLE
+  ## corpus omits both bounds, i.e. the empty interval `{}` — the half-open,
+  ## fully-unbounded reading of "verified from before the corpus began
+  ## through after it ended," which is exactly what "every harvested version
+  ## agrees" means when nothing outside the corpus is ever extrapolated.
+  if versions.len == 0:
+    return
+  type Run = tuple[kind: FactKind, firstVersion: string]
+  var runs: seq[Run] = @[]
+  for v in versions:
+    let k = perVersion[v]
+    if runs.len == 0 or runs[^1].kind != k:
+      runs.add (k, v)
+  for i in 0 ..< runs.len:
+    var iv: VersionInterval
+    if i > 0: iv.lo = runs[i].firstVersion
+    if i < runs.len - 1: iv.hi = runs[i + 1].firstVersion
+    result[runs[i].kind].add iv
+
+proc loadCorpusProvenance*(corpusDir: string): seq[tuple[version, source: string]] =
+  ## Reads `<corpusDir>/corpus.json`'s `"corpus"` array for the manifest's
+  ## own `"corpus"` provenance field (RFC-0001 SS4 B.3: `{version, source}`
+  ## pairs only — `prepare`/`_comment` are fetch-time concerns the manifest
+  ## never records). Ordered via `cmpVersion` to match
+  ## `HarvestResult.versions`' own order; `enumerateCorpusVersions` already
+  ## cross-validates that the manifest and the on-disk corpus agree on the
+  ## SET of versions, so this reorders for presentation only, it does not
+  ## re-validate.
+  let j = parseJson(readFile(corpusDir / "corpus.json"))
+  for entry in j["corpus"]:
+    result.add (entry["version"].getStr, entry["source"].getStr)
+  result.sort(proc(a, b: tuple[version, source: string]): int =
+    cmpVersion(a.version, b.version))
+
+proc buildManifest*(r: HarvestResult,
+                     corpus: seq[tuple[version, source: string]],
+                     meta: HarvestMeta): JsonNode =
+  ## RFC-0001 SS4 B.3 manifest, pure: `HarvestResult` (already-classified
+  ## facts) + explicit `corpus` provenance + explicit `meta` -> the
+  ## `<lib>.compat.json` `JsonNode` tree. Pure so a golden-fixture test can
+  ## PIN `meta`/`corpus` and compare structurally (`tests/tharvest.nim`),
+  ## independent of the machine or day a real harvest runs on.
+  ##
+  ## `lib` is `toLowerAscii(r.baseName)` (design guidance point 4) — the
+  ## SAME derivation a `dynlib` block's `libNameToIdent` (src/softlink.nim)
+  ## already produces, so both a bare logical name (`dynlib "z3"` -> baseName
+  ## "Z3") and an explicit pattern (`"libcorpuslib.so"` -> baseName
+  ## "Corpuslib") round-trip to their expected lowercase manifest stem ("z3",
+  ## "corpuslib"). The RFC's `lib`-identity CHECK is consumption-side (B6a);
+  ## this is only the derivation, reused verbatim there.
+  ##
+  ## One `symbols` entry per `r.probedSymbols` (skipped procs — `noverify`,
+  ## `prototype`-only — are corpus-INVARIANT, never given an entry: nothing
+  ## version-shaped was ever recorded for them, see `harvest`'s own doc
+  ## comment). Under `"header"`, only NON-EMPTY fact keys are emitted (the
+  ## RFC's own example omits empty ones) and interval objects omit unbounded
+  ## ends (no `"lo": ""`) — both directly reflect `compressFacts`' output:
+  ## an unobserved `FactKind` is an empty seq, an unbounded bound is `""`.
+  var corpusArr = newJArray()
+  for entry in corpus:
+    corpusArr.add %*{"version": entry.version, "source": entry.source}
+
+  var symbols = newJObject()
+  for cname in r.probedSymbols:
+    let compressed = compressFacts(r.versions, r.facts[cname])
+    var header = newJObject()
+    for kind in FactKind:
+      if compressed[kind].len > 0:
+        var arr = newJArray()
+        for iv in compressed[kind]:
+          var obj = newJObject()
+          if iv.lo.len > 0: obj["lo"] = %iv.lo
+          if iv.hi.len > 0: obj["hi"] = %iv.hi
+          arr.add obj
+        header[factKindKey(kind)] = arr
+    symbols[cname] = %*{"header": header}
+
+  %*{
+    "schema": 1,
+    "lib": r.baseName.toLowerAscii(),
+    "harvest": {"toolchain": meta.toolchain, "tier": meta.tier,
+                "abi": meta.abi, "date": meta.date},
+    "corpus": corpusArr,
+    "symbols": symbols,
+  }
+
+proc writeManifest*(path: string, manifest: JsonNode) =
+  ## The one place this section writes the committed `<lib>.compat.json`
+  ## artifact — kept separate from `buildManifest` so tests exercise the
+  ## pure `JsonNode` tree directly (structural comparison, no filesystem, no
+  ## whitespace brittleness).
+  writeFile(path, manifest.pretty)
+
+func abiTag*(): string =
+  ## Best-effort OS + data-model tag for `HarvestMeta.abi` (RFC-0001 SS4
+  ## B.3's round-2 addition — "a manifest is valid for exactly one ABI
+  ## class"): `hostOS` (a Nim compile-time constant) plus the data model
+  ## computed from `sizeof(clong)`/`sizeof(pointer)` — `lp64` (long=8,
+  ## ptr=8; Linux/macOS 64-bit), `llp64` (long=4, ptr=8; 64-bit Windows),
+  ## `ilp32` (long=4, ptr=4; any 32-bit target). Nim's `clong` is defined to
+  ## match the TARGET C compiler's `long` width for the current platform
+  ## (`system/ctypes.nim`), not a fixed Nim integer size, so this reflects
+  ## the real ABI the harvester's own probe compiles ran under. Multi-
+  ## platform bindings harvest once per ABI class and commit one manifest
+  ## each (`z3.linux-lp64.compat.json`, ...) — this is the computation that
+  ## per-manifest tag comes from for the default (gcc/clang) pipeline.
+  let model =
+    if sizeof(clong) == 8 and sizeof(pointer) == 8: "lp64"
+    elif sizeof(clong) == 4 and sizeof(pointer) == 8: "llp64"
+    elif sizeof(clong) == 4 and sizeof(pointer) == 4: "ilp32"
+    else: "unknown-datamodel"
+      # An exotic/16-bit target: never crash the harvester over an
+      # unrecognized data model, just record that the tag couldn't be
+      # computed — a human authoring a manifest for such a target can
+      # still hand-edit this one field.
+  hostOS & "-" & model
+
+proc detectToolchain(): string =
+  ## Best-effort first line of `gcc --version` for `HarvestMeta.toolchain`
+  ## (design guidance point 3: "a plain caller-supplied string is also
+  ## fine — don't over-engineer"). `defaultHarvestOptions` already commits
+  ## this module to the gcc/clang-tuned pipeline as its required minimum
+  ## leg, so this asks for gcc specifically rather than reinventing
+  ## compiler-family detection. Never raises: a harvester that can't
+  ## identify its own compiler still produces a usable manifest — this
+  ## field is provenance, not a machine-checked contract (that's schema/
+  ## lib-identity checking, B6a).
+  try:
+    let (output, code) = execCmdEx("gcc --version")
+    if code == 0 and output.len > 0:
+      return output.splitLines()[0]
+  except OSError, ValueError:
+    discard
+  "unknown"
+
+proc defaultHarvestMeta*(): HarvestMeta =
+  ## Real-use defaults for `HarvestMeta` — best-effort, never auto-detected
+  ## when a caller supplies its own (e.g. the golden-fixture test's PINNED
+  ## meta, design guidance point 3).
+  HarvestMeta(
+    toolchain: detectToolchain(),
+    tier: "builtin-compat",
+    abi: abiTag(),
+    date: now().format("yyyy-MM-dd"),
+  )
+
 when isMainModule:
   ## Thin entry point for the tests (full CLI UX is B8's). Usage:
   ##   harvester <dumpFile> <corpusDir> [nimPath ...]
@@ -502,6 +710,17 @@ when isMainModule:
   try:
     let r = harvest(args[0], args[1], opts)
     echo r.report
+    # RFC-0001 SS4 B.3 (slice B4): write the compat manifest next to the
+    # dump — trivial extension of this already-thin shim, NOT the B8 CLI
+    # (no flags/subcommand parsing, just "harvest, then emit the artifact
+    # the harvest exists to produce"). Real-use `defaultHarvestMeta`/corpus
+    # provenance read fresh off disk — the golden-fixture TEST pins its own
+    # `HarvestMeta` instead, see tests/tharvest.nim.
+    let corpus = loadCorpusProvenance(args[1])
+    let manifest = buildManifest(r, corpus, defaultHarvestMeta())
+    let manifestPath = args[0].parentDir / (r.baseName.toLowerAscii() & ".compat.json")
+    writeManifest(manifestPath, manifest)
+    echo "softlink harvest: wrote " & manifestPath
   except CalibrationRefusedError as e:
     stderr.writeLine("softlink harvest: REFUSED — calibration preflight failed:\n" & e.msg)
     quit(1)

@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "lib": "corpuslib",
+  "harvest": {
+    "toolchain": "gcc (pinned for golden test)",
+    "tier": "builtin-compat",
+    "abi": "linux-lp64",
+    "date": "2026-01-01"
+  },
+  "corpus": [
+    { "version": "1.0.0", "source": "git:example/testlib@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "version": "2.0.0", "source": "git:example/testlib@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    { "version": "3.0.0", "source": "git:example/testlib@cccccccccccccccccccccccccccccccccccccccc" }
+  ],
+  "symbols": {
+    "corpuslib_stable": {
+      "header": {
+        "verified": [{ "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_changed": {
+      "header": {
+        "verified": [{ "hi": "2.0.0" }],
+        "mismatch": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_added": {
+      "header": {
+        "verified": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "absent": [{ "hi": "2.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    }
+  }
+}
