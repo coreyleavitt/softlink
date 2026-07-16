@@ -1267,6 +1267,43 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string,
       "one symbol to probe its existence."
     error(msg, allProcs[0].name)
 
+  # RFC-0001 §4 B.2, coverage fix (code-review finding F9): `probeOnlyList`
+  # is never checked against this block's own C names — a typo'd or stale
+  # `-d:softlinkProbeOnly` value silently suppresses EVERY proc in the
+  # block (the trivially-compiling verify TU gives no signal that anything
+  # is wrong). `-d:softlinkProbeOnly` is deliberately GLOBAL to the whole
+  # compilation, though: a module may legitimately contain MULTIPLE
+  # `dynlib`/`verifyProcs` blocks, and the harvester's single invocation
+  # targets exactly one of them by name — every OTHER block in that same
+  # module correctly matches nothing and correctly suppresses everything.
+  # A hard ERROR here would break that entirely legitimate multi-block
+  # case, so this is a WARNING, not an error (unconditionally — there is
+  # no existing precedent in this file for escalating a *warning* to an
+  # *error* under `-d:softlinkStrictVerify`; the only escalation precedent
+  # here is hint-to-warning, e.g. the {.noverify.} enumeration below, which
+  # is a different severity pair and does not apply). Existence mode
+  # (`softlinkProbeExistence`) gets the exact same warning, not a harder
+  # one, for the identical reason: its single-symbol target not matching
+  # THIS block is just as often the legitimate "targets a different block"
+  # case as it is a typo.
+  if probeOnlyList.len > 0:
+    var blockCNames: HashSet[string]
+    for p in allProcs: blockCNames.incl(p.nameStr)
+    var unmatched: seq[string]
+    for name in probeOnlyList:
+      if name notin blockCNames:
+        unmatched.add(name)
+    if unmatched.len > 0:
+      let msg = "softlink: -d:softlinkProbeOnly=" & softlinkProbeOnly &
+        " names " & unmatched.join(", ") &
+        (if unmatched.len == 1: " that matches" else: " that match") &
+        " no proc in this '" & tag & "' block — if you intended to " &
+        "target THIS block, this is a typo or stale name and every " &
+        "proc's verification here is being silently suppressed (fatal if " &
+        "so); if you intended a DIFFERENT dynlib/verifyProcs block in the " &
+        "same module, this is expected and can be ignored (RFC-0001 §4 B.2)."
+      warning(msg, allProcs[0].name)
+
   template isSuppressed(p: SoftlinkProc): bool =
     ## RFC-0001 §4 B.2 (list support: slice B7): true when this proc's
     ## entire verification apparatus (call-based assert chain AND any
@@ -1755,24 +1792,48 @@ proc seqOfTupleType(fields: openArray[(string, string)]): NimNode =
     tupleTy.add(newNimNode(nnkIdentDefs).add(ident(fname), ident(tname), newEmptyNode()))
   newNimNode(nnkBracketExpr).add(ident("seq"), tupleTy)
 
+proc calleeIdentName(n: NimNode): string =
+  ## Extracts a plain identifier name from a call/command node's callee
+  ## position (`n`), when that position is either a bare ident (`P(x)`'s
+  ## callee IS `P`) or the field/callee half of a dot-call/UFCS expression
+  ## (`x.P(...)`'s callee is `DotExpr(x, P)` — the caller passes THAT node's
+  ## `[1]` here, i.e. `P`). A single-token `` `P` `` (`nnkAccQuoted`) in
+  ## that position is also unwrapped, so `` x.`P`(...) `` resolves the same
+  ## as `x.P(...)`. Returns `""` for anything else (multi-token accquoted,
+  ## a computed/non-ident expression, etc.) — callers treat `""` as "not a
+  ## recognizable direct callee name", never as a match.
+  if n.kind == nnkIdent:
+    $n
+  elif n.kind == nnkAccQuoted and n.len == 1 and n[0].kind == nnkIdent:
+    $n[0]
+  else:
+    ""
+
 proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string]): bool =
   ## RFC-0001 §C.1/§C.3, slice C4b: "the version probe may only call
   ## symbols with no known drift ranges" (RFC §C.1: "the probe must not be
   ## the drift"). Walks `stmts` (the versionProbe body, still raw AST at
   ## macro-expansion time — the manifest is already parsed by now) looking
-  ## for a DIRECT call (`nnkCall`/`nnkCommand`) whose callee is a bare
-  ## ident matching `mismatchCNames` — this block's own symbols (required
-  ## OR optional; required-symbol RUNTIME refusal is C4c's territory, but
-  ## the call-safety risk this scan guards against exists for both) that
-  ## carry ANY `mismatch` interval in the attached manifest. Emits ONE
-  ## macro error at the offending call node and stops (returns `true`) — a
-  ## probe with several such calls gets one diagnostic, not a pile-up.
-  ## Indirect calls (through a variable, a closure, a method) can't be
-  ## seen statically; that residual risk is accepted and documented here,
-  ## not pretended away, per the RFC's own words.
-  if stmts.kind in {nnkCall, nnkCommand} and stmts.len > 0 and stmts[0].kind == nnkIdent:
-    let callee = $stmts[0]
-    if callee in mismatchCNames:
+  ## for a DIRECT call (`nnkCall`/`nnkCommand`) whose callee is a bare ident
+  ## matching `mismatchCNames` — this block's own symbols (required OR
+  ## optional; required-symbol RUNTIME refusal is C4c's territory, but the
+  ## call-safety risk this scan guards against exists for both) that carry
+  ## ANY `mismatch` interval in the attached manifest. The dot-call/UFCS
+  ## form (`x.P(...)`, AST `Call(DotExpr(x, P), ...)`) is ALSO matched: the
+  ## callee's `P` half is exactly as direct and exactly as detectable as
+  ## the bare-ident form `P(x)` — UFCS is sugar, not an indirection, so
+  ## treating it as unseeable would be a real gap, not a documented one.
+  ## Emits ONE macro error at the offending call node and stops (returns
+  ## `true`) — a probe with several such calls gets one diagnostic, not a
+  ## pile-up. Indirect calls TRULY through a variable, a closure, or a
+  ## method value can't be seen statically; that residual risk is accepted
+  ## and documented here, not pretended away, per the RFC's own words.
+  if stmts.kind in {nnkCall, nnkCommand} and stmts.len > 0:
+    let calleeNode =
+      if stmts[0].kind == nnkDotExpr and stmts[0].len == 2: stmts[0][1]
+      else: stmts[0]
+    let callee = calleeIdentName(calleeNode)
+    if callee.len > 0 and callee in mismatchCNames:
       error("softlink: dynlib: versionProbe directly calls '" & callee &
             "', which has a recorded 'mismatch' interval in the attached " &
             "compat manifest — the version probe may only call symbols " &

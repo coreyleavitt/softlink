@@ -432,6 +432,17 @@ task test, "Run tests":
     "nim c --path:src --passC:-I. tests/tfail_verifyprocs_prototype_conflict.nim"
   const vpProtoConflictCppCheck =
     "nim cpp --path:src --passC:-I. tests/tfail_verifyprocs_prototype_conflict.nim"
+  # Code-review finding F4 (coverage-only): the {.optional.} rejection
+  # branch in `parseProcPragmas`'s `ppmVerifyProcs` arm had zero test
+  # coverage. `tests/test_softlink.nim`'s "compile-time: verifyProcs
+  # rejects noverify and unknown pragmas" suite now also has a `compiles()`
+  # check for `optional`; this fixture + grep additionally pins the EXACT
+  # diagnostic wording, following the same tfail-fixture-plus-grep pattern
+  # `contraFailCheck` above already uses for the `noverify`/`verifyWhen`
+  # contradiction message.
+  const vpOptionalFailCheck = "nim c --path:src tests/tfail_verifyprocs_optional.nim"
+  const vpOptionalFailAnchor =
+    "verifyProcs does not support pragma 'optional' on proc 'vp_optional_fail'"
 
   proc expectNoEmptyInclude(dumpCmd: string) =
     ## RFC-0001 slice A6: assert the generated C contains no `#include ""`
@@ -858,6 +869,33 @@ task test, "Run tests":
         "tests/tcheck_probe_only.nim",
       [poMultiExistenceAnchor])
 
+    # Code-review finding F9 (Medium): a -d:softlinkProbeOnly name matching
+    # NO proc in this block must emit a compile-time WARNING (never a
+    # silent total suppression with no signal anything is wrong) — see
+    # genVerifyBlock's own doc comment in src/softlink.nim for why this is
+    # a warning rather than a hard error (the define is GLOBAL to the whole
+    # compilation; a module may legitimately contain multiple dynlib/
+    # verifyProcs blocks, and a name targeting a DIFFERENT block correctly
+    # suppresses everything in THIS one).
+    expectManifestCompileOk(
+      cBaseNoCache & " -d:softlinkProbeOnly=testlib_totally_bogus_name tests/tcheck_probe_only.nim",
+      ["no proc in this 'Probeonly' block"], [])
+
+    # Control: a name that DOES match a proc in this block (the same
+    # `testlib_add` M2 above already proves suppresses correctly) must NOT
+    # trigger the new warning — proves no false positive on the ordinary case.
+    expectManifestCompileOk(
+      cBaseNoCache & " -d:softlinkProbeOnly=testlib_add tests/tcheck_probe_only.nim",
+      [], ["no proc in this"])
+
+    # Existence mode gets the identical warning, not a harder error, when
+    # its singleton target doesn't match this block — the same legitimate
+    # multi-block reasoning applies to existence mode's target.
+    expectManifestCompileOk(
+      cBaseNoCache & " -d:softlinkProbeOnly=testlib_totally_bogus_name -d:softlinkProbeExistence " &
+        "tests/tcheck_probe_only.nim",
+      ["no proc in this 'Probeonly' block"], [])
+
     exec cBase & probeOnlyV0 & " tests/tcheck_probe_only_verifyprocs.nim"
     exec cBase & probeOnlyV1 & " -d:softlinkProbeOnly=testlib_magic tests/tcheck_probe_only_verifyprocs.nim"
     exec cBase & probeOnlyV2 &
@@ -949,6 +987,19 @@ task test, "Run tests":
     # `verified`) compiles fine.
     expectManifestCompileFail(mcBase & "tests/tfail_probe_drift_call.nim",
       ["the version probe may only call symbols with no known drift ranges"])
+
+    # Code-review finding F3: the UFCS/dot-call form of the same direct-call
+    # scan (`x.testlib_add(2)`, callee `DotExpr(x, testlib_add)`) must be
+    # caught identically — a separate, dedicated manifest
+    # (`testlib_probe_drift_ufcs`, marking the two-parameter `testlib_add`
+    # itself as `mismatch`) keeps this fixture independent of the shared
+    # `testlib.compat.json` used by the bare-ident check directly above and
+    # by several unrelated fixtures.
+    const ufcsBase = "testlib_probe_drift_ufcs"
+    writeManifestFromTemplate(mdir & ufcsBase & ".tmpl.json", mdir & ufcsBase & ".compat.json")
+    expectManifestCompileFail(mcBase & "tests/tfail_probe_drift_call_ufcs.nim",
+      ["the version probe may only call symbols with no known drift ranges"])
+    rmFile(mdir & ufcsBase & ".compat.json")
 
     expectManifestCompileOk(mcBase & "tests/tcheck_versionprobe_drift_free.nim", [], [])
 
@@ -1178,6 +1229,9 @@ task test, "Run tests":
     exec vpProtoMismatchFailCheck & " 2>&1 | findstr /C:\"signature mismatch\" >NUL"
     expectCompileFailure(vpProtoConflictCCheck)
     expectCompileFailure(vpProtoConflictCppCheck)
+    # Code-review finding F4: {.optional.} rejection in verifyProcs, pinned
+    # to its exact diagnostic wording.
+    exec vpOptionalFailCheck & " 2>&1 | findstr /C:\"" & vpOptionalFailAnchor & "\" >NUL"
     exec hintCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Hint:\" >NUL"
     exec warnCheck & " 2>&1 | findstr /C:\"not header-verified\" | findstr /C:\"Warning:\" >NUL"
     exec reasonHintCheck & " 2>&1 | findstr /C:\"private symbol, no public header at any version\" | findstr /C:\"Hint:\" >NUL"
@@ -1270,6 +1324,9 @@ task test, "Run tests":
     exec vpProtoMismatchFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     expectCompileFailure(vpProtoConflictCCheck)
     expectCompileFailure(vpProtoConflictCppCheck)
+    # Code-review finding F4: {.optional.} rejection in verifyProcs, pinned
+    # to its exact diagnostic wording.
+    exec vpOptionalFailCheck & " 2>&1 | grep -q \"" & vpOptionalFailAnchor & "\""
     exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
     exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
     exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
@@ -1332,6 +1389,9 @@ task test, "Run tests":
     exec vpProtoMismatchFailCheck & " 2>&1 | grep -q 'signature mismatch'"
     expectCompileFailure(vpProtoConflictCCheck)
     expectCompileFailure(vpProtoConflictCppCheck)
+    # Code-review finding F4: {.optional.} rejection in verifyProcs, pinned
+    # to its exact diagnostic wording.
+    exec vpOptionalFailCheck & " 2>&1 | grep -q \"" & vpOptionalFailAnchor & "\""
     # RFC-0001 slice A4, optional extra confidence (gcc/clang-gated only —
     # never on the Windows/MSVC branch above): also inspect the compiler's
     # own wording for the redeclaration conflict. Deliberately NOT required

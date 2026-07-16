@@ -278,6 +278,17 @@ suite "verifyProcs (static-binding header verification)":
       verifyProcs:
         proc vp_vararg(): cint {.cdecl, varargs, header: "tests/testlib.h".}
     )
+    # F4 (code-review finding): the {.optional.} rejection branch itself had
+    # zero test coverage — noverify and varargs (above) exercised the
+    # surrounding rejection machinery, but not this specific pragma. Exact
+    # diagnostic wording is separately pinned by a tfail fixture + nimble
+    # grep (tests/tfail_verifyprocs_optional.nim) per this repo's convention
+    # for pinning macro-error text; this `compiles()` check only proves the
+    # branch actually rejects (matching this suite's existing style).
+    check not compiles(block:
+      verifyProcs:
+        proc vp_optional(): cint {.cdecl, optional, header: "tests/testlib.h".}
+    )
 
 suite "prototype tokenizer/analyzer (RFC-0001 slice A1)":
   # Pure functions — unit-tested directly, no compiles() gymnastics needed.
