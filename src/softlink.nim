@@ -14,6 +14,7 @@ when defined(js):
 
 import std/[macros, sets, strutils, os, json]
 import std/dynlib as stdDynlib
+import ./softlink/manifest
 # Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
        stdDynlib.unloadLib
@@ -163,6 +164,7 @@ type
     noVerifyReason: string  ## RFC-0001 §3 A.2: {.noverify: "why".} justification; "" if none given
     verifyWhen: string  ## C preprocessor expr gating verification; "" = always
     prototype: string   ## raw {.prototype: "...".} string; "" if absent
+    sinceVersion: string  ## RFC-0001 §B.5/§C.2: {.since: "x.y.z".} claim; "" if absent
     hasReturn: bool
 
 func pragmaKeyName(pragma: NimNode): string =
@@ -182,6 +184,30 @@ proc parseVerifyWhenExpr(pragma, stmt: NimNode): string =
   else:
     error("verifyWhen pragma requires a non-empty C preprocessor " &
           "expression (e.g., {.verifyWhen: \"FOO_VERSION >= 0x0300\".})", stmt)
+    ""
+
+proc parseSinceExpr(pragma, stmt: NimNode, nameStr: string): string =
+  ## RFC-0001 §C.2/§B.5, slice B6a: extract and validate one proc's
+  ## {.since: "x.y.z".} claim — a non-empty string literal that must
+  ## additionally `parseVersion` successfully (`softlink/versions`), since
+  ## a lower bound that can't even be compared is worse than none. Shared
+  ## by `dynlib` and `verifyProcs`: the since-contradiction check
+  ## (`softlink/manifest.checkSince`) needs it in both, and Stage C's
+  ## runtime consumption (§C.2/§C.3, `dynlib`-only) is a separate, later
+  ## concern from this pragma's parse.
+  if pragma.kind == nnkExprColonExpr and
+     pragma[1].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit} and
+     pragma[1].strVal.strip().len > 0:
+    let v = pragma[1].strVal
+    if parseVersion(v).isNone:
+      error("proc '" & nameStr & "': since pragma value '" & v &
+            "' does not parse as a version (softlink/versions.parseVersion " &
+            "found no digit or alphabetic run in it)", stmt)
+    v
+  else:
+    error("proc '" & nameStr &
+          "' since pragma requires a non-empty version string literal " &
+          "(e.g., {.since: \"4.15.0\".})", stmt)
     ""
 
 proc parseNoVerifyReasonExpr(pragma, stmt: NimNode, nameStr: string): string =
@@ -487,6 +513,7 @@ type
     verifyWhen*: string  ## C preprocessor expr gating verification; "" = always
     prototype*: string   ## raw {.prototype: "...".} string; "" if absent
     prototypeName*: string  ## tokenizer-extracted C name; "" if absent
+    sinceVersion*: string  ## RFC-0001 §B.5/§C.2: {.since: "x.y.z".} claim; "" if absent
 
 const callingConventions = ["cdecl", "stdcall", "fastcall", "syscall", "noconv"]
 
@@ -530,6 +557,8 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
                 "solely to verify; simply omit proc '" & nameStr & "'", stmt)
       elif pragmaName == "verifyWhen":
         result.verifyWhen = parseVerifyWhenExpr(pragma, stmt)
+      elif pragmaName == "since":
+        result.sinceVersion = parseSinceExpr(pragma, stmt, nameStr)
       elif pragmaName == "prototype":
         let (raw, name) = parsePrototypePragma(pragma, stmt, nameStr)
         result.prototype = raw
@@ -598,6 +627,231 @@ proc parseProcPragmas(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pro
       else:
         hint(msg, stmt)
 
+## RFC-0001 §B.5's "erroring stub" message: exported so a
+## `compatManifest(...)` call OUTSIDE a `dynlib`/`verifyProcs` block
+## resolves, via ordinary overload resolution, to the `compatManifest`
+## proc below — whose `{.error.}` pragma turns the call into a
+## softlink-authored diagnostic instead of a bare "undeclared
+## identifier" (the #14 lesson, reapplied here: an opaque compiler
+## error pointing nowhere useful is worse than a clear one).
+## Correctly-placed directives never reach that proc at all — the
+## `dynlib`/`verifyProcs` macros recognize and consume the
+## `compatManifest` statement structurally (see `isCompatManifestCall`
+## below) and never re-emit it into the generated code, exactly like
+## every proc declaration in the same body is consumed and regenerated
+## rather than passed through verbatim.
+const compatManifestStubMsg =
+  "softlink: compatManifest is a body directive of dynlib/verifyProcs " &
+  "blocks (RFC-0001 §B.5) — it must appear directly inside a " &
+  "`dynlib \"lib\": ...` or `verifyProcs: ...` block (e.g. " &
+  "`compatManifest \"lib.compat.json\"`), not called as an ordinary proc."
+
+proc compatManifest*(path: string, refuse: bool = false) {.error: compatManifestStubMsg.}
+
+type
+  CompatManifestDirective = object
+    ## RFC-0001 §B.5/§B.5a, slice B6a: one parsed `compatManifest` body
+    ## directive. `present == false` is the zero value (no directive in
+    ## this block) — every check downstream short-circuits on it.
+    present: bool
+    pathLit: string     ## the string literal argument, as written
+    refuse: bool         ## parsed value of `refuse = ...`; false if absent
+    refuseGiven: bool    ## RFC-0001 §B.5a: was `refuse` written at all?
+                         ## (verifyProcs rejects it outright regardless of
+                         ## value — "nothing to refuse" there)
+    node: NimNode        ## the directive call node, for diagnostic anchoring
+
+func isCompatManifestCall(stmt: NimNode): bool =
+  ## True when `stmt` is a `compatManifest ...` directive statement —
+  ## `compatManifest "path"` (parses as `nnkCommand`) or
+  ## `compatManifest("path", refuse = true)` (`nnkCall`). Checked
+  ## structurally against the bare identifier text, exactly like every
+  ## other body-shape recognition in this file (`stmt.kind != nnkProcDef`
+  ## below) — the block's body is `untyped`, so nothing has been resolved
+  ## to an actual symbol yet; that only happens (deliberately) for a
+  ## MISPLACED directive, via the erroring stub above.
+  stmt.kind in {nnkCall, nnkCommand} and stmt.len >= 1 and
+    stmt[0].kind == nnkIdent and $stmt[0] == "compatManifest"
+
+proc parseCompatManifestDirective(stmt: NimNode, macroName: string): CompatManifestDirective =
+  ## RFC-0001 §B.5: parse one recognized `compatManifest` directive
+  ## statement's argument shape — a string literal path, and an optional
+  ## `refuse = <bool literal>` named argument (§5.3's drift-refusal scope
+  ## flag; this slice only parses and stores it, see `refuseGiven` above).
+  ## Any other shape (non-literal path, unknown named arg, non-bool
+  ## `refuse`, or a bare `compatManifest` with no path at all) is a
+  ## directive-specific macro error here, never the generic body-shape
+  ## error `dynlib`/`verifyProcs` raise for an unrecognized statement.
+  result.present = true
+  result.node = stmt
+  var pathSet = false
+  for i in 1 ..< stmt.len:
+    let arg = stmt[i]
+    if arg.kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit} and not pathSet:
+      result.pathLit = arg.strVal
+      pathSet = true
+    elif arg.kind == nnkExprEqExpr and arg.len == 2 and
+         arg[0].kind == nnkIdent and $arg[0] == "refuse":
+      result.refuseGiven = true
+      if arg[1].kind == nnkIdent and $arg[1] in ["true", "false"]:
+        result.refuse = $arg[1] == "true"
+      else:
+        error(macroName & ": compatManifest's 'refuse' argument must be a " &
+              "bool literal (true or false)", stmt)
+    else:
+      error(macroName & ": compatManifest directive has an unrecognized " &
+            "argument — expected compatManifest(\"lib.compat.json\") or " &
+            "compatManifest(\"lib.compat.json\", refuse = true/false)", stmt)
+  if not pathSet:
+    error(macroName & ": compatManifest requires a string literal manifest " &
+          "path, e.g. compatManifest(\"z3.compat.json\")", stmt)
+  if result.pathLit.strip().len == 0 and pathSet:
+    error(macroName & ": compatManifest's manifest path must be non-empty", stmt)
+
+proc compatManifestDupError(macroName: string, first, second: CompatManifestDirective): string =
+  ## RFC-0001 §B.5: "at most one compatManifest per block, any position."
+  ## Voiced like the existing #14 dup-block guard (`src/softlink.nim`'s
+  ## `dynlib` macro) — softlink-authored, names both paths, tells the
+  ## author what to do, never an opaque "redefinition of ...".
+  "softlink: " & macroName & ": duplicate compatManifest directive in one " &
+  "block ('" & first.pathLit & "' and '" & second.pathLit & "') — merge " &
+  "them into a single compatManifest directive; a dynlib/verifyProcs " &
+  "block may attach at most one compat manifest."
+
+proc applyCompatManifest(mode: ProcPragmaMode, libNameForIdentity: string,
+                          procs: seq[SoftlinkProc],
+                          directive: CompatManifestDirective): bool =
+  ## RFC-0001 §B.5/§B.5a, slice B6a: the compile-time manifest-consumption
+  ## orchestration. Every actual DECISION is a pure `softlink/manifest`
+  ## predicate (independently unit-tested there); this proc's only job is
+  ## sequencing them in the RFC's own order and turning each into an
+  ## `error`/`warning`/`hint` anchored at the directive or the offending
+  ## proc. No runtime behavior changes here — everything below runs at
+  ## macro-expansion time only, and without a `compatManifest` directive
+  ## this proc returns immediately (additive: existing blocks are
+  ## byte-for-byte unaffected).
+  ##
+  ## Returns `true` iff a manifest was attached AND not ABI-ignored — the
+  ## one bit `genVerifyBlock` needs downstream, to decide whether its
+  ## graceful `#else` fallback gets the degraded-tier `#pragma message`
+  ## (check 9 below).
+  if not directive.present: return false
+
+  let macroName = if mode == ppmDynlib: "dynlib" else: "verifyProcs"
+
+  # RFC-0001 §B.5a: verifyProcs has no loadX/drift-refusal surface at all —
+  # an ACCEPTED `refuse` argument would silently promise a policy knob that
+  # does nothing ("an accepted-but-dead parameter would be a lie").
+  if mode == ppmVerifyProcs and directive.refuseGiven:
+    error(macroName & ": compatManifest's 'refuse' argument has nothing " &
+          "to refuse on verifyProcs — there is no loadX/drift-refusal " &
+          "surface here (RFC-0001 §B.5a); omit 'refuse' entirely",
+          directive.node)
+
+  # Path resolution: relative to the MODULE containing this block (the
+  # directive call node's own line info), never the compiler's cwd — a
+  # binding package ships its manifest alongside its module.
+  let absPath = directive.node.lineInfoObj.filename.parentDir / directive.pathLit
+  if not fileExists(absPath):
+    error("softlink: " & macroName & ": compatManifest: manifest file not " &
+          "found: " & absPath, directive.node)
+    return false
+
+  # `staticRead` (not a plain compile-time `readFile`) registers the
+  # manifest as a compile dependency, so editing it retriggers
+  # compilation — design guidance's stated reason for preferring it here.
+  let jsonText = staticRead(absPath)
+  var m: CompatManifest
+  try:
+    m = parseManifest(jsonText, absPath)
+  except ManifestError as e:
+    error(e.msg, directive.node)
+    return false
+
+  # Check 2: schema policy — an unsupported (newer) schema is a compile
+  # error naming the required schema, never a silent partial read.
+  if not schemaSupported(m):
+    error("softlink: " & macroName & ": compat manifest " & absPath &
+          " has schema " & $m.schema & ", but this softlink version only " &
+          "supports schema " & $supportedSchema & " — upgrade softlink to " &
+          "consume it", directive.node)
+    return false
+
+  # Check 3: lib identity (dynlib only — verifyProcs has no library
+  # identity to check against, RFC-0001 §B.5a).
+  if mode == ppmDynlib:
+    if not libIdentityOk(m, libNameForIdentity):
+      error("softlink: dynlib: compat manifest " & absPath & " is for " &
+            "library '" & m.lib & "', but this block's library is '" &
+            libNameForIdentity & "' — wrong-file paste protection " &
+            "(RFC-0001 §B.3): point compatManifest at the right file, or " &
+            "regenerate it for this library", directive.node)
+      return false
+
+  # Check 4: ABI. A mismatch degrades to no-manifest behavior entirely —
+  # every check below (5 through 9) is skipped, per the RFC ("a manifest
+  # asserting confidence across a different OS/data-model would be worse
+  # than none").
+  let targetAbi = abiTag()
+  if not abiOk(m, targetAbi):
+    warning("softlink: " & macroName & ": compat manifest " & absPath &
+            " was harvested for ABI '" & m.abi & "', but this build's " &
+            "target ABI is '" & targetAbi & "' — ignoring the compat " &
+            "manifest entirely for this compile (a manifest asserting " &
+            "confidence across a different OS/data-model would be worse " &
+            "than none)", directive.node)
+    return false
+
+  # Check 5: disjoint/exhaustive validation — every violation found, not
+  # just the first (a hand-merge mistake should surface completely).
+  for v in validateDisjointExhaustive(m):
+    let what = if v.matchCount == 0: "is in NO fact interval (a gap)"
+               else: "is in " & $v.matchCount &
+                     " fact intervals at once (an overlap)"
+    error("softlink: " & macroName & ": compat manifest " & absPath &
+          ": symbol '" & v.cname & "' at version '" & v.version & "' " &
+          what & " — the four header fact-interval sets must be disjoint " &
+          "and exhaustive over the corpus (RFC-0001 §B.3); fix the " &
+          "manifest (likely a hand-merge mistake)", directive.node)
+
+  # Check 6: since-contradiction — hard error, no escape hatch, message
+  # includes the corrected bound (softlink/manifest.checkSince computes it).
+  for p in procs:
+    if p.sinceVersion.len == 0: continue
+    let sc = checkSince(m, p.nameStr, p.sinceVersion)
+    if sc.contradicted:
+      error(sc.message, p.name)
+
+  # Bound, harvester-trackable C names — same predicate `tools/harvest/
+  # harvester.nim`'s `harvest` uses to decide what it records: excludes
+  # `noverify` (nothing to probe) and prototype-only procs (corpus-
+  # invariant, never in a manifest by design). Shared by checks 7 and 8.
+  var trackable: seq[string] = @[]
+  for p in procs:
+    if not p.noVerify and p.headerFile.len > 0: trackable.add p.nameStr
+
+  # Check 7: mismatch warning.
+  let mismatched = mismatchedSymbols(m, trackable)
+  if mismatched.len > 0:
+    warning("softlink: " & macroName & ": compat manifest " & absPath &
+            ": " & $mismatched.len & " symbol" &
+            (if mismatched.len != 1: "s" else: "") &
+            " recorded a 'mismatch' interval: " & mismatched.join(", ") &
+            " — see the drift alarm / softlink harvest for details",
+            directive.node)
+
+  # Check 8: not-in-manifest hint.
+  let missing = notInManifest(m, trackable)
+  if missing.len > 0:
+    hint("softlink: " & macroName & ": " & $missing.len & " symbol" &
+         (if missing.len != 1: "s" else: "") & " not in compat manifest " &
+         absPath & " — regenerate with softlink harvest", directive.node)
+
+  # Check 9 (the degraded-tier warning) is emitted by `genVerifyBlock`
+  # itself, into the graceful `#else` fallback branch — this proc's
+  # `true` return is the signal that tells it to.
+  true
+
 const softlinkProbeOnly {.strdefine.} = ""
   ## RFC-0001 §4 B.2: with `-d:softlinkProbeOnly=<CName>`, `genVerifyBlock`
   ## suppresses the ENTIRE verification apparatus (the call-based
@@ -639,10 +893,21 @@ const softlinkProbeExistence {.booldefine.} = false
   ## macro error raised in `genVerifyBlock` below — rather than silently
   ## compiling as some other mode.
 
-proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
+proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string,
+                     hasManifestAttached: bool = false): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes
   ## (include section + a file-local _Static_assert proc). Shared by
   ## `dynlib` and `verifyProcs`.
+  ##
+  ## `hasManifestAttached` (RFC-0001 §B.5 check 9, slice B6a): true iff
+  ## `applyCompatManifest` attached a (non-ABI-ignored) compat manifest to
+  ## this block. When true, every proc's graceful `#else` fallback (the
+  ## no-verification tier — see the "Fallback: graceful degradation"
+  ## comment below) gains a `#pragma message` noting that this specific
+  ## compile did NOT re-verify the manifest's facts — a green manifest and
+  ## a degraded verification tier must never blur together into one
+  ## "everything is fine" signal. `false` (the default) reproduces today's
+  ## emission byte-for-byte.
   # {.noverify.} procs are excluded entirely — no _Static_assert AND no
   # #include of their header. A noverify symbol typically doesn't exist in
   # the installed headers (that's why verification is skipped), and its call
@@ -968,8 +1233,20 @@ proc genVerifyBlock(allProcs: seq[SoftlinkProc], tag: string): seq[NimNode] =
           "#else\n#error \"softlink: signature verification unavailable here " &
           "(need C++, GCC/Clang, or MSVC /std:clatest); remove -d:softlinkStrictVerify to skip\"\n#endif\n"))
       else:
-        emitArray.add(newStrLitNode(
-          "#else\n/* softlink: signature verification skipped — unsupported compiler/mode */\n#endif\n"))
+        var fallbackText =
+          "#else\n/* softlink: signature verification skipped — unsupported compiler/mode */\n"
+        if hasManifestAttached:
+          # RFC-0001 §B.5 check 9: this build's own verification tier
+          # degraded to the no-op fallback WHILE a compat manifest is
+          # attached — the manifest may be green, but THIS compile
+          # verified nothing, and those two facts must not blur.
+          # `#pragma message` is portable across gcc/clang/MSVC.
+          fallbackText.add(
+            "#pragma message(\"softlink: compat manifest attached but " &
+            "this compile's verification tier degraded to no-op — " &
+            "manifest facts were NOT re-verified by this build\")\n")
+        fallbackText.add("#endif\n")
+        emitArray.add(newStrLitNode(fallbackText))
 
       if p.verifyWhen.len > 0:
         emitArray.add(newStrLitNode("#endif /* softlink verifyWhen */\n"))
@@ -1042,9 +1319,11 @@ proc probeFactsJson(p: SoftlinkProc): JsonNode =
   ## emitted so the harvester's schema doesn't have to special-case their
   ## current equality if that axis is ever added.
   ##
-  ## `since` is always `""`: RFC-0001 §9 Stage C introduces the `since`
-  ## pragma; the key is reserved here (rather than left absent) so the
-  ## harvester's key set doesn't churn when Stage C lands.
+  ## `since` (RFC-0001 §B.5/§C.2, slice B6a: {.since: "x.y.z".} lands in
+  ## THIS slice) now carries the real per-proc value — "" when the pragma
+  ## is absent, same as every other optional fact here. The key itself was
+  ## already reserved (always `""`) before this slice, precisely so the
+  ## harvester's key set would not churn when a real value arrived.
   %*{
     "nimName": p.nameStr,
     "cName": p.nameStr,
@@ -1054,7 +1333,7 @@ proc probeFactsJson(p: SoftlinkProc): JsonNode =
     "optional": p.isOptional,
     "noverify": p.noVerify,
     "noverifyReason": p.noVerifyReason,
-    "since": ""
+    "since": p.sinceVersion
   }
 
 proc dumpProbeFacts(kind, modulePath, libPattern, baseName: string,
@@ -1221,10 +1500,26 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # Collect proc info and generate pointer vars
   var procs: seq[SoftlinkProc]
   var seenNames: HashSet[string]
+  var manifestDirective: CompatManifestDirective
 
   for stmt in body:
+    # RFC-0001 §B.5, slice B6a: the `compatManifest` body directive — at
+    # most one per block, any position. Consumed here (never re-emitted),
+    # exactly like every proc declaration below is consumed and
+    # regenerated rather than passed through verbatim — this is why a
+    # correctly-placed directive never reaches the erroring stub proc
+    # `compatManifest` above.
+    if isCompatManifestCall(stmt):
+      let d = parseCompatManifestDirective(stmt, "dynlib")
+      if manifestDirective.present:
+        error(compatManifestDupError("dynlib", manifestDirective, d), stmt)
+      else:
+        manifestDirective = d
+      continue
+
     if stmt.kind != nnkProcDef:
-      error("dynlib body must contain only proc declarations", stmt)
+      error("dynlib body must contain only proc declarations (or a " &
+            "compatManifest directive)", stmt)
 
     let procName = stmt[0]
     let nameStr = $procName
@@ -1246,7 +1541,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
                         headerFile: facts.headerFile, isOptional: facts.isOptional,
                         noVerify: facts.noVerify, noVerifyReason: facts.noVerifyReason,
                         verifyWhen: facts.verifyWhen,
-                        prototype: facts.prototype, hasReturn: hasReturn))
+                        prototype: facts.prototype, sinceVersion: facts.sinceVersion,
+                        hasReturn: hasReturn))
 
     # Build proc type for the var — C functions can't raise Nim exceptions
     var procTy = newNimNode(nnkProcTy)
@@ -1312,7 +1608,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       else:
         hint(msg, body)
 
-  for verifyNode in genVerifyBlock(procs, baseName):
+  # RFC-0001 §B.5, slice B6a: compile-time compat-manifest consumption —
+  # no-op unless a `compatManifest` directive was found above. Must run
+  # before `genVerifyBlock` so its return value (whether a manifest is
+  # attached, ABI-ignored or not) can gate the degraded-tier warning.
+  let hasManifestAttached = applyCompatManifest(ppmDynlib, baseNameLower, procs, manifestDirective)
+
+  for verifyNode in genVerifyBlock(procs, baseName, hasManifestAttached):
     result.add(verifyNode)
 
   # loadXxx*(): LoadResult
@@ -1580,15 +1882,23 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ))
     result.add(ptrAccessorProc)
 
-proc collectVProcs(body: NimNode): seq[SoftlinkProc] =
+proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: CompatManifestDirective] =
   ## Parse a block of proc declarations for verification. Each must carry a
   ## calling convention and a {.header.} pragma (same rules as `dynlib`,
   ## enforced by the shared `parseProcPragmas`), but `optional`/`noverify`
   ## are rejected — the block exists solely to verify.
   var seenNames: HashSet[string]
+  var manifestDirective: CompatManifestDirective
   for stmt in body:
+    if isCompatManifestCall(stmt):
+      let d = parseCompatManifestDirective(stmt, "verifyProcs")
+      if manifestDirective.present:
+        error(compatManifestDupError("verifyProcs", manifestDirective, d), stmt)
+      else:
+        manifestDirective = d
+      continue
     if stmt.kind != nnkProcDef:
-      error("verifyProcs body must contain only proc declarations", stmt)
+      error("verifyProcs body must contain only proc declarations (or a compatManifest directive)", stmt)
     let procName = stmt[0]
     let nameStr = $procName
     let formalParams = stmt[3]
@@ -1597,10 +1907,11 @@ proc collectVProcs(body: NimNode): seq[SoftlinkProc] =
       error("duplicate proc '" & nameStr & "' in verifyProcs block", stmt)
     seenNames.incl(nameStr)
     let facts = parseProcPragmas(stmt, nameStr, ppmVerifyProcs)
-    result.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
+    result.procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
       formalParams: formalParams, callConv: facts.callConv, headerFile: facts.headerFile,
       isOptional: false, verifyWhen: facts.verifyWhen, prototype: facts.prototype,
-      hasReturn: hasReturn))
+      sinceVersion: facts.sinceVersion, hasReturn: hasReturn))
+  result.directive = manifestDirective
 
 macro verifyProcs*(body: untyped): untyped =
   ## Emit ONLY compile-time C header signature verification for the given proc
@@ -1611,10 +1922,13 @@ macro verifyProcs*(body: untyped): untyped =
   ## `_Static_assert`-grade signature checking that `dynlib` performs for
   ## dynamic ones. This is identity-coherent with softlink: it *verifies* FFI
   ## signatures against headers; it does not perform static linking.
-  let procs = collectVProcs(body)
+  let (procs, manifestDirective) = collectVProcs(body)
   let tag = if procs.len > 0: procs[0].nameStr else: "anon"
+  # RFC-0001 SS4 B.5a, slice B6a: the compile-time subset (no lib-identity
+  # check -- verifyProcs has no library identity to check against).
+  let hasManifestAttached = applyCompatManifest(ppmVerifyProcs, "", procs, manifestDirective)
   result = newStmtList()
-  for n in genVerifyBlock(procs, tag):
+  for n in genVerifyBlock(procs, tag, hasManifestAttached):
     result.add(n)
 
   # RFC-0001 §4 B.1, spec gap resolved: `verifyProcs` blocks have no lib

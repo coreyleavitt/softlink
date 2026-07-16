@@ -24,7 +24,7 @@
 import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times]
 import softlink/versions
 
-export FactKind
+export FactKind, abiTag
 
 type
   HarvestError* = object of CatchableError
@@ -668,10 +668,12 @@ func versionInSupportRange(v: string, r: VersionInterval): bool =
   ## Half-open range membership, IDENTICAL semantics to B0's
   ## `VersionInterval`/B4's manifest intervals: `lo` inclusive, `hi`
   ## exclusive, either bound `""` meaning unbounded in that direction.
-  ## Reuses `cmpVersion`, never raw string comparison — see B0's own
-  ## "4.9.0" < "4.10.0" property this must not silently violate.
-  (r.lo.len == 0 or cmpVersion(v, r.lo) >= 0) and
-  (r.hi.len == 0 or cmpVersion(v, r.hi) < 0)
+  ## Thin wrapper over `softlink/versions.contains` (slice B6a pulled the
+  ## predicate itself up into that shared module, since the consumer side
+  ## needs the identical rule) — kept as a named local proc rather than
+  ## inlined at the one call site below, to preserve this doc comment's
+  ## explanation at its point of use.
+  r.contains(v)
 
 func driftAlarm*(r: HarvestResult,
                   supportRange: VersionInterval = VersionInterval(lo: "", hi: "")
@@ -722,30 +724,6 @@ func driftAlarm*(r: HarvestResult,
     lines.add("  " & o.cname & ": mismatch at " & o.versions.join(", "))
   lines.add(f3Sentence)
   (tripped: true, diagnosis: lines.join("\n"))
-
-func abiTag*(): string =
-  ## Best-effort OS + data-model tag for `HarvestMeta.abi` (RFC-0001 SS4
-  ## B.3's round-2 addition — "a manifest is valid for exactly one ABI
-  ## class"): `hostOS` (a Nim compile-time constant) plus the data model
-  ## computed from `sizeof(clong)`/`sizeof(pointer)` — `lp64` (long=8,
-  ## ptr=8; Linux/macOS 64-bit), `llp64` (long=4, ptr=8; 64-bit Windows),
-  ## `ilp32` (long=4, ptr=4; any 32-bit target). Nim's `clong` is defined to
-  ## match the TARGET C compiler's `long` width for the current platform
-  ## (`system/ctypes.nim`), not a fixed Nim integer size, so this reflects
-  ## the real ABI the harvester's own probe compiles ran under. Multi-
-  ## platform bindings harvest once per ABI class and commit one manifest
-  ## each (`z3.linux-lp64.compat.json`, ...) — this is the computation that
-  ## per-manifest tag comes from for the default (gcc/clang) pipeline.
-  let model =
-    if sizeof(clong) == 8 and sizeof(pointer) == 8: "lp64"
-    elif sizeof(clong) == 4 and sizeof(pointer) == 8: "llp64"
-    elif sizeof(clong) == 4 and sizeof(pointer) == 4: "ilp32"
-    else: "unknown-datamodel"
-      # An exotic/16-bit target: never crash the harvester over an
-      # unrecognized data model, just record that the tag couldn't be
-      # computed — a human authoring a manifest for such a target can
-      # still hand-edit this one field.
-  hostOS & "-" & model
 
 proc detectToolchain(): string =
   ## Best-effort first line of `gcc --version` for `HarvestMeta.toolchain`

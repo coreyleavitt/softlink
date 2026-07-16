@@ -25,3 +25,9 @@ docs/
 
 # Nim cache
 nimcache/
+
+# RFC-0001 §B.5, slice B6a: per-OS-leg-generated compat manifest fixtures
+# — the nimble test task writes these from their `*.tmpl.json` templates
+# with THIS CI leg's real target ABI substituted in (see `writeManifestAbi`
+# in softlink.nimble); the `.tmpl.json` sources stay tracked.
+tests/manifests/*.compat.json

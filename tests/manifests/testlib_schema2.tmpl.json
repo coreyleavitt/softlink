@@ -1,0 +1,20 @@
+{
+  "schema": 2,
+  "lib": "testlib",
+  "harvest": {
+    "toolchain": "fixture",
+    "tier": "builtin-compat",
+    "abi": "${ABI}",
+    "date": "2026-01-01"
+  },
+  "corpus": [
+    { "version": "1.0.0", "source": "git:example/testlib@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+  ],
+  "symbols": {
+    "testlib_add": {
+      "header": {
+        "verified": [{}]
+      }
+    }
+  }
+}

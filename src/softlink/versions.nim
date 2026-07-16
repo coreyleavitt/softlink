@@ -115,6 +115,32 @@ func parseVersion*(v: string): Option[seq[int]] =
       inc i
   if runs.len == 0: none(seq[int]) else: some(runs)
 
+func abiTag*(): string =
+  ## Best-effort OS + data-model tag (RFC-0001 §B.3's round-2 addition —
+  ## "a manifest is valid for exactly one ABI class"): `hostOS` (a Nim
+  ## compile-time constant) plus the data model computed from
+  ## `sizeof(clong)`/`sizeof(pointer)` — `lp64` (long=8, ptr=8; Linux/macOS
+  ## 64-bit), `llp64` (long=4, ptr=8; 64-bit Windows), `ilp32` (long=4,
+  ## ptr=4; any 32-bit target). Nim's `clong` is defined to match the
+  ## TARGET C compiler's `long` width for the current platform
+  ## (`system/ctypes.nim`), not a fixed Nim integer size, so this reflects
+  ## the real ABI code compiled against this call runs under — true both
+  ## when `tools/harvest/harvester.nim`'s probe compiles call it (the
+  ## producer side) and when a `dynlib`/`verifyProcs` macro evaluates it at
+  ## compile time via `const`/`static` (the consumer side, slice B6a) — one
+  ## definition, shared by both, so they cannot drift apart independently
+  ## (the same rationale the RFC gives for pinning the B0 types here).
+  let model =
+    if sizeof(clong) == 8 and sizeof(pointer) == 8: "lp64"
+    elif sizeof(clong) == 4 and sizeof(pointer) == 8: "llp64"
+    elif sizeof(clong) == 4 and sizeof(pointer) == 4: "ilp32"
+    else: "unknown-datamodel"
+      # An exotic/16-bit target: never crash over an unrecognized data
+      # model, just record that the tag couldn't be computed — a human
+      # authoring a manifest for such a target can still hand-edit this
+      # one field.
+  hostOS & "-" & model
+
 func cmpVersion*(a, b: string): int =
   ## Three-way comparison of two version strings under the B0 total
   ## order: negative if `a` sorts before `b`, zero if equal, positive if
@@ -130,3 +156,16 @@ func cmpVersion*(a, b: string): int =
   let ra = parseVersion(a)
   let rb = parseVersion(b)
   cmpRuns(if ra.isSome: ra.get else: @[], if rb.isSome: rb.get else: @[])
+
+func contains*(iv: VersionInterval, v: string): bool =
+  ## Half-open interval membership (RFC-0001 §B.3/§B.4): `lo` inclusive,
+  ## `hi` exclusive, either bound `""` meaning unbounded in that direction.
+  ## Compared via `cmpVersion`, never raw string comparison — see the
+  ## module doc comment's "4.9.0" < "4.10.0" property this must not
+  ## silently violate. The single exported predicate slice B6a's manifest
+  ## validation (`softlink/manifest`) needs consumer-side; the harvester's
+  ## own `versionInSupportRange` (`tools/harvest/harvester.nim`) is the
+  ## producer-side twin with identical semantics — kept as two call sites
+  ## of the SAME rule rather than two independent implementations.
+  (iv.lo.len == 0 or cmpVersion(v, iv.lo) >= 0) and
+  (iv.hi.len == 0 or cmpVersion(v, iv.hi) < 0)

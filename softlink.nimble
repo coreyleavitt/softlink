@@ -83,6 +83,56 @@ proc expectCompileFailure(cmd: string) =
          "vs. prototype conflict on testlib_add) but the compile " &
          "SUCCEEDED: " & cmd)
 
+proc writeManifestFromTemplate(tmplPath, outPath: string) =
+  ## RFC-0001 §B.5, slice B6a design guidance: materialize a `*.tmpl.json`
+  ## compat-manifest fixture (tracked) into its real, gitignored
+  ## `*.compat.json` path, substituting a `${ABI}` placeholder with THIS
+  ## CI leg's real target ABI tag — computed via `softlink/versions.abiTag`,
+  ## the IDENTICAL function `dynlib`/`verifyProcs`'s own ABI check calls at
+  ## macro-expansion time (one shared definition, imported at the top of
+  ## this file) — so a fixture authored once passes the ABI check on every
+  ## OS leg, not just the one it was written on. A template with no
+  ## `${ABI}` placeholder (e.g. `testlib_abi_mismatch.tmpl.json`, whose abi
+  ## is deliberately fixed and wrong on every real target) round-trips
+  ## unchanged.
+  writeFile(outPath, readFile(tmplPath).replace("${ABI}", abiTag()))
+
+proc expectManifestCompileOk(cmd: string, mustContain, mustNotContain: openArray[string]) =
+  ## RFC-0001 §B.5/§B.5a, slice B6a: assert `cmd` (a compile invocation)
+  ## SUCCEEDS, and its output contains every string in `mustContain` and
+  ## none in `mustNotContain`. Every manifest-consumption diagnostic is
+  ## softlink's OWN text, but — unlike this file's other softlink-string
+  ## checks, which grep/findstr-split per OS — this asserts at the
+  ## NimScript level directly (`gorgeEx` + plain `in`), the same trick
+  ## `expectCompileFailure`/`expectAnchor` above already use, so ONE call
+  ## works identically from all three OS branches below.
+  let (output, code) = gorgeEx(cmd)
+  if code != 0:
+    echo output
+    quit("softlink: RFC-0001 slice B6a expected a compile SUCCESS: " & cmd)
+  for s in mustContain:
+    if s notin output:
+      echo output
+      quit("softlink: RFC-0001 slice B6a expected compile output to " &
+           "contain '" & s & "': " & cmd)
+  for s in mustNotContain:
+    if s in output:
+      echo output
+      quit("softlink: RFC-0001 slice B6a expected compile output to NOT " &
+           "contain '" & s & "': " & cmd)
+
+proc expectManifestCompileFail(cmd: string, mustContain: openArray[string]) =
+  ## The failure-polarity mirror of `expectManifestCompileOk` above.
+  let (output, code) = gorgeEx(cmd)
+  if code == 0:
+    echo output
+    quit("softlink: RFC-0001 slice B6a expected a compile FAILURE: " & cmd)
+  for s in mustContain:
+    if s notin output:
+      echo output
+      quit("softlink: RFC-0001 slice B6a expected compile output to " &
+           "contain '" & s & "': " & cmd)
+
 proc corpusBaseName(path: string): string =
   ## Last path component of a NimScript `listDirs`/`listFiles` result
   ## (`"tests/corpus/1.0.0"` -> `"1.0.0"`). NimScript's directory walkers
@@ -722,6 +772,107 @@ task test, "Run tests":
     for d in probeOnlyDirs:
       if dirExists(d): rmDir(d)
 
+  # RFC-0001 §B.5/§B.5a, slice B6a: the `compatManifest` body directive —
+  # grammar, erroring stub, path resolution, and every compile-time
+  # consumption check (schema, lib identity, ABI, disjoint/exhaustive,
+  # since-contradiction, mismatch warning, not-in-manifest hint,
+  # degraded-tier warning). Fixture manifests under tests/manifests/ are
+  # tracked as `*.tmpl.json` templates (a `${ABI}` placeholder where the
+  # check must pass on every OS leg) and materialized into their real,
+  # gitignored `*.compat.json` paths per run — see
+  # `writeManifestFromTemplate` above.
+  const manifestTmplBases = ["testlib", "testlib_schema2", "testlib_wronglib",
+    "testlib_overlap", "testlib_gap", "testlib_since", "testlib_vp_subset",
+    "testlib_vp_since", "testlib_abi_mismatch"]
+
+  proc runManifestChecks() =
+    const mdir = "tests/manifests/"
+    for base in manifestTmplBases:
+      writeManifestFromTemplate(mdir & base & ".tmpl.json", mdir & base & ".compat.json")
+
+    const mcBase = "nim c --compileOnly --path:src --passC:-I. "
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_ok.nim", [], [
+      "not in compat manifest", "recorded a 'mismatch' interval",
+      "only supports schema", "is for library", "ignoring the compat manifest"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_dup_directive.nim",
+      ["duplicate compatManifest directive"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_outside_block.nim",
+      ["compatManifest is a body directive"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_bad_path.nim",
+      ["manifest file not found"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_bad_path_type.nim",
+      ["unrecognized argument"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_bad_refuse_type.nim",
+      ["must be a bool literal"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_no_path.nim",
+      ["requires a string literal manifest path"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_schema_newer.nim",
+      ["only supports schema 1"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_wrong_lib.nim",
+      ["is for library 'notthislib'"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_overlap.nim",
+      ["an overlap"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_gap.nim",
+      ["a gap"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_since_contradiction.nim",
+      ["corrected lower bound is 2.0.0"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_since_unparseable.nim",
+      ["does not parse as a version"])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_mismatch_warning.nim",
+      ["recorded a 'mismatch' interval"], [])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_not_in_manifest_hint.nim",
+      ["not in compat manifest"], [])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_abi_mismatch.nim",
+      ["ignoring the compat manifest entirely"], ["corrected lower bound"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_refuse_verifyprocs.nim",
+      ["nothing to refuse on verifyProcs"])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_verifyprocs_subset.nim",
+      ["recorded a 'mismatch' interval", "not in compat manifest"], [])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_verifyprocs_since_contradiction.nim",
+      ["corrected lower bound is 2.0.0"])
+
+    # Check 9 (degraded-tier warning): direct C-inspection, mirroring
+    # `runProbeOnlyChecks`'s own `expectAnchor` convention above — the
+    # macro cannot know at expansion time which C tier fires, so the
+    # `#pragma message` is asserted PRESENT in the emitted C for the
+    # manifest-attached fixture and ABSENT for its no-manifest twin.
+    const degradedWithDir = "tests/nimcache_manifest_degraded_with"
+    const degradedWithoutDir = "tests/nimcache_manifest_degraded_without"
+    if dirExists(degradedWithDir): rmDir(degradedWithDir)
+    if dirExists(degradedWithoutDir): rmDir(degradedWithoutDir)
+    exec mcBase & "--nimcache:" & degradedWithDir & " tests/tcheck_manifest_degraded_with.nim"
+    exec mcBase & "--nimcache:" & degradedWithoutDir & " tests/tcheck_manifest_degraded_without.nim"
+    const degradedNeedle = "softlink: compat manifest attached but this " &
+      "compile's verification tier degraded to no-op"
+    expectAnchor(degradedWithDir, degradedNeedle,
+      "manifest attached: degraded-tier pragma present", true)
+    expectAnchor(degradedWithoutDir, degradedNeedle,
+      "no manifest: degraded-tier pragma absent", false)
+    rmDir(degradedWithDir)
+    rmDir(degradedWithoutDir)
+
+    for base in manifestTmplBases:
+      rmFile(mdir & base & ".compat.json")
+
   # RFC-0001 §4 B.2, classification-table discriminators: the heart of the
   # RFC's harvester classification table, proven directly against the
   # shipped mechanism (no harvester exists yet — that's slice B3):
@@ -855,6 +1006,7 @@ task test, "Run tests":
     exec probeNoTargetSentinelCheck & " 2>&1 | findstr /C:\"" & probeNoTargetAnchor & "\" >NUL"
     runProbeOnlyChecks()
     runCorpusChecks()
+    runManifestChecks()
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -919,6 +1071,7 @@ task test, "Run tests":
     exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
     runCorpusChecks()
+    runManifestChecks()
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -989,6 +1142,7 @@ task test, "Run tests":
     exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
     runCorpusChecks()
+    runManifestChecks()
     runHarvesterCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":

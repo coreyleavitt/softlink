@@ -3,9 +3,10 @@
 ## Tests against system math/C libraries (Linux) and a custom test library (all platforms).
 ## Build the test library before running (see nimble test task).
 
-import std/[unittest, math, strutils]
+import std/[unittest, math, strutils, sequtils]
 import softlink {.all.}
 import softlink/versions
+import softlink/manifest
 
 suite "deriveLibPattern — logical name → per-OS candidates":
   test "Linux → bare .so first, then descending single-component majors":
@@ -892,3 +893,127 @@ suite "softlink/versions — B0 version comparator":
     check facts.header[fkVerified].len == 1
     check facts.header[fkMismatch].len == 0
     check facts.header[fkUnknown].len == 0
+
+  test "contains: half-open membership, both bounds unbounded":
+    check VersionInterval(lo: "", hi: "").contains("0.0.1")
+    check VersionInterval(lo: "", hi: "").contains("99.0.0")
+
+  test "contains: lo inclusive, hi exclusive":
+    let iv = VersionInterval(lo: "1.0.0", hi: "2.0.0")
+    check not iv.contains("0.9.9")
+    check iv.contains("1.0.0")
+    check iv.contains("1.5.0")
+    check not iv.contains("2.0.0")
+    check not iv.contains("2.0.1")
+
+  test "contains: one-sided bounds":
+    check VersionInterval(lo: "2.0.0", hi: "").contains("2.0.0")
+    check VersionInterval(lo: "2.0.0", hi: "").contains("99.0.0")
+    check not VersionInterval(lo: "2.0.0", hi: "").contains("1.9.9")
+    check VersionInterval(lo: "", hi: "2.0.0").contains("1.9.9")
+    check not VersionInterval(lo: "", hi: "2.0.0").contains("2.0.0")
+
+  test "abiTag: <os>-<datamodel> shape, matches this build's target":
+    let tag = abiTag()
+    check '-' in tag
+    when defined(linux):
+      check tag.startsWith("linux-")
+    elif defined(macosx):
+      check tag.startsWith("macosx-")
+    elif defined(windows):
+      check tag.startsWith("windows-")
+    when sizeof(clong) == 8 and sizeof(pointer) == 8:
+      check tag.endsWith("-lp64")
+    elif sizeof(clong) == 4 and sizeof(pointer) == 8:
+      check tag.endsWith("-llp64")
+    elif sizeof(clong) == 4 and sizeof(pointer) == 4:
+      check tag.endsWith("-ilp32")
+
+# RFC-0001 §B.3/§B.5, slice B6a: softlink/manifest — pure parse/validate
+# predicates, tested directly (no macro involved) against the golden
+# fixture already used elsewhere in this suite's corpus
+# (tests/corpus/expected.compat.json).
+suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5)":
+  const fixturePath = "tests/corpus/expected.compat.json"
+  let fixtureText = readFile(fixturePath)
+
+  test "parseManifest: schema/lib/abi/corpus/symbols, golden fixture":
+    let m = parseManifest(fixtureText, fixturePath)
+    check m.schema == 1
+    check m.lib == "corpuslib"
+    check m.abi == "linux-lp64"
+    check m.corpus == @["1.0.0", "2.0.0", "3.0.0"]
+    check m.symbols.len == 3
+    check schemaSupported(m)
+    check libIdentityOk(m, "corpuslib")
+    check not libIdentityOk(m, "otherlib")
+    check abiOk(m, "linux-lp64")
+    check not abiOk(m, "windows-llp64")
+
+  test "parseManifest: malformed JSON raises ManifestError":
+    expect(ManifestError):
+      discard parseManifest("not json", "bogus.json")
+
+  test "parseManifest: missing required key raises ManifestError":
+    expect(ManifestError):
+      discard parseManifest("""{"schema": 1, "lib": "x"}""", "bogus.json")
+
+  test "schemaSupported: false for a newer schema value":
+    var m = parseManifest(fixtureText, fixturePath)
+    m.schema = 2
+    check not schemaSupported(m)
+
+  test "validateDisjointExhaustive: golden fixture has no violations":
+    let m = parseManifest(fixtureText, fixturePath)
+    check validateDisjointExhaustive(m).len == 0
+
+  test "validateDisjointExhaustive: detects an injected overlap":
+    var m = parseManifest(fixtureText, fixturePath)
+    for i in 0 ..< m.symbols.len:
+      if m.symbols[i].cname == "corpuslib_stable":
+        # corpuslib_stable is already verified/hi:3.0.0 + unknown/lo:3.0.0;
+        # also marking it mismatch across the whole corpus creates overlap.
+        m.symbols[i].header[fkMismatch] = @[VersionInterval(lo: "", hi: "")]
+    let violations = validateDisjointExhaustive(m)
+    check violations.len > 0
+    check violations[0].cname == "corpuslib_stable"
+
+  test "validateDisjointExhaustive: detects an injected gap":
+    var m = parseManifest(fixtureText, fixturePath)
+    for i in 0 ..< m.symbols.len:
+      if m.symbols[i].cname == "corpuslib_added":
+        # corpuslib_added: absent/hi:2.0.0, verified/lo:2.0.0-hi:3.0.0,
+        # unknown/lo:3.0.0. Narrowing verified's hi to before 3.0.0 opens a
+        # gap that nothing else covers.
+        m.symbols[i].header[fkVerified] = @[VersionInterval(lo: "2.0.0", hi: "2.0.0")]
+    let violations = validateDisjointExhaustive(m)
+    check violations.len > 0
+    check violations.anyIt(it.cname == "corpuslib_added" and it.matchCount == 0)
+
+  test "checkSince: claim too early — a later corpus version is absent":
+    let m = parseManifest(fixtureText, fixturePath)
+    # corpuslib_added is absent through 2.0.0 (exclusive), verified from 2.0.0.
+    let sc = checkSince(m, "corpuslib_added", "1.0.0")
+    check sc.contradicted
+    check "2.0.0" in sc.message
+
+  test "checkSince: claim too late — an earlier corpus version is already declared":
+    let m = parseManifest(fixtureText, fixturePath)
+    let sc = checkSince(m, "corpuslib_added", "3.0.0")
+    check sc.contradicted
+    check "2.0.0" in sc.message
+
+  test "checkSince: claim matches the manifest — no contradiction":
+    let m = parseManifest(fixtureText, fixturePath)
+    check not checkSince(m, "corpuslib_added", "2.0.0").contradicted
+
+  test "checkSince: symbol absent from manifest entirely — no check possible":
+    let m = parseManifest(fixtureText, fixturePath)
+    check not checkSince(m, "corpuslib_nonexistent", "1.0.0").contradicted
+
+  test "mismatchedSymbols / notInManifest":
+    let m = parseManifest(fixtureText, fixturePath)
+    check mismatchedSymbols(m, @["corpuslib_changed", "corpuslib_stable"]) ==
+      @["corpuslib_changed"]
+    check notInManifest(m, @["corpuslib_stable", "not_a_real_symbol"]) ==
+      @["not_a_real_symbol"]
