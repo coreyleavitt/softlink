@@ -17,6 +17,13 @@
       "header": {
         "verified": [{}]
       }
+    },
+    "testlib_future": {
+      "header": {
+        "absent": [{ "hi": "2.0.0" }],
+        "verified": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
     }
   }
 }

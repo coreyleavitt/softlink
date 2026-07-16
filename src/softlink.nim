@@ -94,6 +94,37 @@ proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
     msg: library & ": library not loaded, cannot call: " & symbol,
     library: library, symbol: symbol)
 
+proc computeMissingPartition(symbols: seq[SymbolFacts], missingSymbols: seq[string],
+                              sinceCNames, sinceVersions: seq[string],
+                              probedVersion: string):
+                              seq[tuple[symbol: string, reason: MissingReason]] =
+  ## RFC-0001 §9/§C.2, slice C3: the runtime bridge between the pure
+  ## `softlink/manifest.classifyAbsence` (facts + version + since ->
+  ## `AbsenceClass`) and `CompatReport.missing`'s `MissingReason`. Called
+  ## once per successful, manifest-attested `loadX` (bound via `bindSym`
+  ## from generated code, like `parseVersion`/`isSome` above it — no
+  ## export needed, `bindSym` resolves in THIS module's own scope) — only
+  ## when the block has both a `compatManifest` and at least one optional
+  ## proc (nothing to partition otherwise). `missingSymbols` is the exact
+  ## `softlinkMissing` seq the load pipeline already built (Phase 2);
+  ## `sinceCNames`/`sinceVersions` are macro-time-computed PARALLEL arrays
+  ## (this block's OPTIONAL procs' own `{.since.}` claims only — required
+  ## symbols never appear in `missingSymbols` on a successful load, so
+  ## their claims are irrelevant here) rather than a `seq` of pairs, purely
+  ## so the macro can embed them with the same plain `newLit(seq[string])`
+  ## shape already proven elsewhere in this file (`corpusLit`), with no new
+  ## exported aggregate type for generated code to reference by name.
+  for sym in missingSymbols:
+    var since = ""
+    for i in 0 ..< sinceCNames.len:
+      if sinceCNames[i] == sym:
+        since = sinceVersions[i]
+        break
+    case classifyAbsence(symbols, sym, probedVersion, since)
+    of acExpected: result.add (symbol: sym, reason: mrExpected)
+    of acAnomalous: result.add (symbol: sym, reason: mrAnomalous)
+    of acNone: discard
+
 func toIncludeDirective(header: string): string =
   ## Convert a header path to a C #include directive.
   ## Supports angle-bracket syntax: ``"<mbedtls/ssl.h>"`` → ``#include <mbedtls/ssl.h>``
@@ -2342,24 +2373,63 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # version string that was never actually harvested; see the C2
       # handoff for the full rationale).
       let corpusLit = newLit(appliedManifest.manifest.corpus)
+
+      # RFC-0001 §9/§C.2, slice C3: the absence partition (`mrExpected`/
+      # `mrAnomalous`), computed AT MOST once per successful, manifest-
+      # attested load — only when there is something to partition at all
+      # (`hasOptional`; a block with no optional procs can never have a
+      # `missing` entry). Deliberately NOT gated on atAttested-vs-
+      # atOutOfCorpus: the manifest's header-fact INTERVALS (§B.3) are
+      # ranges, independent of whether `probedVersion` is a literally-
+      # harvested corpus point — that literal-membership question is what
+      # `corpusLit`'s `in` check above answers for `attestation`, a
+      # different question from "do the harvested interval facts say
+      # something about this specific version" (judgment call; see the C3
+      # handoff for the full rationale). `computeMissingPartition` (bound
+      # via `bindSym`, like `parseVersion`/`isSome` above) is the pure-func
+      # bridge — no nontrivial decision logic inlined as raw AST here.
+      var missingPartitionFields: seq[(string, NimNode)] = @[]
+      var missingPartitionLet = newEmptyNode()
+      if hasOptional:
+        var sinceCNames: seq[string] = @[]
+        var sinceVersions: seq[string] = @[]
+        for p in procs:
+          if p.isOptional and p.sinceVersion.len > 0:
+            sinceCNames.add(p.nameStr)
+            sinceVersions.add(p.sinceVersion)
+        let missingPartitionSym = genSym(nskLet, "missingPartition")
+        missingPartitionLet = newLetStmt(missingPartitionSym, newCall(
+          bindSym("computeMissingPartition"),
+          ident("softlinkCompatFacts" & baseName),
+          missingName,
+          newLit(sinceCNames),
+          newLit(sinceVersions),
+          probedVersionName
+        ))
+        missingPartitionFields.add(("missing", missingPartitionSym))
+
       var corpusIf = newNimNode(nnkIfStmt)
       corpusIf.add(newNimNode(nnkElifBranch).add(
         newNimNode(nnkInfix).add(ident("in"), probedVersionName, corpusLit),
         newStmtList(assignCompatReportStmt(@[
           ("runtimeVersion", probedVersionName),
-          ("attestation", ident("atAttested"))]))
+          ("attestation", ident("atAttested"))] & missingPartitionFields))
       ))
       corpusIf.add(newNimNode(nnkElse).add(newStmtList(
         assignCompatReportStmt(@[
           ("runtimeVersion", probedVersionName),
-          ("attestation", ident("atOutOfCorpus"))])
+          ("attestation", ident("atOutOfCorpus"))] & missingPartitionFields)
       )))
       var reportIf = newNimNode(nnkIfStmt)
       reportIf.add(newNimNode(nnkElifBranch).add(
         probeFailedName,
         newStmtList(assignCompatReportStmt(@[("attestation", ident("atProbeFailed"))]))
       ))
-      reportIf.add(newNimNode(nnkElse).add(newStmtList(corpusIf)))
+      var successStmts = newStmtList()
+      if hasOptional:
+        successStmts.add(missingPartitionLet)
+      successStmts.add(corpusIf)
+      reportIf.add(newNimNode(nnkElse).add(successStmts))
       loadBody.add(reportIf)
 
     # Cache and return result

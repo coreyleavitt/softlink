@@ -258,6 +258,80 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
     message: "softlink: {.since: \"" & since & "\".} on '" & cname & "' " &
       detail & " (" & boundMsg & ")")
 
+type
+  AbsenceClass* = enum
+    ## RFC-0001 §C.2, slice C3: the pure classification behind the runtime
+    ## absence partition. `CompatReport.missing`'s `MissingReason` (defined
+    ## in `src/softlink.nim`, since it's a `dynlib`-facing public type) is
+    ## NOT reused here directly — this module must stay macro-free and
+    ## independently `unittest`-able, and `MissingReason` also carries
+    ## `mrDriftRefused` (C4b/C4c, not this slice's concern). The generated
+    ## code's runtime bridge (`computeMissingPartition` in `softlink.nim`)
+    ## maps this 1:1: `acExpected` -> `mrExpected`, `acAnomalous` ->
+    ## `mrAnomalous`, `acNone` -> no partition entry at all.
+    acNone       ## honest ignorance (RFC-0001 §C.2: "otherwise they are
+                 ## simply absent from the report's partition") — no header
+                 ## fact and no `{.since.}` claim covers this version.
+    acExpected   ## manifest header-absent at this version, OR a
+                 ## `{.since.}` claim whose lower bound is still ahead of
+                 ## this runtime (this runtime predates the symbol).
+    acAnomalous  ## this version's headers declare the symbol (`verified`
+                 ## OR `mismatch` — see `classifyAbsence`'s own doc comment
+                 ## for the `mismatch` judgment call), yet it did not
+                 ## resolve at load time.
+
+func classifyAbsence*(symbols: seq[SymbolFacts], cname, probedVersion,
+                       sinceVersion: string): AbsenceClass =
+  ## RFC-0001 §C.2/§C.3, slice C3: given one symbol that failed to resolve
+  ## at runtime (an entry already in `LoadResult.missing` — this function
+  ## is never called for a resolved symbol), classify why against this
+  ## block's HEADER facts (`symbols`, the exact `seq[SymbolFacts]` embedded
+  ## at compile time as `softlinkCompatFacts<Base>`, RFC-0001 §B.5) at
+  ## `probedVersion`, folding in a `{.since.}` claim (`sinceVersion`, `""`
+  ## if the proc carries none) per RFC-0001 §C.2's "manifest/since" wording
+  ## on `mrExpected`.
+  ##
+  ## Precedence and judgment calls (flagged in the C3 handoff; RFC-0001
+  ## §B.3/§C.2 text quoted where it applies):
+  ## - **`binary` facts, when they exist, "take precedence"** (§C.2) over
+  ##   header facts. `SymbolFacts` has no `binary` field yet — the schema
+  ##   reserves the namespace (§B.3) but nothing populates or represents it
+  ##   until `softlink audit --record` (RFC-0002). This function is
+  ##   therefore HEADER-FACTS-ONLY by construction (there is nothing else
+  ##   to consult); the precedence rule has no representation to honor yet.
+  ##   Revisit this comment when `binary` lands.
+  ## - **A missing symbol whose headers say `mismatch` at `probedVersion`**
+  ##   is folded into `acAnomalous` alongside `verified`: RFC-0001 §C.2
+  ##   defines `mrAnomalous` as "the headers of this version declare it,
+  ##   yet it did not resolve" — a `mismatch` interval IS the headers
+  ##   declaring the symbol (with a signature this manifest already knows
+  ##   drifted); the "resolved-but-refused" story (`mrDriftRefused`) is a
+  ##   DIFFERENT symbol population (already-resolved pointers, C4b/C4c) and
+  ##   doesn't overlap this one — a symbol reported here never resolved in
+  ##   the first place, so there is no refusal to make; classifying it
+  ##   `acNone`/ignorant would hide a genuine header/`.so` divergence (the
+  ##   F1 case this whole partition exists to surface).
+  ## - **No manifest attached at all** is NOT this function's concern — the
+  ##   generated code never calls it in that case (RFC-0001 §C.2: "with no
+  ##   probe or no manifest, the report degrades field-by-field to
+  ##   empty"); `symbols == @[]` here would be indistinguishable from "an
+  ##   attached manifest that happens to track nothing", which is why that
+  ##   gating lives in the caller, not here.
+  for sf in symbols:
+    if sf.cname == cname:
+      if anyContains(sf.header[fkVerified], probedVersion) or
+         anyContains(sf.header[fkMismatch], probedVersion):
+        return acAnomalous
+      if anyContains(sf.header[fkAbsent], probedVersion):
+        return acExpected
+      # fkUnknown, or (disjoint/exhaustive violations aside) no interval
+      # covers this exact version at all -- fall through to the `since`
+      # check below, exactly like "not in the manifest".
+      break
+  if sinceVersion.len > 0 and cmpVersion(probedVersion, sinceVersion) < 0:
+    return acExpected
+  acNone
+
 func mismatchedSymbols*(m: CompatManifest, boundCNames: seq[string]): seq[string] =
   ## RFC-0001 §B.5 mismatch warning: which of `boundCNames` (this block's
   ## own header/prototype-verified procs) have any recorded `mismatch`

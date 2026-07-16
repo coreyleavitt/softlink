@@ -1229,3 +1229,44 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
       @["corpuslib_changed"]
     check notInManifest(m, @["corpuslib_stable", "not_a_real_symbol"]) ==
       @["not_a_real_symbol"]
+
+  # RFC-0001 §C.2/§C.3, slice C3: `classifyAbsence` — the pure decision
+  # func behind the runtime absence partition (`mrExpected`/`mrAnomalous`),
+  # tested directly against the same golden fixture, no macro/loadX
+  # involved. `corpuslib_added`/`corpuslib_changed`/`corpuslib_stable`'s
+  # interval shapes (see the fixture read above) are reused as-is.
+  test "classifyAbsence: version in an absent interval -> acExpected":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_added", "1.0.0", "") == acExpected
+
+  test "classifyAbsence: version in a verified interval -> acAnomalous":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_added", "2.5.0", "") == acAnomalous
+
+  test "classifyAbsence: version in a mismatch interval -> acAnomalous (judgment call)":
+    # A symbol that never resolved, whose headers at this version are
+    # already known to have DRIFTED, is still "the headers declare it, yet
+    # it did not resolve" (RFC-0001 §C.2's own wording for mrAnomalous) —
+    # not a separate case, and not honest-ignorance either.
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_changed", "2.5.0", "") == acAnomalous
+
+  test "classifyAbsence: version in an unknown interval, no since -> acNone":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "") == acNone
+
+  test "classifyAbsence: unknown interval, but since is still ahead -> acExpected":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "5.0.0") == acExpected
+
+  test "classifyAbsence: unknown interval, since already passed -> acNone":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "1.0.0") == acNone
+
+  test "classifyAbsence: symbol entirely absent from manifest, no since -> acNone":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "") == acNone
+
+  test "classifyAbsence: symbol entirely absent from manifest, since covers it -> acExpected":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "5.0.0") == acExpected
