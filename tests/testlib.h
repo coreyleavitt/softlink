@@ -57,6 +57,15 @@ TESTLIB_API int testlib_gated(void);
 /* Symbol for lrLibNotFound testing — declared in header, bound to a non-existent library */
 TESTLIB_API int testlib_notreal(void);
 
+/* RFC-0001 §9/§C.2, slice C2: a second lrLibNotFound fixture, on its own
+ * dynlib block that ALSO declares a versionProbe — for the "fooCompat()
+ * after a failed load" test (the probe never gets a chance to run, so the
+ * report must be the zero state). Declared here purely so header
+ * verification has something to check against; like testlib_notreal
+ * above, this symbol is never actually resolved at runtime (the library
+ * never loads). */
+TESTLIB_API int testlib_notreal_c2(void);
+
 /* Const-qualified pointer returns — regression tests for #11.
  * On the GCC pathway, `const char *` returns must be considered
  * compatible with the Nim binding's `cstring` type (which emits as

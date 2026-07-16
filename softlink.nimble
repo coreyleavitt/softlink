@@ -1018,6 +1018,22 @@ task test, "Run tests":
 
     expectManifestCompileOk(vpBase & "tests/tcheck_versionprobe_absent.nim", [], [])
 
+  proc runCompatReportManifestChecks(runCmd: string) =
+    ## RFC-0001 §9/§C.2, slice C2: `fooCompat()`'s runtime attestation
+    ## against an ACTUALLY attached compat manifest (atAttested /
+    ## atOutOfCorpus) needs a real `versionProbe` load — something the
+    ## `--compileOnly` fixtures `runManifestChecks` drives above can't
+    ## exercise. `runCmd` is the exact per-OS "load the shared testlib and
+    ## run" command prefix each of the three call sites below already uses
+    ## for `tests/test_softlink.nim` itself (library-path env var included);
+    ## `tests/tcompat_report_manifest.nim` binds the identical
+    ## `libtestlib.so`/`.dylib`/`.dll`, so it needs the same prefix.
+    const mdir = "tests/manifests/"
+    const base = "testlib_compat_report"
+    writeManifestFromTemplate(mdir & base & ".tmpl.json", mdir & base & ".compat.json")
+    exec runCmd & " tests/tcompat_report_manifest.nim"
+    rmFile(mdir & base & ".compat.json")
+
   # RFC-0001 §4 B.2, classification-table discriminators: the heart of the
   # RFC's harvester classification table, proven directly against the
   # shipped mechanism (no harvester exists yet — that's slice B3):
@@ -1161,6 +1177,7 @@ task test, "Run tests":
     runCorpusChecks()
     runManifestChecks()
     runVersionProbeChecks()
+    runCompatReportManifestChecks("nim c -r --path:src --passC:-I.")
   elif defined(macosx):
     exec "cc -shared -fPIC -o tests/libtestlib.dylib tests/testlib.c"
     exec "cc -shared -fPIC -o tests/libmagic.dylib tests/testlib.c"
@@ -1227,6 +1244,7 @@ task test, "Run tests":
     runCorpusChecks()
     runManifestChecks()
     runVersionProbeChecks()
+    runCompatReportManifestChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -1299,6 +1317,7 @@ task test, "Run tests":
     runCorpusChecks()
     runManifestChecks()
     runVersionProbeChecks()
+    runCompatReportManifestChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runHarvesterCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":

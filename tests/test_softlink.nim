@@ -749,6 +749,51 @@ suite "softlink":
     discard loadTestlib()
     check probeRunCount == before
 
+  # RFC-0001 §9/§C.2, slice C2 — TDD suite item 2: TestLib's own block
+  # carries a versionProbe but no compatManifest, so a successful load must
+  # report atNoManifest with the probed version populated.
+  test "CompatReport: probe succeeds, no manifest attached -> atNoManifest + runtimeVersion (item 2)":
+    probeMode = pmNormal
+    unloadTestlib()
+    discard loadTestlib()
+    let c = testlibCompat()
+    check c.attestation == atNoManifest
+    check c.runtimeVersion == "1.5"
+    check c.missing.len == 0
+    probeMode = pmNormal
+
+  # TDD suite item 3 — reusing pmUnparseable (already proven to fail
+  # parseVersion above): the compat report must show atProbeFailed with an
+  # empty runtimeVersion.
+  test "CompatReport: probe fails (unparseable) -> atProbeFailed, runtimeVersion empty (item 3)":
+    probeMode = pmUnparseable
+    unloadTestlib()
+    discard loadTestlib()
+    let c = testlibCompat()
+    check c.attestation == atProbeFailed
+    check c.runtimeVersion == ""
+    check c.missing.len == 0
+    probeMode = pmNormal
+
+  # TDD suite item 6: unloadTestlib() must reset fooCompat() to the zero
+  # report, and a subsequent reload must repopulate it — never serving a
+  # previous load's trust signals.
+  test "CompatReport: unloadTestlib resets to zero report; reload repopulates (item 6)":
+    probeMode = pmNormal
+    unloadTestlib()
+    discard loadTestlib()
+    check testlibCompat().attestation == atNoManifest
+    check testlibCompat().runtimeVersion == "1.5"
+    unloadTestlib()
+    let zero = testlibCompat()
+    check zero.attestation == atNoProbe
+    check zero.runtimeVersion == ""
+    check zero.missing.len == 0
+    discard loadTestlib()
+    let reloaded = testlibCompat()
+    check reloaded.attestation == atNoManifest
+    check reloaded.runtimeVersion == "1.5"
+
   # Compile-time validation tests
   test "compile-time: rejects proc without calling convention":
     check not compiles(block:
@@ -778,6 +823,17 @@ suite "softlink":
 # Missing library — for lrLibNotFound test
 dynlib "libdefinitely_not_real.so":
   proc testlib_notreal(): cint {.cdecl, header: "tests/testlib.h".}
+
+# RFC-0001 §9/§C.2, slice C2 — TDD suite item 5: a versionProbe DECLARED on
+# a library that never loads. Phase 1 fails before Phase 3/the probe ever
+# runs, so `fooCompat()` must report the zero state (atNoProbe) — not a
+# fabricated atProbeFailed — per the judgment call recorded in the C2
+# handoff (softlink.nim's loadX codegen: the Phase-1 early-return report
+# writes are always the zero-field form, regardless of hasProbe).
+dynlib "libdefinitely_not_real_c2.so":
+  proc testlib_notreal_c2(): cint {.cdecl, header: "tests/testlib.h".}
+  versionProbe:
+    "9.9.9"
 
 # dyntype — compile-time struct layout verification
 dyntype "tests/testlib_types.h":
@@ -874,6 +930,16 @@ suite "softlink — error paths":
   test "lrLibNotFound for missing library":
     check loadDefinitelyNotReal().kind == lrLibNotFound
 
+  # RFC-0001 §9/§C.2, slice C2 — TDD suite item 5: fooCompat() after a
+  # FAILED load, even with a versionProbe declared on the block, must
+  # report the zero state — the probe never got a chance to run.
+  test "CompatReport: zero report (atNoProbe) after a failed load, even with a probe declared":
+    check loadDefinitelyNotRealC2().kind == lrLibNotFound
+    let c = definitelyNotRealC2Compat()
+    check c.attestation == atNoProbe
+    check c.runtimeVersion == ""
+    check c.missing.len == 0
+
 when defined(linux):
   suite "softlink — angle-bracket includes":
     test "angle-bracket header syntax works":
@@ -919,6 +985,32 @@ suite "dynlib magic — bare logical name resolves and loads":
   test "dynlib \"magic\" resolves to libmagic.so and calls its symbol":
     check loadMagic().kind == lrOk
     check testlib_magic() == 42
+
+# RFC-0001 §9/§C.2, slice C2 — TDD suite item 1: a probe-less block's
+# fooCompat() must be the zero report (atNoProbe) across a full
+# load/unload cycle — no versionProbe was ever declared on "magic" above,
+# so there is nothing to attest to at any point.
+suite "CompatReport (RFC-0001 C2) — probe-less block stays atNoProbe":
+  test "fooCompat is zero report before load, after load, and after unload":
+    unloadMagic()
+    block:
+      let c = magicCompat()
+      check c.attestation == atNoProbe
+      check c.runtimeVersion == ""
+      check c.missing.len == 0
+    check loadMagic().kind == lrOk
+    block:
+      let c = magicCompat()
+      check c.attestation == atNoProbe
+      check c.runtimeVersion == ""
+      check c.missing.len == 0
+    unloadMagic()
+    block:
+      let c = magicCompat()
+      check c.attestation == atNoProbe
+      check c.runtimeVersion == ""
+      check c.missing.len == 0
+    discard loadMagic()
 
 
 # Runtime-only single-component soname: libvern.so.3 exists but NO bare

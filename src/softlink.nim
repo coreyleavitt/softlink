@@ -48,6 +48,46 @@ type
     of lrLibNotFound, lrOk:
       discard
 
+  Attestation* = enum
+    ## RFC-0001 §C.2, slice C2: `CompatReport.attestation` — five
+    ## diagnostically distinct "how much do we trust this runtime" states,
+    ## kept apart so a caller never has to infer "no information" from the
+    ## absence of some other field (`atUnattested` collapsing `atNoManifest`
+    ## and "probed but not in corpus" was the round-2 mistake the RFC
+    ## itself calls out).
+    atNoProbe      ## block declares no versionProbe, OR the probe never
+                   ## ran (the load failed in Phase 1, before Phase 3/the
+                   ## probe ever executed) — the zero value, by construction
+                   ## the default for a freshly zero-initialized `CompatReport`.
+    atProbeFailed  ## probe ran and raised, or returned an unparseable string
+    atNoManifest   ## probe ok, but no compatManifest attached to check against
+    atOutOfCorpus  ## probed version outside the manifest's harvested corpus
+    atAttested     ## probed version inside the manifest's harvested corpus
+
+  MissingReason* = enum
+    ## RFC-0001 §C.2: why one `CompatReport.missing` symbol didn't resolve.
+    ## The type is defined now (public surface); the partition that
+    ## populates `missing` is later slices — C3 (`mrExpected`/`mrAnomalous`)
+    ## and C4b/C4c (`mrDriftRefused`). Slice C2 itself never adds an entry.
+    mrExpected      ## manifest/since: this runtime predates the symbol
+    mrAnomalous     ## this version's headers declare it, yet it did not resolve
+    mrDriftRefused  ## resolved, but refused for known signature drift (§C.3)
+
+  CompatReport* = object
+    ## RFC-0001 §C.2: a query proc (`fooCompat*(): CompatReport`) generated
+    ## per `dynlib` block — deliberately NOT fields on `LoadResult` (dead
+    ## weight on every non-attestation-relevant failure kind). Written on
+    ## EVERY `loadX` return path (including the Phase-1 early returns, which
+    ## do not write the cached `LoadResult`); `unloadX` resets it to this
+    ## type's zero value (`atNoProbe`, `""`, `@[]`) alongside its other
+    ## pointer/cache resets — `fooCompat()` after `unloadFoo()` must never
+    ## serve a previous load's trust signals. `verifyProcs` generates no
+    ## `fooCompat` at all (no runtime footprint, consistent with its
+    ## `versionProbe` rejection).
+    runtimeVersion*: string   ## "" unless the probe succeeded
+    attestation*: Attestation
+    missing*: seq[tuple[symbol: string, reason: MissingReason]]
+
 # Exported because macro-generated wrapper procs call this by ident at the call site.
 proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
   raise SoftlinkError(
@@ -1653,13 +1693,20 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   let loadedProcName = ident(baseNameLower & "Loaded")
   let handleName = ident("softlinkHandle" & baseName)
   let cachedResultName = ident("softlinkResult" & baseName)
+  # RFC-0001 §9/§C.2, slice C2: the compat report's backing var — named
+  # alongside `softlinkHandle<Base>`/`softlinkResult<Base>` above, same
+  # convention. Unlike the probe state vars just below, this one is
+  # emitted UNCONDITIONALLY: `fooCompat()` is generated for every dynlib
+  # block (a probe-less block's query proc simply always returns this
+  # var's zero value, `atNoProbe`).
+  let compatReportName = ident("softlinkCompatReport" & baseName)
   let libPatternLit = newStrLitNode(resolvedPattern)
-  # RFC-0001 §9/§C.1, slice C1b: the probe's outcome state (read by Stage
-  # C2's future CompatReport, not yet wired) and the internal reentrancy
-  # flag — named alongside `softlinkHandle<Base>`/`softlinkResult<Base>`
-  # above, following the same convention. All three are emitted only when
-  # this block declares a (well-formed) `versionProbe` — see `hasProbe`
-  # below, computed after the body loop that finds out.
+  # RFC-0001 §9/§C.1, slice C1b: the probe's outcome state (read by C2's
+  # CompatReport construction below) and the internal reentrancy flag —
+  # named alongside `softlinkHandle<Base>`/`softlinkResult<Base>` above,
+  # following the same convention. All three are emitted only when this
+  # block declares a (well-formed) `versionProbe` — see `hasProbe` below,
+  # computed after the body loop that finds out.
   let probedVersionName = ident("softlinkProbedVersion" & baseName)
   let probeFailedName = ident("softlinkProbeFailed" & baseName)
   let loadInProgressName = ident("softlinkLoadInProgress" & baseName)
@@ -1685,6 +1732,25 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newNimNode(nnkExprColonExpr).add(ident("symbol"), newStrLitNode(""))
       )
     )
+
+  proc compatReportObjConstr(fields: seq[(string, NimNode)]): NimNode =
+    ## RFC-0001 §9/§C.2: build one `CompatReport(...)` object-constructor
+    ## node — a closure only in spirit (no captures), grouped here purely
+    ## so every report shape in `loadXxx`/`unloadXxx` below goes through one
+    ## place. `fields` omitted entirely means every field takes its
+    ## zero-value default (`""`, `atNoProbe`, `@[]`) — the report's zero
+    ## state.
+    result = newNimNode(nnkObjConstr).add(ident("CompatReport"))
+    for (fieldName, valNode) in fields:
+      result.add(newNimNode(nnkExprColonExpr).add(ident(fieldName), valNode))
+
+  proc assignCompatReportStmt(fields: seq[(string, NimNode)] = @[]): NimNode =
+    ## RFC-0001 §9/§C.2: `softlinkCompatReport<Base> = CompatReport(...)` —
+    ## a closure over `compatReportName`, the ONE assignment shape every
+    ## `loadXxx` return path below uses (Phase-1 early returns via the
+    ## zero-field form, the post-probe success path via the classified
+    ## form) — see the design guidance's "one AST-generating helper" call.
+    newAssignment(compatReportName, compatReportObjConstr(fields))
 
   result = newStmtList()
 
@@ -1728,6 +1794,19 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     newNimNode(nnkIdentDefs).add(
       cachedResultName,
       ident("LoadResult"),
+      newEmptyNode()
+    )
+  ))
+
+  # var compatReport: CompatReport — RFC-0001 §9/§C.2: zero-initializes to
+  # the zero state (atNoProbe, "", @[]), which is exactly right before the
+  # first load (mirrors `cachedResult` above). Emitted for EVERY dynlib
+  # block, unlike the probe state vars further below — `fooCompat()` is
+  # generated unconditionally (see its emission point near `xxxLoaded*`).
+  result.add(newNimNode(nnkVarSection).add(
+    newNimNode(nnkIdentDefs).add(
+      compatReportName,
+      ident("CompatReport"),
       newEmptyNode()
     )
   ))
@@ -2063,15 +2142,22 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # handle = loadLibPattern(pattern)
     loadBody.add(newAssignment(handleName, newCall(ident("loadLibPattern"), libPatternLit)))
 
-    # if handle.isNil: return LoadResult(kind: lrLibNotFound)
+    # if handle.isNil: write the zero-state compat report (RFC-0001 §9/
+    # §C.2 — this Phase-1 early return happens only before the first ever
+    # load, or right after unloadX already reset the probe state vars to
+    # their own zero values, so the zero-state report IS the correct value
+    # here, not merely a placeholder) + return LoadResult(kind: lrLibNotFound)
     loadBody.add(newIfStmt((
       newCall(ident("isNil"), handleName),
-      newStmtList(newNimNode(nnkReturnStmt).add(
-        newNimNode(nnkObjConstr).add(
-          ident("LoadResult"),
-          newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrLibNotFound"))
+      newStmtList(
+        assignCompatReportStmt(),
+        newNimNode(nnkReturnStmt).add(
+          newNimNode(nnkObjConstr).add(
+            ident("LoadResult"),
+            newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrLibNotFound"))
+          )
         )
-      ))
+      )
     )))
 
     # Collect temp sym names for deferred assignment
@@ -2101,10 +2187,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # let sym = handle.symAddr("name")
       loadBody.add(newLetStmt(tempSym, newCall(ident("symAddr"), handleName, symName)))
 
-      # if sym.isNil: unload + nil handle + return lrSymbolNotFound
+      # if sym.isNil: unload + nil handle + zero-state compat report
+      # (RFC-0001 §9/§C.2 — same "probe never ran" reasoning as the
+      # lrLibNotFound early return above) + return lrSymbolNotFound
       var cleanupBlock = newStmtList()
       cleanupBlock.add(newCall(ident("unloadLib"), handleName))
       cleanupBlock.add(newAssignment(handleName, newNilLit()))
+      cleanupBlock.add(assignCompatReportStmt())
       cleanupBlock.add(newNimNode(nnkReturnStmt).add(
         newNimNode(nnkObjConstr).add(
           ident("LoadResult"),
@@ -2218,6 +2307,61 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       )))
       loadBody.add(tryStmt)
 
+    # RFC-0001 §9/§C.2: the compat report on the success path — written
+    # AFTER the probe's try/finally above (so `probedVersionName`/
+    # `probeFailedName`, when they exist, are final) and BEFORE the cached
+    # LoadResult write below (the two are independent vars; only the
+    # relative order to the probe, and to the final `return`, matters).
+    # Which shape applies is a MACRO-EXPANSION-time fact (`hasProbe`,
+    # `appliedManifest.attached`); the one piece that must run at RUNTIME
+    # is reading `probeFailedName`/corpus membership, since only the probe
+    # call itself (just above) knows the outcome.
+    if not hasProbe:
+      # No versionProbe at all — atNoProbe, the zero state, unconditionally.
+      loadBody.add(assignCompatReportStmt())
+    elif not appliedManifest.attached:
+      # Probed, no manifest to check against: failed -> atProbeFailed;
+      # succeeded -> atNoManifest + the probed version.
+      var reportIf = newNimNode(nnkIfStmt)
+      reportIf.add(newNimNode(nnkElifBranch).add(
+        probeFailedName,
+        newStmtList(assignCompatReportStmt(@[("attestation", ident("atProbeFailed"))]))
+      ))
+      reportIf.add(newNimNode(nnkElse).add(newStmtList(
+        assignCompatReportStmt(@[
+          ("runtimeVersion", probedVersionName),
+          ("attestation", ident("atNoManifest"))])
+      )))
+      loadBody.add(reportIf)
+    else:
+      # Probed AND a manifest is attached: failed -> atProbeFailed;
+      # succeeded -> atAttested/atOutOfCorpus by EXACT STRING membership in
+      # the manifest's own harvested corpus (embedded here as a literal —
+      # the corpus is a discrete set of literally-harvested version tags,
+      # not a range, so `cmpVersion`-equality would risk attesting a
+      # version string that was never actually harvested; see the C2
+      # handoff for the full rationale).
+      let corpusLit = newLit(appliedManifest.manifest.corpus)
+      var corpusIf = newNimNode(nnkIfStmt)
+      corpusIf.add(newNimNode(nnkElifBranch).add(
+        newNimNode(nnkInfix).add(ident("in"), probedVersionName, corpusLit),
+        newStmtList(assignCompatReportStmt(@[
+          ("runtimeVersion", probedVersionName),
+          ("attestation", ident("atAttested"))]))
+      ))
+      corpusIf.add(newNimNode(nnkElse).add(newStmtList(
+        assignCompatReportStmt(@[
+          ("runtimeVersion", probedVersionName),
+          ("attestation", ident("atOutOfCorpus"))])
+      )))
+      var reportIf = newNimNode(nnkIfStmt)
+      reportIf.add(newNimNode(nnkElifBranch).add(
+        probeFailedName,
+        newStmtList(assignCompatReportStmt(@[("attestation", ident("atProbeFailed"))]))
+      ))
+      reportIf.add(newNimNode(nnkElse).add(newStmtList(corpusIf)))
+      loadBody.add(reportIf)
+
     # Cache and return result
     if hasOptional:
       # if missing.len > 0: cache lrOkPartial else: cache lrOk
@@ -2290,11 +2434,17 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newNimNode(nnkExprColonExpr).add(ident("kind"), ident("lrOk"))
       )
     ))
+    # RFC-0001 §9/§C.2: reset the compat report to its zero state alongside
+    # every other piece of per-load state above — `fooCompat()` called
+    # after `unloadFoo()` must never serve a previous load's trust signals.
+    # Unconditional, like the report var's own declaration (every dynlib
+    # block gets a report, not just probe-declaring ones).
+    ifBody.add(assignCompatReportStmt())
     if hasProbe:
       # RFC-0001 §9/§C.1: reset the probe's outcome alongside every other
-      # piece of per-load state above — a future `fooCompat()` (Stage C2,
-      # not yet wired) called after `unloadFoo()` must never serve a
-      # previous load's probe result.
+      # piece of per-load state above — `fooCompat()` (RFC-0001 §C.2)
+      # called after `unloadFoo()` must never serve a previous load's
+      # probe result.
       ifBody.add(newAssignment(probedVersionName, newStrLitNode("")))
       ifBody.add(newAssignment(probeFailedName, newLit(false)))
     unloadBody.add(newIfStmt((
@@ -2312,6 +2462,17 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     name = postfix(loadedProcName, "*"),
     params = [ident("bool")],
     body = newStmtList(prefix(newCall(ident("isNil"), handleName), "not")),
+  ))
+
+  # xxxCompat*(): CompatReport — RFC-0001 §9/§C.2, slice C2: generated for
+  # EVERY dynlib block, unconditionally (a probe-less block's query proc
+  # simply always returns the report var's zero value, `atNoProbe`).
+  # `verifyProcs` has no counterpart — see `CompatReport`'s own doc comment.
+  let compatProcName = ident(baseNameLower & "Compat")
+  result.add(newProc(
+    name = postfix(compatProcName, "*"),
+    params = [ident("CompatReport")],
+    body = newStmtList(compatReportName),
   ))
 
 proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: CompatManifestDirective] =

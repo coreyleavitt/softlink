@@ -4,6 +4,10 @@ tests/test_nimport
 tests/tharvest
 tests/tharvest_cli
 tests/tharvest_msvc_calibration_refusal
+# RFC-0001 §9/§C.2, slice C2: tests/tcompat_report_manifest.nim's own
+# runtime binary (built by `runCompatReportManifestChecks` in the nimble
+# test task).
+tests/tcompat_report_manifest
 # RFC-0001 slice B5: tests/tharvest.nim's drift-alarm exit-code integration
 # test compiles+runs the harvester CLI shim itself (`nim c -r
 # tools/harvest/harvester.nim ...`), which builds this binary in place.
