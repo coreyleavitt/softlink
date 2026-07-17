@@ -24,6 +24,8 @@
 import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times,
             sequtils, monotimes]
 import softlink/versions
+when defined(posix):
+  import std/posix
 
 export FactKind, abiTag
 
@@ -418,6 +420,49 @@ type
 
   ReaderArgs = tuple[process: Process, maxOutputBytes: int, chan: ptr Channel[ReaderMsg]]
 
+proc killProcessTree(p: Process) {.gcsafe.} =
+  ## Kills not just `p` but its whole descendant tree, so that if `p` (the
+  ## direct child, `nim c`) has itself forked a real C compiler (gcc ->
+  ## cc1/as/ld), those grandchildren die too. This matters because they
+  ## inherit the merged stdout pipe's write-end: killing only `p` leaves the
+  ## pipe open as long as any grandchild survives, so `readOutputThread`'s
+  ## blocked `readData` never sees EOF, never sends its terminal message,
+  ## and `joinThread` in `runProcess` hangs forever waiting for a thread
+  ## that cannot be force-detached.
+  ##
+  ## POSIX (the path this repo's Docker test suite actually exercises):
+  ## `runProcess` starts `p` with `poDaemon`, which — via Nim's
+  ## `posix_spawn` backend (`posix_spawnattr_setpgroup(attr, 0)` +
+  ## `POSIX_SPAWN_SETPGROUP`) — makes `p` the leader of its OWN new process
+  ## group, i.e. PGID == PID. Every descendant `p` forks inherits that same
+  ## PGID (a fork never changes process group on its own). `killpg` sends
+  ## the signal to every process in that group at once, so this reaches the
+  ## grandchildren directly instead of relying on the immediate child to
+  ## propagate anything. A plain single-PID `kill(p)` cannot do this: POSIX
+  ## `kill(pid, sig)` targets exactly one process.
+  ##
+  ## Windows: `poDaemon` there only means "no console window" (no process-
+  ## group equivalent in osproc), so there is no cheap in-stdlib group kill.
+  ## `taskkill /F /T` is the best-effort tree-kill parity path — not
+  ## exercised by CI, which runs Linux-only Docker.
+  when defined(posix):
+    try:
+      if running(p):
+        discard killpg(Pid(processID(p)), SIGKILL)
+    except OSError:
+      discard
+  else:
+    try:
+      discard execCmd("taskkill /F /T /PID " & $processID(p))
+    except OSError:
+      discard
+  # Belt-and-suspenders: also signal the immediate child directly, in case
+  # the group/tree kill above silently no-ops (e.g. `p` already reaped).
+  try:
+    if running(p): kill(p)
+  except OSError:
+    discard
+
 proc readOutputThread(args: ReaderArgs) {.thread.} =
   ## Code-review finding F6: runs on its own `Thread` so `runProcess`'s main
   ## loop can enforce a wall-clock deadline independently of how long any
@@ -442,10 +487,7 @@ proc readOutputThread(args: ReaderArgs) {.thread.} =
     total += n
     args.chan[].send(ReaderMsg(kind: rmkChunk, data: buf[0 ..< n]))
     if total > args.maxOutputBytes:
-      try:
-        if running(args.process): kill(args.process)
-      except OSError:
-        discard
+      killProcessTree(args.process)
       args.chan[].send(ReaderMsg(kind: rmkExceeded))
       return
   args.chan[].send(ReaderMsg(kind: rmkDone))
@@ -473,7 +515,15 @@ proc runProcess*(exe: string, args: seq[string], timeoutMs, maxOutputBytes: int)
   ## (`*`) so its bounded-time/bounded-output CONTRACT can be tested
   ## directly (`tests/tharvest.nim`) against real subprocesses (`sleep`,
   ## `yes`), not only observed indirectly through a full `harvest()` run.
-  var p = startProcess(exe, args = args, options = {poStdErrToStdOut, poUsePath})
+  # `poDaemon` is added here purely for its POSIX side effect (making `p`
+  # the leader of its own new process group, PGID == PID — see
+  # `killProcessTree`'s doc comment) — NOT for its literal "daemonize"
+  # meaning. It does not set `poParentStreams`, so it does not redirect or
+  # detach the merged stdout pipe this proc still reads via
+  # `readOutputThread`; the "normal command still returns its real output"
+  # test below pins that the success path is unaffected.
+  var p = startProcess(exe, args = args,
+                        options = {poStdErrToStdOut, poUsePath, poDaemon})
   var chan: Channel[ReaderMsg]
   chan.open()
   var thr: Thread[ReaderArgs]
@@ -496,14 +546,18 @@ proc runProcess*(exe: string, args: seq[string], timeoutMs, maxOutputBytes: int)
     else:
       if not timedOut and getMonoTime() >= deadline:
         timedOut = true
-        try:
-          if running(p): kill(p)
-        except OSError:
-          discard
-        # Fall through and keep polling: killing the process closes its
-        # stdout pipe, so `readOutputThread`'s blocked read returns EOF
-        # promptly and it sends `rmkDone` — the loop above still exits via
-        # the normal `finished = true` path, just with `timedOut` recorded.
+        killProcessTree(p)
+        # Fall through and keep polling: `killProcessTree` kills `p`'s
+        # entire process group (see its doc comment above), not just `p`
+        # itself, so the merged stdout pipe's write-end genuinely closes
+        # even if `p` had forked a real compiler (grandchildren inherit
+        # that pipe). That's what lets `readOutputThread`'s blocked read
+        # return EOF promptly and send `rmkDone` — the loop above still
+        # exits via the normal `finished = true` path, just with
+        # `timedOut` recorded. A plain single-PID `kill(p)` would NOT be
+        # enough here: it only signals the immediate child, leaving any
+        # grandchild that still holds the pipe open free to keep it open
+        # indefinitely — which is exactly the hang this fix closes.
       sleep(5)
 
   joinThread(thr)

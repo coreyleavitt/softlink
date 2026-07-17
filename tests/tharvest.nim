@@ -686,3 +686,35 @@ suite "runProcess — bounded time and output (code-review finding F6)":
     let (output, exitCode) = runProcess("echo", @["hello"], 5_000, 16_777_216)
     check "hello" in output
     check exitCode == 0
+
+  when defined(posix):
+    test "a grandchild holding stdout open after the direct child dies " &
+         "still returns promptly on timeout (R2-2 group-kill regression)":
+      ## Reproduces the confirmed hang: `sh -c "sleep 30 & wait"` backgrounds
+      ## `sleep 30` (detached from `sh`'s own job control via `&`) and then
+      ## `wait`s on it — so `sh` itself lives exactly as long as `sleep`
+      ## does and is NOT the process actually holding the pipe open past any
+      ## direct-child kill. Killing only the immediate child (old
+      ## behavior: plain `kill(p)`, PID-only, no process group) leaves
+      ## `sleep 30` — a grandchild reparented once `sh` is reaped — still
+      ## holding the merged stdout pipe's write-end open, so
+      ## `readOutputThread`'s blocked `readData` never sees EOF and
+      ## `runProcess` never returns within the 30s the child would
+      ## otherwise run. The fix (`killProcessTree`: `killpg` on the
+      ## `poDaemon`-created process group) must reach `sleep 30` too, so
+      ## this must return well before 30s elapse.
+      let t0 = epochTime()
+      var raised = false
+      var msg = ""
+      try:
+        discard runProcess("sh", @["-c", "sleep 30 & wait"], 1_500, 1_000_000)
+      except HarvestError as e:
+        raised = true
+        msg = e.msg
+      let elapsed = epochTime() - t0
+      check raised
+      check "did not finish within" in msg
+      # Must return in well under the grandchild's 30s lifetime — proves
+      # `runProcess` returned because it killed the tree, not because the
+      # orphaned `sleep 30` eventually exited on its own.
+      check elapsed < 10.0
