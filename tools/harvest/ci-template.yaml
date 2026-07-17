@@ -53,6 +53,20 @@ on:
 jobs:
   harvest:
     runs-on: ubuntu-latest
+    # Toolchain: run the whole job INSIDE the project's maintained Nim image
+    # rather than installing Nim per-run. This (a) supplies Nim + nimble +
+    # gcc already, so there is no `curl | bash` choosenim install to hand
+    # every downstream binding repo's CI to whatever nim-lang.org serves at
+    # run time (the supply-chain concern), and (b) pins the EXACT toolchain
+    # the project tests against, which must be Nim >= 2.2.8: the harvester's
+    # bounded-subprocess `runProcess` hits a Nim 2.2.0 ORC cyclic-collector
+    # crash (SIGSEGV in its Channel/Thread cleanup), fixed in 2.2.8+. The
+    # image below is Nim 2.2.10.
+    # TODO(binding): `:latest` is a MUTABLE tag — for fully reproducible CI,
+    # pin by digest instead (`ghcr.io/coreyleavitt/nim@sha256:...`, resolve
+    # via `docker buildx imagetools inspect ghcr.io/coreyleavitt/nim:latest`)
+    # and bump it as a deliberate, reviewable diff.
+    container: ghcr.io/coreyleavitt/nim:latest
     # Generous cap so a hung/slow-network corpus fetch or compile fails the
     # job instead of running (and billing) forever; raise if a real binding's
     # corpus fetch legitimately needs longer. TODO(binding): adjust to taste.
@@ -60,26 +74,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Nim install: pinned action, not `curl | bash`. This template is
-      # copied verbatim into every downstream binding repo, so an
-      # unpinned `curl https://nim-lang.org/choosenim/init.sh -sSf | bash`
-      # here would hand every one of those repos' CI runners to whatever
-      # nim-lang.org serves at run time, with no checksum or signature to
-      # catch a compromised install script. `jiro4989/setup-nim-action` is
-      # pinned to a full 40-char commit SHA (not a mutable tag like `@v2`)
-      # so the action's own code can't change under this workflow without
-      # a deliberate edit here, and `nim-version` pins the toolchain
-      # itself (matching the 2.2.0 pin this repo's own
-      # .github/workflows/ci.yaml uses for its Windows leg) instead of
-      # floating on choosenim's "latest stable". Bumping either pin is a
-      # deliberate, reviewable diff -- that's the point of pinning.
-      # TODO(binding): bump the SHA/version together, deliberately, when
-      # you want a newer setup-nim-action release or Nim release; verify
-      # the new SHA via `gh api repos/jiro4989/setup-nim-action/tags`.
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@cb1fc1270b117457dd0d9f610ec981fad3369cec # v2.3.0
-        with:
-          nim-version: '2.2.0'
+      # No Nim-install step: the `container:` above already provides Nim,
+      # nimble, and gcc. (This replaces the earlier pinned-setup-nim-action
+      # install — a maintained, version-fixed image is a stronger toolchain
+      # pin than a version string, and still avoids any unpinned remote
+      # install script.)
 
       # TODO(binding): pin real version constraints once softlink_harvest
       # is published; `nimble install` resolves `requires "softlink"`

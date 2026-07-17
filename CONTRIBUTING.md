@@ -2,10 +2,17 @@
 
 ## Development setup
 
-softlink requires **Nim >= 2.0.0**. Tests run in Docker for reproducibility:
+The `softlink` library itself requires **Nim >= 2.0.0**. The dev/test
+toolchain — and the `softlink_harvest` tool in particular — uses the
+project's maintained image `ghcr.io/coreyleavitt/nim:latest` (Nim 2.2.10).
+Do NOT use vanilla `nimlang/nim:2.2.0`: the harvester's bounded-subprocess
+machinery hits a Nim 2.2.0 ORC cyclic-collector crash (`runProcess` SIGSEGVs
+during its `Channel`/`Thread` cleanup); it is fixed in Nim 2.2.8+, which the
+project image provides. Tests run in Docker for reproducibility:
 
 ```bash
-docker run --rm -v $(pwd):/app -w /app nimlang/nim:2.2.0 \
+docker pull ghcr.io/coreyleavitt/nim:latest
+docker run --rm -v $(pwd):/app -w /app ghcr.io/coreyleavitt/nim:latest \
   bash -c "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c && \
   LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I. tests/test_softlink.nim"
 ```
