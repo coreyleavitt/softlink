@@ -134,8 +134,15 @@ jobs:
     name: Test
     needs: prepare-version
     runs-on: ubuntu-latest
+    # Nim >= 2.2.8 required: this job runs `nimble test`, whose non-Windows
+    # branch exercises the harvester subprocess suite (tests/tharvest.nim).
+    # That suite SIGSEGVs on vanilla Nim 2.2.0 (an ORC cyclic-collector crash
+    # in runProcess's Channel/Thread cleanup, fixed in 2.2.8+) — pinning
+    # nimlang/nim:2.2.0 here would crash the release gate. Use the project's
+    # maintained image, pinned by IMMUTABLE version tag (== :latest at time of
+    # writing) so a release is gated on a known, reproducible toolchain.
     container:
-      image: nimlang/nim:2.2.0
+      image: ghcr.io/coreyleavitt/nim:2.2.10
     steps:
       - uses: actions/checkout@v4
         with:

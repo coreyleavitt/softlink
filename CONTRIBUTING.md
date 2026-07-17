@@ -17,7 +17,9 @@ docker run --rm -v $(pwd):/app -w /app ghcr.io/coreyleavitt/nim:latest \
   LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I. tests/test_softlink.nim"
 ```
 
-Or use `nimble test` if you have the test library built locally.
+Or use `nimble test` if you have the test library built locally — the same
+Nim >= 2.2.8 requirement applies, since `nimble test` runs the crash-prone
+`tests/tharvest.nim` harvester suite.
 
 ## Architecture
 

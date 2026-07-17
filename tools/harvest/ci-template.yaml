@@ -62,11 +62,15 @@ jobs:
     # bounded-subprocess `runProcess` hits a Nim 2.2.0 ORC cyclic-collector
     # crash (SIGSEGV in its Channel/Thread cleanup), fixed in 2.2.8+. The
     # image below is Nim 2.2.10.
-    # TODO(binding): `:latest` is a MUTABLE tag — for fully reproducible CI,
-    # pin by digest instead (`ghcr.io/coreyleavitt/nim@sha256:...`, resolve
-    # via `docker buildx imagetools inspect ghcr.io/coreyleavitt/nim:latest`)
-    # and bump it as a deliberate, reviewable diff.
-    container: ghcr.io/coreyleavitt/nim:latest
+    # This template ships an IMMUTABLE version tag rather than `:latest`: a
+    # copy-paste of this file lands reproducible CI even for a binding author
+    # who never reads the TODO below, instead of silently tracking whatever
+    # `:latest` points at on each unattended scheduled run.
+    # TODO(binding): for MAXIMUM immutability pin by digest instead
+    # (`ghcr.io/coreyleavitt/nim@sha256:...`, resolve via
+    # `docker buildx imagetools inspect ghcr.io/coreyleavitt/nim:2.2.10`) and
+    # bump it as a deliberate, reviewable diff.
+    container: ghcr.io/coreyleavitt/nim:2.2.10
     # Generous cap so a hung/slow-network corpus fetch or compile fails the
     # job instead of running (and billing) forever; raise if a real binding's
     # corpus fetch legitimately needs longer. TODO(binding): adjust to taste.
