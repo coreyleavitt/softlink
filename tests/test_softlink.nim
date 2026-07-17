@@ -7,6 +7,14 @@ import std/[unittest, math, strutils, sequtils]
 import softlink {.all.}
 import softlink/versions
 import softlink/manifest
+# code-review finding #13: the prototype tokenizer/analyzer this suite unit-
+# tests directly (`tokenizePrototype`/`analyzePrototype`/
+# `nonBuiltinIdentifiers` below) moved from `softlink.nim` itself into the
+# internal `softlink/prototype` submodule — `import softlink {.all.}` above
+# only bypasses visibility for symbols declared IN softlink.nim, not for an
+# unexported symbol one of its submodules declares, so this second `{.all.}`
+# import is needed to keep reaching them. Path-only change, no test logic.
+import softlink/prototype {.all.}
 
 suite "deriveLibPattern — logical name → per-OS candidates":
   test "Linux → bare .so first, then descending single-component majors":
