@@ -1243,7 +1243,9 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
     check m.lib == "corpuslib"
     check m.abi == "linux-lp64"
     check m.corpus == @["1.0.0", "2.0.0", "3.0.0"]
-    check m.symbols.len == 3
+    # Finding #19.7 added a 4th probed symbol (corpuslib_crosscheck,
+    # header+prototype cross-check mode) to tests/corpus/expected.compat.json.
+    check m.symbols.len == 4
     check schemaSupported(m)
     check libIdentityOk(m, "corpuslib")
     check not libIdentityOk(m, "otherlib")
@@ -1392,8 +1394,13 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
   test "formatInterval: both bounds -> \">=lo, <hi\"":
     check formatInterval(VersionInterval(lo: "2.0.0", hi: "3.0.0")) == ">=2.0.0, <3.0.0"
 
-  test "formatInterval: unbounded both ways -> non-empty fallback text":
-    check formatInterval(VersionInterval(lo: "", hi: "")).len > 0
+  # Finding #19.8 (code-review coverage gap): this used to assert only
+  # `.len > 0` — a tautology any non-empty fallback text satisfies, pinning
+  # nothing about what that text actually says. Pinned to the exact
+  # fallback string `formatInterval` returns (its own `else: "any version"`
+  # branch — see src/softlink/manifest.nim).
+  test "formatInterval: unbounded both ways -> exact fallback text \"any version\"":
+    check formatInterval(VersionInterval(lo: "", hi: "")) == "any version"
 
 # Code-review findings (2026-07 round 1, RFC-0001 §B.3/§B.5 hardening;
 # IDs F1/F2/F7/F8/F16 refer to that review's ledger). Every test below

@@ -20,6 +20,10 @@
  *
  *   corpuslib_stable  -- unchanged byte-for-byte from 1.0.0: `verified`
  *                        at both versions.
+ *
+ *   corpuslib_crosscheck -- unchanged byte-for-byte from 1.0.0, same
+ *                        story as corpuslib_stable (code-review
+ *                        Finding #19.7 — see 1.0.0/testlib.h).
  */
 
 #ifdef __cplusplus
@@ -31,6 +35,8 @@ int corpuslib_stable(int a, int b);
 double corpuslib_changed(int a);
 
 int corpuslib_added(int x);
+
+int corpuslib_crosscheck(int a, int b);
 
 #ifdef __cplusplus
 }

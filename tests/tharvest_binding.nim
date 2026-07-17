@@ -12,7 +12,7 @@
 ## prepended `-I`/`/I` actually SHADOW anything else on the include path
 ## (see tests/corpus/README.md).
 ##
-## Four procs, one per corpus fixture symbol plus one proving the
+## Five procs, one per corpus fixture symbol plus one proving the
 ## `{.prototype.}`-only skip path (RFC-0001 SS4 B.2: corpus-invariant,
 ## never probed):
 ##   - `corpuslib_stable`    pinned to its TRUE, unchanging signature.
@@ -23,6 +23,14 @@
 ##     never declares it at all.
 ##   - `corpuslib_protoonly` prototype-only (no `header`): the harvester
 ##     must skip it, never probe it against any corpus version.
+##   - `corpuslib_crosscheck` code-review Finding #19.7: bound with BOTH
+##     `header` AND `prototype` together (softlink's cross-check mode,
+##     RFC-0001 SS3 A.1/A4) — no prior harvester fixture exercised this
+##     combination. Its signature is TRUE and unchanging (same story as
+##     `corpuslib_stable`; see tests/corpus/README.md), so this pins that
+##     the harvester probes it exactly like a header-only symbol
+##     (`verified` at 1.0.0/2.0.0, `unknown` at 3.0.0) — never skipped as
+##     "corpus-invariant" the way a `{.prototype.}`-only proc is.
 ##
 ## NOT compiled by the regular `nimble test` suite — this is B3's own
 ## integration fixture, driven by tests/tharvest.nim via a
@@ -35,3 +43,6 @@ dynlib "libcorpuslib.so":
   proc corpuslib_added(x: cint): cint {.cdecl, header: "testlib.h".}
   proc corpuslib_protoonly(): cint
     {.cdecl, prototype: "int corpuslib_protoonly(void)".}
+  proc corpuslib_crosscheck(a: cint, b: cint): cint
+    {.cdecl, header: "testlib.h",
+      prototype: "int corpuslib_crosscheck(int a, int b)".}

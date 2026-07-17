@@ -31,6 +31,8 @@ double corpuslib_changed(int a, int b);
 
 int corpuslib_added(int x);
 
+int corpuslib_crosscheck(int a, int b);
+
 #ifdef __cplusplus
 }
 #endif

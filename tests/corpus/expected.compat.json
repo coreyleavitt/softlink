@@ -32,6 +32,12 @@
         "absent": [{ "hi": "2.0.0" }],
         "unknown": [{ "lo": "3.0.0" }]
       }
+    },
+    "corpuslib_crosscheck": {
+      "header": {
+        "verified": [{ "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
     }
   }
 }

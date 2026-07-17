@@ -183,50 +183,64 @@ suite "harvest fastPath — identical facts to the standard path (RFC-0001 SS4 B
     check rFast.skipped == r.skipped
 
   test "compile-count arithmetic on this fixture corpus (honest, derived, not assumed)":
-    ## This fixture corpus has only 3 probed symbols across 3 versions — far
-    ## below the scale where O(k·log n) bisection wins over "up to 3
+    ## This fixture corpus has 4 probed symbols across 3 versions (code-
+    ## review Finding #19.7 added `corpuslib_crosscheck` — same true,
+    ## unchanging signature/story as `corpuslib_stable`, bound via BOTH
+    ## `header` and `prototype` together — alongside the original 3) — far
+    ## below the scale where O(k·log n) bisection wins over "up to 2
     ## compiles per symbol per version" (the standard path's own cost
-    ## shape). Worked by hand BEFORE this assertion was written (see the
-    ## slice's own handoff notes) and then confirmed against a real run:
+    ## shape). Worked by hand and then confirmed against a real run.
+    ## `probeTargets`' order (dump.procs order, `corpuslib_protoonly`
+    ## excluded as corpus-invariant) is
+    ## [stable, changed, added, crosscheck]; `bisectPlan` splits a group of
+    ## n into a left half of `n div 2` and a right half of the remainder.
     ##
     ## STANDARD path, per version (baseline + up to 2 compiles/symbol):
     ##   1.0.0: baseline(1) + stable verified(2) + changed verified(2) +
-    ##          added ABSENT(1, existence only) = 6
+    ##          added ABSENT(1, existence only) + crosscheck verified(2) = 8
     ##   2.0.0: baseline(1) + stable verified(2) + changed MISMATCH(2) +
-    ##          added verified(2) = 7
+    ##          added verified(2) + crosscheck verified(2) = 9
     ##   3.0.0: baseline FAILS(1); every symbol unknown, 0 extra = 1
-    ##   TOTAL = 6 + 7 + 1 = 14
+    ##   TOTAL = 8 + 9 + 1 = 18
     ##
     ## FAST path, per version (define-free compile first; corpuslib_added
-    ## is the one 1.0.0 drift, corpuslib_changed the one 2.0.0 drift):
+    ## is the one 1.0.0 drift, corpuslib_changed the one 2.0.0 drift;
+    ## corpuslib_crosscheck never drifts, same as corpuslib_stable):
     ##   1.0.0: define-free FAILS(1) [added is absent] -> baseline ok(1) ->
-    ##          bisect{stable,changed,added}: root FAILS(1), left{stable}
-    ##          PASSES(1), right{changed,added} FAILS(1), left{changed}
-    ##          PASSES(1), right{added} FAILS(1) = 5 group compiles ->
-    ##          singleton "added" -> standard existence-only(1, absent) =
-    ##          1 + 1 + 5 + 1 = 8
+    ##          bisect{stable,changed,added,crosscheck} (root splits into
+    ##          left{stable,changed}, right{added,crosscheck}):
+    ##          root FAILS(1) [added absent poisons the whole group],
+    ##          left{stable,changed} PASSES together(1) [both verified,
+    ##          no further split needed], right{added,crosscheck}
+    ##          FAILS(1) [added absent], splits into left{added} FAILS(1)
+    ##          [singleton], right{crosscheck} PASSES(1) [singleton] =
+    ##          5 group compiles -> singleton "added" -> standard
+    ##          existence-only(1, absent) = 1 + 1 + 5 + 1 = 8
     ##   2.0.0: define-free FAILS(1) [changed mismatches] -> baseline ok(1)
-    ##          -> bisect: root FAILS(1), left{stable} PASSES(1),
-    ##          right{changed,added} FAILS(1), left{changed} FAILS(1)
-    ##          [singleton], right{added} PASSES(1) = 5 group compiles ->
-    ##          singleton "changed" -> standard existence+verify(2,
-    ##          mismatch) = 1 + 1 + 5 + 2 = 9
+    ##          -> bisect{stable,changed,added,crosscheck}: root FAILS(1)
+    ##          [changed mismatches poisons the whole group],
+    ##          left{stable,changed} FAILS(1) [changed mismatches], splits
+    ##          into left{stable} PASSES(1) [singleton], right{changed}
+    ##          FAILS(1) [singleton], right{added,crosscheck} PASSES
+    ##          together(1) [both verified, no further split needed] =
+    ##          5 group compiles -> singleton "changed" -> standard
+    ##          existence+verify(2, mismatch) = 1 + 1 + 5 + 2 = 9
     ##   3.0.0: define-free FAILS(1) [broken #include] -> baseline ALSO
     ##          FAILS(1); every symbol unknown, no bisection = 1 + 1 = 2
     ##   TOTAL = 8 + 9 + 2 = 19
     ##
-    ## So on THIS fixture the fast path costs MORE real compiles (19 > 14)
-    ## — expected and fine: a 3-symbol corpus is dominated by the fast
+    ## So on THIS fixture the fast path costs MORE real compiles (19 > 18)
+    ## — expected and fine: a 4-symbol corpus is dominated by the fast
     ## path's own overhead (a define-free compile plus a baseline probe
     ## PLUS the bisection tree, paid IN ADDITION TO the standard pipeline
     ## for every symbol that doesn't settle at the whole-module level,
     ## which on this corpus is every symbol at every non-broken version).
     ## The O(k·log n) win the RFC describes shows up at real-corpus scale
-    ## (hundreds of symbols, few drifted) — not on a 3-symbol fixture where
+    ## (hundreds of symbols, few drifted) — not on a 4-symbol fixture where
     ## k/n is large and log n is tiny. This assertion pins the CONCRETE,
     ## derived-then-confirmed counts rather than a directional "fewer"
     ## claim that would be false for this corpus.
-    check r.compileCount == 14
+    check r.compileCount == 18
     check rFast.compileCount == 19
 
 suite "runCalibration — preflight (RFC-0001 SS4 B.2)":
@@ -283,6 +297,21 @@ suite "compressFacts — interval compression (RFC-0001 SS4 B.3, slice B4)":
     # The shared boundaries, spelled out:
     check compressed[fkVerified][0].hi == compressed[fkMismatch][0].lo
     check compressed[fkMismatch][0].hi == compressed[fkUnknown][0].lo
+
+  # Finding #19.6 (code-review coverage gap): `compressFacts`' own
+  # `if versions.len == 0: return` early-out (an empty corpus — no version
+  # directories at all) had no test at all; every existing case above has
+  # at least one version. A truly empty corpus should compress to the
+  # ZERO value: all four FactKind interval seqs empty, no runs, no
+  # `perVersion` lookups ever attempted (an empty `Table` here would
+  # `KeyError` on any lookup, so this also proves the function returns
+  # before indexing `perVersion` at all).
+  test "empty corpus (no versions at all) -> every FactKind interval seq is empty":
+    let compressed = compressFacts(@[], initTable[string, FactKind]())
+    check compressed[fkVerified].len == 0
+    check compressed[fkAbsent].len == 0
+    check compressed[fkMismatch].len == 0
+    check compressed[fkUnknown].len == 0
 
 suite "buildManifest — pure manifest JSON (RFC-0001 SS4 B.3, slice B4)":
   ## Small synthetic `HarvestResult`s — no real compiles — to pin the
@@ -437,6 +466,20 @@ suite "harvest — full classification matrix against the B3a fixture corpus":
     check r.facts["corpuslib_added"]["2.0.0"] == fkVerified
     check r.facts["corpuslib_added"]["3.0.0"] == fkUnknown
 
+  # Finding #19.7 (code-review coverage gap): `corpuslib_crosscheck` is
+  # bound with BOTH `header` AND `prototype` together (softlink's
+  # cross-check mode) — no prior harvester fixture combined the two. Same
+  # true, unchanging signature/classification story as `corpuslib_stable`
+  # above; the point of this test is that it gets PROBED at all (`else:
+  # probeTargets.add(p)` in `harvest`'s skip-classification loop only
+  # skips a symbol as "prototype-only, corpus-invariant" when `header` is
+  # ABSENT — a symbol carrying both never takes that branch).
+  test "corpuslib_crosscheck (header + prototype together): verified at 1.0.0 and 2.0.0, unknown at 3.0.0":
+    check "corpuslib_crosscheck" in r.probedSymbols
+    check r.facts["corpuslib_crosscheck"]["1.0.0"] == fkVerified
+    check r.facts["corpuslib_crosscheck"]["2.0.0"] == fkVerified
+    check r.facts["corpuslib_crosscheck"]["3.0.0"] == fkUnknown
+
   test "corpuslib_protoonly is skipped, never probed":
     check r.skipped.len == 1
     check r.skipped[0].cname == "corpuslib_protoonly"
@@ -447,6 +490,7 @@ suite "harvest — full classification matrix against the B3a fixture corpus":
     check "corpuslib_stable" in r.report
     check "corpuslib_changed" in r.report
     check "corpuslib_added" in r.report
+    check "corpuslib_crosscheck" in r.report
     check "SKIPPED corpuslib_protoonly" in r.report
 
   test "compat manifest matches the golden fixture (RFC-0001 SS4 B.3, slice B4)":
@@ -517,6 +561,51 @@ suite "softlink_harvest CLI — packaged entry, drift alarm exit code (RFC-0001 
     let (output, exitCode) = execCmdEx(cliCmd)
     check exitCode == exitDriftAlarm
     check f3Sentence in output
+
+  # Finding #19.5 (code-review coverage gap): `harvest_cli.exitCalibrationRefused`'s
+  # own doc comment states the contract in so many words — "NO manifest
+  # written" — but until now nothing asserted that FILESYSTEM fact; every
+  # existing calibration-refusal test (this suite's sibling
+  # tests/tharvest_msvc_calibration_refusal.nim, and `runCalibration`'s own
+  # unit tests) only checks the returned/raised diagnosis, never that a
+  # manifest file failed to appear on disk. This is the portable (no real
+  # MSVC needed) version: `--extra-flag:--cc:<bogus>` makes the calibration
+  # preflight's own BASELINE compile fail immediately (Nim rejects an
+  # unrecognized `--cc` value before touching any header), which is a
+  # different sub-diagnosis than the MSVC no-op-tier scenario but exercises
+  # the IDENTICAL "calibration refused -> harvest() raises before
+  # `softlink_harvest.run()` ever reaches its `writeManifest` call" path —
+  # the one this finding is actually about. A fresh, never-before-used
+  # `--out:` path (rather than the default next to `dumpFile`, which the
+  # test directly above THIS one legitimately writes to) keeps this
+  # assertion unambiguous: nothing else in this suite could have created
+  # this exact file.
+  #
+  # Deliberately builds the CLI binary with a plain `nim c -o:<path>` and
+  # then runs THAT binary directly, rather than `nim c -r` (the pattern the
+  # drift-alarm test directly above uses) — empirically, `nim c -r`
+  # collapses ANY nonzero child exit code to its own generic wrapper exit
+  # code 1 ("Error: execution of an external program failed"), so it can't
+  # actually distinguish `exitCalibrationRefused` (2) from any other
+  # failure. Running the compiled binary directly yields the real exit
+  # code.
+  test "calibration refusal (broken --cc toolchain) -> exitCalibrationRefused, and NO manifest file is written":
+    let cliModule = "tools" / "harvest" / "softlink_harvest.nim"
+    let cliBin = dumpDir / "softlink_harvest_finding19_5"
+    let (buildOutput, buildCode) = execCmdEx(
+      "nim c --path:src -o:" & cliBin & " " & cliModule)
+    doAssert buildCode == 0,
+      "softlink: Finding #19.5: failed to build the softlink_harvest CLI " &
+      "binary:\n" & buildOutput
+
+    let refusalOutPath = dumpDir / "finding19_5_should_not_exist.compat.json"
+    if fileExists(refusalOutPath): removeFile(refusalOutPath)
+    let runCmd = cliBin & " " & dumpFile & " " & ("tests" / "corpus") &
+      " --nim-path:src --out:" & refusalOutPath &
+      " --extra-flag:--cc:softlinkDoesNotExistBogusCompiler"
+    let (output, exitCode) = execCmdEx(runCmd)
+    check exitCode == exitCalibrationRefused
+    check not fileExists(refusalOutPath)
 
 removeDir(dumpDir)
 

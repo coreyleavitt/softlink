@@ -43,6 +43,16 @@
  * 3.0.0's testlib.h is the fourth classification's fixture: it fails to
  * compile at all (a broken #include near the top), so every symbol
  * probed against it classifies `unknown` -- see that version's header.
+ *
+ * corpuslib_crosscheck -- code-review Finding #19.7: declared with the
+ *                        IDENTICAL signature in both 1.0.0 and 2.0.0,
+ *                        same story as corpuslib_stable above, but the
+ *                        harvester fixture binds it with BOTH `header`
+ *                        AND `prototype` together (cross-check mode) --
+ *                        see tests/tharvest_binding.nim. Proves the
+ *                        harvester probes (never skips) a symbol bound
+ *                        this way, classifying it identically to a
+ *                        header-only binding.
  */
 
 #ifdef __cplusplus
@@ -52,6 +62,8 @@ extern "C" {
 int corpuslib_stable(int a, int b);
 
 int corpuslib_changed(int a);
+
+int corpuslib_crosscheck(int a, int b);
 
 #ifdef __cplusplus
 }

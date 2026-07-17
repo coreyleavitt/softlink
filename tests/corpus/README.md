@@ -43,9 +43,20 @@ reachable:
 | `corpuslib_stable`   | `int corpuslib_stable(int a, int b);` | same signature, byte-identical | unreachable (broken include) |
 | `corpuslib_changed`  | `int corpuslib_changed(int a);` | `double corpuslib_changed(int a);` (return type changed, arity unchanged) | unreachable |
 | `corpuslib_added`    | not declared at all | `int corpuslib_added(int x);` (newly added) | unreachable |
+| `corpuslib_crosscheck` | `int corpuslib_crosscheck(int a, int b);` | same signature, byte-identical | unreachable (broken include) |
 
 A binding pinned to `corpuslib_stable`'s signature classifies `verified`
 at both 1.0.0 and 2.0.0.
+
+Code-review Finding #19.7: `corpuslib_crosscheck` carries the IDENTICAL
+classification story as `corpuslib_stable` above, but
+`tests/tharvest_binding.nim` binds it with BOTH `header` AND `prototype`
+together (softlink's cross-check mode, RFC-0001 SS3 A.1/A4) rather than
+`header` alone. This proves the harvester probes a cross-checked symbol
+exactly like a header-only one — the `header`-vs-`prototype`-only
+skip rule (`p.header.len == 0 and p.prototype.len > 0` in
+`tools/harvest/harvester.nim`) only ever fires when `header` is ABSENT,
+so a symbol carrying both is never skipped as "corpus-invariant."
 
 A binding pinned to `corpuslib_changed`'s **1.0.0** signature
 (`int corpuslib_changed(int a)`) classifies `verified` at 1.0.0 and
