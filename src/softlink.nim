@@ -28,6 +28,7 @@ import ./softlink/versions
 # file only ever goes through that one entry point.
 import ./softlink/procinfo
 import ./softlink/pragmas
+import ./softlink/directives
 import ./softlink/verify
 # Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
@@ -275,15 +276,15 @@ func currentLibOs(): LibOs =
 ## Correctly-placed directives never reach that proc at all — the
 ## `dynlib`/`verifyProcs` macros recognize and consume the
 ## `compatManifest` statement structurally (see
-## `softlink/pragmas.isCompatManifestCall`) and never re-emit it into the
+## `softlink/directives.isCompatManifestCall`) and never re-emit it into the
 ## generated code, exactly like every proc declaration in the same body is
 ## consumed and regenerated rather than passed through verbatim.
 ##
-## Declared directly HERE rather than in `softlink/pragmas` alongside the
+## Declared directly HERE rather than in `softlink/directives` alongside the
 ## rest of the directive-recognition machinery (code-review finding #13):
 ## Nim's qualified re-export syntax (`export someModule.someProc`) does not
 ## reliably re-export a bodyless `{.error.}`-pragma'd proc/template — see
-## `softlink/pragmas`' own comment at this stub's old location for the
+## `softlink/directives`' own comment at this stub's old location for the
 ## empirical detail. Keeping both stubs declared where their own `*` already
 ## makes them public sidesteps the issue and reproduces pre-extraction
 ## behavior byte-for-byte.
@@ -308,7 +309,7 @@ proc compatManifest*(path: string, refuse: bool = false) {.error: compatManifest
 ## `{.error.}` on a template behaves exactly like on a proc). Correctly-
 ## placed directives never reach this template at all — `dynlib` recognizes
 ## and consumes the `versionProbe` statement structurally (see
-## `softlink/pragmas.isVersionProbeStmt`) before it is ever resolved as an
+## `softlink/directives.isVersionProbeStmt`) before it is ever resolved as an
 ## identifier; `verifyProcs` does the same, but ALWAYS rejects it with its
 ## own directive-specific error (no runtime footprint there — see
 ## `collectVProcs`).
@@ -336,15 +337,26 @@ template versionProbe*(body: untyped) {.error: versionProbeStubMsg.} =
 # finding #13's "prototype tokenizer" seam) — a self-contained, pure-
 # function group with no dependency on anything else in this file.
 #
-# `ProcPragmaMode`/`ProcPragmaFacts`/`callingConventions`/
-# `parseProcPragmas` (per-proc pragma parsing), `CompatManifestDirective`/
-# `isCompatManifestCall`/`parseCompatManifestDirective`/
-# `compatManifestDupError`, `VersionProbeDirective`/`isVersionProbeStmt`/
-# `parseVersionProbeDirective`/`versionProbeDupErrorMsg`, and
-# `AppliedManifest`/`applyCompatManifest` all moved to `softlink/pragmas`
-# (code-review finding #13's "pragma parsing + directive/manifest
-# application" seam) — every proc there takes its inputs as explicit
+# `ProcPragmaFacts`/`callingConventions`/`parseProcPragmas` (per-proc
+# pragma parsing) moved to `softlink/pragmas` (code-review finding #13's
+# "pragma parsing" seam) — every proc there takes its inputs as explicit
 # parameters and closes over no `dynlib`/`verifyProcs` macro local.
+#
+# `CompatManifestDirective`/`isCompatManifestCall`/
+# `parseCompatManifestDirective`/`compatManifestDupError`,
+# `VersionProbeDirective`/`isVersionProbeStmt`/`parseVersionProbeDirective`/
+# `versionProbeDupErrorMsg`, and `AppliedManifest`/`applyCompatManifest`
+# moved to `softlink/directives` (code-review finding #13's "pragma parsing
+# + directive/manifest application" seam, later split from `softlink/pragmas`
+# itself under code-review finding R2-4 — block-level directive AST
+# recognition plus I/O-performing manifest-application orchestration is a
+# different concern from per-proc pragma parsing) — every proc there takes
+# its inputs as explicit parameters and closes over no `dynlib`/
+# `verifyProcs` macro local. `ProcPragmaMode` (the `ppmDynlib`/
+# `ppmVerifyProcs` enum `parseProcPragmas` and `applyCompatManifest` both
+# take) moved to `softlink/procinfo` in the R2-4 pass, so that
+# `softlink/pragmas` and `softlink/directives` each import `procinfo` for
+# it rather than one importing the other.
 # The `compatManifest`/`versionProbe` erroring stubs did NOT move: they
 # stay declared above in THIS file (a bodyless `{.error.}` proc/template
 # does not survive Nim's qualified re-export — see the stubs' own doc

@@ -20,6 +20,24 @@
 ## `CompatReport`, and friends are), so no new public surface is added.
 
 type
+  ProcPragmaMode* = enum
+    ## Which caller is parsing pragmas/directives — `dynlib` and
+    ## `verifyProcs` share the same token recognition but disagree on what
+    ## `optional`/`noverify` mean (dynlib: runtime-optional escape hatches;
+    ## verifyProcs: meaningless, since the block exists solely to verify)
+    ## and on their diagnostic wording. New pragmas Stage A adds
+    ## (`prototype`, etc.) get their rules defined once instead of drifting
+    ## between two hand-rolled loops.
+    ##
+    ## Lives here rather than in `softlink/pragmas` (whose
+    ## `parseProcPragmas` is this enum's original, and still primary,
+    ## consumer) so that `softlink/directives`' `applyCompatManifest` —
+    ## which also takes a `ProcPragmaMode` — can see it without importing
+    ## `softlink/pragmas` (code-review finding R2-4): both of those modules
+    ## import `procinfo` for it, and neither imports the other.
+    ppmDynlib
+    ppmVerifyProcs
+
   SoftlinkProc* = object
     name*: NimNode
     nameStr*: string
