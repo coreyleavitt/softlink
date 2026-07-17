@@ -245,7 +245,16 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
   # case as it is a typo.
   if probeOnlyList.len > 0:
     var blockCNames: HashSet[string]
-    for p in allProcs: blockCNames.incl(p.nameStr)
+    # Code-review finding R2-3: built from `procs` (the verification-
+    # ELIGIBLE subset — see its own `for p in allProcs: if not
+    # p.noVerify and ...` filter above), NOT `allProcs`. A `{.noverify.}`
+    # proc's cname is a real symbol in this block but has NO verification
+    # to gate; if it were the sole match for `probeOnlyList` against
+    # `allProcs`, the "no proc in this block" warning below would never
+    # fire (the name IS in `allProcs`) even though every genuinely-
+    # verifiable proc in the block is being silently, totally suppressed —
+    # exactly the failure mode this warning exists to catch.
+    for p in procs: blockCNames.incl(p.nameStr)
     var unmatched: seq[string]
     for name in probeOnlyList:
       if name notin blockCNames:

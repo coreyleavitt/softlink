@@ -539,6 +539,23 @@ proc calleeIdentName(n: NimNode): string =
   else:
     ""
 
+proc normalizeCalleeNode(n: NimNode): NimNode =
+  ## Code-review finding R2-1: repeatedly strips a single-child `nnkPar` —
+  ## a parenthesized expression, e.g. `(P)` or the doubly-wrapped `((P))` —
+  ## around a call's callee position, so `(P)(x)` and `((P))(x)` are seen
+  ## exactly as directly as the unparenthesized `P(x)`. An `nnkPar` with
+  ## `len != 1` is a TUPLE CONSTRUCTOR (`(a, b)`), never a grouped
+  ## expression, and is deliberately left untouched — stripping it would
+  ## silently treat an unrelated AST shape as a callee.
+  ##
+  ## Must run BEFORE the `nnkDotExpr` unwrap in
+  ## `scanProbeBodyForDriftCalls`: a paren can wrap a dot-expr callee too
+  ## (`(x.P)(...)`), so parens have to come off first for the subsequent
+  ## dot-unwrap to see the `DotExpr` underneath.
+  result = n
+  while result.kind == nnkPar and result.len == 1:
+    result = result[0]
+
 proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string]): bool =
   ## RFC-0001 §C.1/§C.3, slice C4b: "the version probe may only call
   ## symbols with no known drift ranges" (RFC §C.1: "the probe must not be
@@ -553,15 +570,21 @@ proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string])
   ## callee's `P` half is exactly as direct and exactly as detectable as
   ## the bare-ident form `P(x)` — UFCS is sugar, not an indirection, so
   ## treating it as unseeable would be a real gap, not a documented one.
-  ## Emits ONE macro error at the offending call node and stops (returns
-  ## `true`) — a probe with several such calls gets one diagnostic, not a
-  ## pile-up. Indirect calls TRULY through a variable, a closure, or a
-  ## method value can't be seen statically; that residual risk is accepted
-  ## and documented here, not pretended away, per the RFC's own words.
+  ## The callee position is first run through `normalizeCalleeNode` (R2-1),
+  ## which strips any wrapping single-child `nnkPar`, so a parenthesized
+  ## callee — `(P)(x)`, `((P))(x)`, or the paren-wrapped-UFCS `(x.P)(x)` —
+  ## is detected identically to its unparenthesized form; detection here is
+  ## now paren/UFCS-insensitive. Emits ONE macro error at the offending
+  ## call node and stops (returns `true`) — a probe with several such calls
+  ## gets one diagnostic, not a pile-up. Indirect calls TRULY through a
+  ## variable, a closure, or a method value can't be seen statically; that
+  ## residual risk is accepted and documented here, not pretended away, per
+  ## the RFC's own words.
   if stmts.kind in {nnkCall, nnkCommand} and stmts.len > 0:
+    let normalizedCallee = normalizeCalleeNode(stmts[0])
     let calleeNode =
-      if stmts[0].kind == nnkDotExpr and stmts[0].len == 2: stmts[0][1]
-      else: stmts[0]
+      if normalizedCallee.kind == nnkDotExpr and normalizedCallee.len == 2: normalizedCallee[1]
+      else: normalizedCallee
     let callee = calleeIdentName(calleeNode)
     if callee.len > 0 and callee in mismatchCNames:
       error("softlink: dynlib: versionProbe directly calls '" & callee &

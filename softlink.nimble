@@ -1009,6 +1009,20 @@ task test, "Run tests":
         "tests/tcheck_probe_only.nim",
       ["no proc in this 'Probeonly' block"], [])
 
+    # Code-review finding R2-3 (Medium): the F9 warning above was built from
+    # `allProcs` (INCLUDING `{.noverify.}` procs), not the verification-
+    # eligible `procs` subset — so a `-d:softlinkProbeOnly` name matching
+    # ONLY a `{.noverify.}` proc's cname never triggered the warning, even
+    # though every genuinely-verifiable proc in the block was still being
+    # silently, totally suppressed. `tests/tcheck_probe_only_noverify_target.nim`
+    # declares `testlib_add` (header-verified) alongside
+    # `testlib_noverify_target` ({.noverify.}); probing ONLY the noverify
+    # proc's name must still fire the warning.
+    expectManifestCompileOk(
+      cBaseNoCache & " -d:softlinkProbeOnly=testlib_noverify_target " &
+        "tests/tcheck_probe_only_noverify_target.nim",
+      ["no proc in this 'Probeonly' block"], [])
+
     exec cBase & probeOnlyV0 & " tests/tcheck_probe_only_verifyprocs.nim"
     exec cBase & probeOnlyV1 & " -d:softlinkProbeOnly=testlib_magic tests/tcheck_probe_only_verifyprocs.nim"
     exec cBase & probeOnlyV2 &
@@ -1111,6 +1125,17 @@ task test, "Run tests":
     const ufcsBase = "testlib_probe_drift_ufcs"
     writeManifestFromTemplate(mdir & ufcsBase & ".tmpl.json", mdir & ufcsBase & ".compat.json")
     expectManifestCompileFail(mcBase & "tests/tfail_probe_drift_call_ufcs.nim",
+      ["the version probe may only call symbols with no known drift ranges"])
+
+    # Code-review finding R2-1: a PARENTHESIZED callee (`(testlib_add)(1, 2)`,
+    # AST `Call(Par(Ident "testlib_add"), ...)`) must be caught identically —
+    # `stmts[0]` is `nnkPar`, not a bare `nnkIdent` nor `nnkDotExpr`, so the
+    # pre-fix unwrap/`calleeIdentName` returned "" for it and this bypassed
+    # the scan entirely. Reuses the SAME materialized
+    # `testlib_probe_drift_ufcs.compat.json` the UFCS check directly above
+    # already set up (it records the two-parameter `testlib_add` as
+    # `mismatch`, exactly what this fixture's paren-wrapped call needs).
+    expectManifestCompileFail(mcBase & "tests/tfail_probe_drift_call_paren.nim",
       ["the version probe may only call symbols with no known drift ranges"])
     rmFile(mdir & ufcsBase & ".compat.json")
 
