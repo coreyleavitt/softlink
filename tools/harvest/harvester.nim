@@ -21,8 +21,8 @@
 ## the macro already understands (`softlinkProbeOnly`/`softlinkProbeExistence`,
 ## slice B2) — this module never re-derives or re-parses a binding, it only
 ## drives the compiler against the one that already exists.
-import std/[os, osproc, json, oids, strutils, tables, algorithm, streams, times,
-            sequtils, monotimes]
+import std/[os, osproc, json, tempfiles, strutils, tables, algorithm, streams,
+            times, sequtils, monotimes]
 import softlink/versions
 when defined(posix):
   import std/posix
@@ -314,6 +314,23 @@ proc loadDump*(dumpFile: string): ProbeDump =
   result.modulePath = j["modulePath"].getStr
   result.libPattern = j["libPattern"].getStr
   result.baseName = j["baseName"].getStr
+  # #22 (defense in depth): `baseName` gets spliced into the output compat-
+  # manifest's PATH (`isMainModule`'s `manifestPath`, below) — a legitimate
+  # dump's `baseName` is always `dynlib`'s own `libNameToIdent` output
+  # (`softlink.nim`), which by construction is non-empty ASCII alphanumeric
+  # only (no `.`, `/`, `\`, or `..`). The dump is normally self-produced by
+  # the SAME macro, but nothing stops a corrupted or hand-edited dump file
+  # from carrying a hostile value here, so this is validated at the one
+  # place it enters the system — before ANY consumer (report text, manifest
+  # path, ...) ever sees it — rather than only at the path-splice site.
+  if result.baseName.len == 0 or not result.baseName.allCharsInSet(IdentChars):
+    raise newException(HarvestError,
+      "softlink harvest: probe-facts dump " & dumpFile & " has an invalid " &
+      "'baseName' (" & escape(result.baseName) & ") — expected a non-empty " &
+      "alphanumeric identifier (as `dynlib`'s libNameToIdent always " &
+      "produces), got something containing a path separator, '..', or " &
+      "another non-identifier character; refusing to use it to build a " &
+      "filesystem path")
   for p in j["procs"]:
     result.procs.add ProbeFact(
       nimName: p["nimName"].getStr,
@@ -404,12 +421,18 @@ proc findNimExe(): string =
 
 proc freshDir(base: string): string =
   ## A unique-per-invocation directory under `base`, created on demand.
-  ## Uses `std/oids.genOid` (a globally-unique 12-byte id), not a counter —
-  ## parallel-safe by construction even though this slice's loop runs
-  ## serially (RFC-0001 SS4 B.2: "the unique nimcache is what makes
-  ## per-symbol probing genuinely embarrassingly parallel").
-  result = base / ("sl_harvest_" & $genOid())
-  createDir(result)
+  ## #23: uses `std/tempfiles.createTempDir` (a real `mkdtemp`-style secure
+  ## primitive — random name AND atomic, race-free creation) rather than a
+  ## predictable name computed separately from the `createDir` that makes
+  ## it: a plain `std/oids.genOid`, while globally unique, is a 12-byte
+  ## timestamp+counter+machine-id value, not a secret — predictable enough
+  ## under the shared, world-writable `getTempDir()` to make a symlink-race
+  ## plausible between "compute the name" and "create the directory" (the
+  ## two used to be separate steps here; `createTempDir` does both in one
+  ## call). Parallel-safe by construction, same as before (RFC-0001 SS4
+  ## B.2: "the unique nimcache is what makes per-symbol probing genuinely
+  ## embarrassingly parallel").
+  createTempDir("sl_harvest_", "", base)
 
 type
   ReaderMsgKind = enum rmkChunk, rmkDone, rmkExceeded
@@ -611,11 +634,14 @@ proc runProcess*(exe: string, args: seq[string], timeoutMs, maxOutputBytes: int)
   # `poDaemon` is deliberately NOT in the options set below, and doing so
   # is backend-independent by construction: it does not matter whether
   # `startProcess` used `posix_spawn` or fork/exec internally.
-  when defined(posix):
-    let setsidPath = findExe("setsid")
   var spawnExe = exe
   var spawnArgs = args
   when defined(posix):
+    # R4-L2: one merged `when defined(posix):` block (finding/probe +
+    # conditional reassignment together) rather than two separate blocks
+    # bracketing the unconditional `spawnExe`/`spawnArgs` decls above —
+    # cosmetic, behavior-preserving.
+    let setsidPath = findExe("setsid")
     if setsidPath.len > 0:
       # Graceful degradation (same policy as this repo's MSVC C23 gate): if
       # `setsid` isn't on PATH (unusual on Linux — it ships in util-linux,
@@ -913,19 +939,25 @@ proc harvest*(dumpFile, corpusDir: string,
 
   var probeTargets: seq[ProbeFact] = @[]
   for p in dump.procs:
-    if p.noverify:
+    # `isCorpusTrackable` (softlink/versions, code-review finding #21) is
+    # the SAME predicate `softlink/directives.applyCompatManifest`'s own
+    # `trackable` list uses on the consumption side — extracted so the two
+    # sides cannot silently drift apart. The three `elif` arms below are
+    # unchanged: they only choose WHICH diagnostic reason to record for a
+    # symbol the shared predicate already said is not trackable.
+    if isCorpusTrackable(p.noverify, p.header.len > 0):
+      probeTargets.add(p)
+      result.probedSymbols.add(p.cName)
+    elif p.noverify:
       result.skipped.add SkipNote(cname: p.cName,
         reason: "noverify — excluded from header verification entirely, " &
                 "nothing to probe")
-    elif p.header.len == 0 and p.prototype.len > 0:
+    elif p.prototype.len > 0:
       result.skipped.add SkipNote(cname: p.cName,
         reason: "prototype-only (no header) — corpus-invariant, skipped")
-    elif p.header.len == 0:
+    else:
       result.skipped.add SkipNote(cname: p.cName,
         reason: "no header or prototype recorded — nothing to probe")
-    else:
-      probeTargets.add(p)
-      result.probedSymbols.add(p.cName)
 
   for v in result.versions:
     let versionDir = corpusDir / v

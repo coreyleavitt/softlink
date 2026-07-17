@@ -169,3 +169,25 @@ func contains*(iv: VersionInterval, v: string): bool =
   ## of the SAME rule rather than two independent implementations.
   (iv.lo.len == 0 or cmpVersion(v, iv.lo) >= 0) and
   (iv.hi.len == 0 or cmpVersion(v, iv.hi) < 0)
+
+func isCorpusTrackable*(noVerify: bool, hasHeader: bool): bool =
+  ## The shared "does this proc have per-version corpus facts worth
+  ## recording/checking" predicate (code-review finding #21). A symbol is
+  ## corpus-trackable iff it is not `{.noverify.}` (nothing to probe — the
+  ## symbol isn't even header-verified) AND it declares a real `{.header.}`
+  ## (a `{.prototype.}`-only symbol verifies against a vendored, corpus-
+  ## INVARIANT declaration that never varies by installed headers, so it has
+  ## no per-version facts to harvest or compare).
+  ##
+  ## Two independent call sites used to hand-roll this same three-line
+  ## condition with nothing forcing them to agree: the manifest-consumption
+  ## side (`softlink/directives.applyCompatManifest`'s `trackable` list, bound
+  ## against `SoftlinkProc.noVerify`/`.headerFile`) and the manifest-production
+  ## side (`tools/harvest/harvester.harvest`'s per-proc classification, bound
+  ## against `ProbeFact.noverify`/`.header`) — two distinct record types with
+  ## different field names/casing, which is why this takes plain `bool`s
+  ## rather than either struct. Pinned here, in the one leaf module both
+  ## sides already import (directly, or — pre-R3-3 — transitively via
+  ## `softlink/manifest`'s `export versions`), so the predicate cannot drift
+  ## apart independently ever again.
+  not noVerify and hasHeader

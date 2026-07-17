@@ -30,6 +30,11 @@
 import std/[macros, os, strutils]
 import ./manifest
 import ./procinfo
+# R3-3: `abiTag` and `isCorpusTrackable` (both used below) are genuinely
+# used by THIS module — imported directly here, rather than relying on
+# `./manifest`'s transitive `export versions`, so the dependency is explicit
+# rather than an accident of what `manifest` happens to re-export.
+import ./versions
 
 # The `compatManifest`/`versionProbe` "erroring stub" proc/template stay
 # declared directly in `src/softlink.nim` rather than moving here with the
@@ -301,13 +306,14 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
     if sc.contradicted:
       error(sc.message, p.name)
 
-  # Bound, harvester-trackable C names — same predicate `tools/harvest/
+  # Bound, harvester-trackable C names — `isCorpusTrackable` (softlink/
+  # versions, code-review finding #21) is the SAME predicate `tools/harvest/
   # harvester.nim`'s `harvest` uses to decide what it records: excludes
   # `noverify` (nothing to probe) and prototype-only procs (corpus-
   # invariant, never in a manifest by design). Shared by checks 7 and 8.
   var trackable: seq[string] = @[]
   for p in procs:
-    if not p.noVerify and p.headerFile.len > 0: trackable.add p.nameStr
+    if isCorpusTrackable(p.noVerify, p.headerFile.len > 0): trackable.add p.nameStr
 
   # Check 7: mismatch warning.
   let mismatched = mismatchedSymbols(m, trackable)
