@@ -97,17 +97,24 @@ per RFC-0001 SS B.2:
   `source` values are well-formed but fake (`git:example/testlib@<40 hex
   chars>`); nothing here was actually fetched.
 
-- **The `prepare` hook**: exactly one entry (`2.0.0`) carries a `prepare`
-  command, illustrating RFC-0001 SS B.2's optional per-version prepare
-  step for libraries whose public headers are configure/generate outputs
-  rather than checked-in files (mbedtls's config-dependent headers are
-  the motivating case there). **Semantics**: when present, the harvester
-  runs `prepare` in the library's source checkout *before* capturing that
-  version's header snapshot — the snapshot is taken *after* `prepare`
-  finishes, so generated headers are captured as they'd actually appear
-  to a consumer, not as blank templates. Header-only, no-configure
-  libraries (like this fixture corpus) need no `prepare` at all, which is
-  why only one of the three entries here carries one.
+- **The `prepare` hook (reserved, not yet implemented)**: exactly one
+  entry (`2.0.0`) carries a `prepare` command, illustrating RFC-0001 SS
+  B.2's *intended* optional per-version prepare step for libraries whose
+  public headers are configure/generate outputs rather than checked-in
+  files (mbedtls's config-dependent headers are the motivating case
+  there). **Current behavior**: the harvester does NOT run `prepare` —
+  `loadCorpusProvenance` (`tools/harvest/harvester.nim`) reads only
+  `version` and `source` from each entry and silently ignores `prepare`
+  and `_comment`; nothing in this repo shells out to it. **Intended
+  future semantics**: once wired up, a fetch script would run `prepare`
+  in the library's source checkout *before* capturing that version's
+  header snapshot, so generated headers are captured as they'd actually
+  appear to a consumer, not as blank templates. Header-only, no-configure
+  libraries (like this fixture corpus) would need no `prepare` at all,
+  which is why only one of the three entries here carries one — it
+  exists to give a future implementation (and any real fetch script
+  modeled on this file) a concrete target, not because the harvester
+  acts on it today.
 
 JSON has no comment syntax, so the semantics above (and this stub's
 purpose) are recorded both here and in `corpus.json`'s own `_comment` key.

@@ -19,6 +19,13 @@
 # BINDING's CI, never on a consumer machine -- a `nimble install` of the
 # binding never triggers any of this; only this scheduled/manually-
 # triggered workflow does.
+#
+# corpus.json's `prepare` field (see the "Fetch upstream header corpus"
+# step below) is RESERVED -- the harvester does not read or execute it
+# today. Review it as code anyway if a corpus.json arrives from a
+# third party: the field is aspirational, and if/when it is wired up it
+# will mean arbitrary shell execution sourced from a repo-committed file,
+# run unattended in this job.
 
 name: softlink harvest (compat manifest lifecycle)
 
@@ -53,10 +60,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Nim install: pinned action, not `curl | bash`. This template is
+      # copied verbatim into every downstream binding repo, so an
+      # unpinned `curl https://nim-lang.org/choosenim/init.sh -sSf | bash`
+      # here would hand every one of those repos' CI runners to whatever
+      # nim-lang.org serves at run time, with no checksum or signature to
+      # catch a compromised install script. `jiro4989/setup-nim-action` is
+      # pinned to a full 40-char commit SHA (not a mutable tag like `@v2`)
+      # so the action's own code can't change under this workflow without
+      # a deliberate edit here, and `nim-version` pins the toolchain
+      # itself (matching the 2.2.0 pin this repo's own
+      # .github/workflows/ci.yaml uses for its Windows leg) instead of
+      # floating on choosenim's "latest stable". Bumping either pin is a
+      # deliberate, reviewable diff -- that's the point of pinning.
+      # TODO(binding): bump the SHA/version together, deliberately, when
+      # you want a newer setup-nim-action release or Nim release; verify
+      # the new SHA via `gh api repos/jiro4989/setup-nim-action/tags`.
       - name: Install Nim
-        run: |
-          curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
-          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+        uses: jiro4989/setup-nim-action@cb1fc1270b117457dd0d9f610ec981fad3369cec # v2.3.0
+        with:
+          nim-version: '2.2.0'
 
       # TODO(binding): pin real version constraints once softlink_harvest
       # is published; `nimble install` resolves `requires "softlink"`
@@ -87,10 +110,14 @@ jobs:
       # RFC-0001 SS4 B.1: dump per-baseName probe facts for the binding
       # module(s) this repo ships. `-d:softlinkDumpProbes=<dir>` is a
       # dedicated single-shot invocation (see the macro's own docs) -- not
-      # something left on in normal builds.
+      # something left on in normal builds. The macro hard-errors unless
+      # <dir> is ABSOLUTE (the dump write shells out via staticExec, whose
+      # cwd Nim ties to softlink.nim's own directory, not this job's cwd,
+      # so a relative path resolves to the wrong place) -- use
+      # `${{ github.workspace }}` to build one.
       - name: Generate B.1 probe-facts dump
         run: |
-          nim c --compileOnly -d:softlinkDumpProbes=probes TODO_binding_module.nim
+          nim c --compileOnly -d:softlinkDumpProbes=${{ github.workspace }}/probes TODO_binding_module.nim
 
       # RFC-0001 SS4 B.2/B.4/B.8: run the harvester. Exit codes (documented
       # in `softlink_harvest --help` and tools/harvest/README.md) are what

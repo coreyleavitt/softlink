@@ -187,10 +187,15 @@ softlink_harvest <dumpFile> <corpusDir> [options]
 ```
 
 1. Generate the probe-facts dump (a one-shot, dedicated compile — not
-   something to leave on in normal builds):
+   something to leave on in normal builds). `-d:softlinkDumpProbes`
+   requires an ABSOLUTE directory: the dump write shells out via
+   `staticExec`, whose working directory Nim ties to the Nim file
+   containing the macro call, not to your shell's cwd, so a relative
+   path here silently resolves to the wrong place (a hard compile-time
+   error catches it either way):
 
    ```sh
-   nim c --compileOnly -d:softlinkDumpProbes=probes path/to/your_binding.nim
+   nim c --compileOnly -d:softlinkDumpProbes=$PWD/probes path/to/your_binding.nim
    ```
 
    This writes `probes/<Base>.probes.json`, where `<Base>` is the same
@@ -270,8 +275,9 @@ everyone else gets it for free.
 ### The one-screen happy path
 
 ```sh
-# 1. Dump probe facts for your binding module.
-nim c --compileOnly -d:softlinkDumpProbes=probes src/mylib_bindings.nim
+# 1. Dump probe facts for your binding module. Path after
+#    softlinkDumpProbes= must be absolute (see "CLI usage" above).
+nim c --compileOnly -d:softlinkDumpProbes=$PWD/probes src/mylib_bindings.nim
 
 # 2. Harvest against your header corpus (see the CI template for how a
 #    real corpus gets fetched from upstream on a schedule).

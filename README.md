@@ -124,6 +124,7 @@ Every proc in a `dynlib` (or `verifyProcs`, see below) block picks a value on in
 1. **Declaration source** — `header` (verify against an installed header), `prototype` (verify against a vendored C declaration), or `noverify` (skip verification). At least one is required; `header` and `prototype` may coexist for cross-checking. `prototype` + `noverify` is rejected — both pick a source, and they contradict.
 2. **Verification gating** — `{.verifyWhen: "EXPR".}` or nothing, orthogonal to the source axis.
 3. **Runtime requirement** — `{.optional.}` or required (the default), orthogonal to both of the above.
+4. **Availability claim** — `{.since: "x.y.z".}` or nothing, orthogonal to all three above. Declares the version a symbol first appeared in; used only for absence classification against a harvested compat manifest (a contradicted claim is a compile-time error), never for verification itself. See [Verified version compat](#verified-version-compat) below.
 
 The rest of this section covers `verifyWhen`, `prototype`, and `noverify` in turn — the three ways to shape *how* (or whether) a symbol gets compile-time checked.
 
@@ -330,8 +331,11 @@ warns; a bound symbol missing from the manifest hints).
 The one-screen happy path:
 
 ```sh
-# 1. Dump probe facts for your binding module.
-nim c --compileOnly -d:softlinkDumpProbes=probes src/mylib_bindings.nim
+# 1. Dump probe facts for your binding module. -d:softlinkDumpProbes
+#    requires an ABSOLUTE directory (it shells out to write the dump; a
+#    relative path resolves against the wrong working directory) — use
+#    $PWD/probes, not probes.
+nim c --compileOnly -d:softlinkDumpProbes=$PWD/probes src/mylib_bindings.nim
 
 # 2. Harvest against your header corpus.
 softlink_harvest probes/Mylib.probes.json corpus/ --out:mylib.compat.json
