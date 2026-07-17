@@ -535,38 +535,42 @@ proc seqOfTupleType(fields: openArray[(string, string)]): NimNode =
   newNimNode(nnkBracketExpr).add(ident("seq"), tupleTy)
 
 proc calleeIdentName(n: NimNode): string =
-  ## Extracts a plain identifier name from a call/command node's callee
-  ## position (`n`), when that position is either a bare ident (`P(x)`'s
-  ## callee IS `P`) or the field/callee half of a dot-call/UFCS expression
-  ## (`x.P(...)`'s callee is `DotExpr(x, P)` — the caller passes THAT node's
-  ## `[1]` here, i.e. `P`). A single-token `` `P` `` (`nnkAccQuoted`) in
-  ## that position is also unwrapped, so `` x.`P`(...) `` resolves the same
-  ## as `x.P(...)`. Returns `""` for anything else (multi-token accquoted,
-  ## a computed/non-ident expression, etc.) — callers treat `""` as "not a
-  ## recognizable direct callee name", never as a match.
-  if n.kind == nnkIdent:
-    $n
-  elif n.kind == nnkAccQuoted and n.len == 1 and n[0].kind == nnkIdent:
-    $n[0]
+  ## Fully resolves a call/command node's callee-position node (`n`) to a
+  ## plain identifier name, seeing through every syntactic wrapper that
+  ## leaves the call DIRECT, or `""` if it isn't a recognizable direct
+  ## callee (a computed expression, a proc/closure value, a multi-token
+  ## accquoted, etc.) — callers treat `""` as "no recognizable direct
+  ## callee name", never as a match.
+  ##
+  ## Code-review findings R2-1/R3-1: this is the SINGLE normalization point.
+  ## All three unwrap steps live here, in the only correct order, so no
+  ## caller has to sequence them (an earlier split across
+  ## `normalizeCalleeNode` + an inline dot-unwrap made correctness depend on
+  ## the caller getting that order right — the same footgun R2-1 itself
+  ## fixed):
+  ##   1. strip wrapping single-child `nnkPar` — `(P)`, `((P))`, and the
+  ##      paren-wrapped-UFCS `(x.P)` — repeatedly. An `nnkPar` with
+  ##      `len != 1` is a TUPLE CONSTRUCTOR (`(a, b)`), never a grouped
+  ##      expression, and is left untouched (stripping it would treat an
+  ##      unrelated shape as a callee). Parens come off FIRST so a paren
+  ##      wrapping a dot-expr callee exposes the `DotExpr` for step 2.
+  ##   2. unwrap a dot-call/UFCS callee (`x.P(...)`, AST `DotExpr(x, P)`) to
+  ##      its field half `P` — UFCS is sugar, not an indirection, so it is
+  ##      exactly as direct and detectable as the bare-ident form `P(x)`.
+  ##   3. extract a bare `nnkIdent`, or a single-token `` `P` ``
+  ##      (`nnkAccQuoted`, so `` x.`P`(...) `` resolves like `x.P(...)`).
+  ## Detection is thereby paren/UFCS-insensitive at a single call site.
+  var cur = n
+  while cur.kind == nnkPar and cur.len == 1:
+    cur = cur[0]
+  if cur.kind == nnkDotExpr and cur.len == 2:
+    cur = cur[1]
+  if cur.kind == nnkIdent:
+    $cur
+  elif cur.kind == nnkAccQuoted and cur.len == 1 and cur[0].kind == nnkIdent:
+    $cur[0]
   else:
     ""
-
-proc normalizeCalleeNode(n: NimNode): NimNode =
-  ## Code-review finding R2-1: repeatedly strips a single-child `nnkPar` —
-  ## a parenthesized expression, e.g. `(P)` or the doubly-wrapped `((P))` —
-  ## around a call's callee position, so `(P)(x)` and `((P))(x)` are seen
-  ## exactly as directly as the unparenthesized `P(x)`. An `nnkPar` with
-  ## `len != 1` is a TUPLE CONSTRUCTOR (`(a, b)`), never a grouped
-  ## expression, and is deliberately left untouched — stripping it would
-  ## silently treat an unrelated AST shape as a callee.
-  ##
-  ## Must run BEFORE the `nnkDotExpr` unwrap in
-  ## `scanProbeBodyForDriftCalls`: a paren can wrap a dot-expr callee too
-  ## (`(x.P)(...)`), so parens have to come off first for the subsequent
-  ## dot-unwrap to see the `DotExpr` underneath.
-  result = n
-  while result.kind == nnkPar and result.len == 1:
-    result = result[0]
 
 proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string]): bool =
   ## RFC-0001 §C.1/§C.3, slice C4b: "the version probe may only call
@@ -582,22 +586,16 @@ proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string])
   ## callee's `P` half is exactly as direct and exactly as detectable as
   ## the bare-ident form `P(x)` — UFCS is sugar, not an indirection, so
   ## treating it as unseeable would be a real gap, not a documented one.
-  ## The callee position is first run through `normalizeCalleeNode` (R2-1),
-  ## which strips any wrapping single-child `nnkPar`, so a parenthesized
-  ## callee — `(P)(x)`, `((P))(x)`, or the paren-wrapped-UFCS `(x.P)(x)` —
-  ## is detected identically to its unparenthesized form; detection here is
-  ## now paren/UFCS-insensitive. Emits ONE macro error at the offending
-  ## call node and stops (returns `true`) — a probe with several such calls
-  ## gets one diagnostic, not a pile-up. Indirect calls TRULY through a
-  ## variable, a closure, or a method value can't be seen statically; that
-  ## residual risk is accepted and documented here, not pretended away, per
-  ## the RFC's own words.
+  ## The callee position goes through `calleeIdentName`, which resolves any
+  ## paren-wrapped (`(P)(x)`, `((P))(x)`, `(x.P)(x)`) or UFCS callee to its
+  ## bare name in one step (R2-1/R3-1) — detection here is paren/UFCS-
+  ## insensitive. Emits ONE macro error at the offending call node and stops
+  ## (returns `true`) — a probe with several such calls gets one diagnostic,
+  ## not a pile-up. Indirect calls TRULY through a variable, a closure, or a
+  ## method value can't be seen statically; that residual risk is accepted
+  ## and documented here, not pretended away, per the RFC's own words.
   if stmts.kind in {nnkCall, nnkCommand} and stmts.len > 0:
-    let normalizedCallee = normalizeCalleeNode(stmts[0])
-    let calleeNode =
-      if normalizedCallee.kind == nnkDotExpr and normalizedCallee.len == 2: normalizedCallee[1]
-      else: normalizedCallee
-    let callee = calleeIdentName(calleeNode)
+    let callee = calleeIdentName(stmts[0])
     if callee.len > 0 and callee in mismatchCNames:
       error("softlink: dynlib: versionProbe directly calls '" & callee &
             "', which has a recorded 'mismatch' interval in the attached " &
