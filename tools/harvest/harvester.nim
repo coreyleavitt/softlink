@@ -430,25 +430,57 @@ proc killProcessTree(p: Process) {.gcsafe.} =
   ## and `joinThread` in `runProcess` hangs forever waiting for a thread
   ## that cannot be force-detached.
   ##
-  ## POSIX (the path this repo's Docker test suite actually exercises):
-  ## `runProcess` starts `p` with `poDaemon`, which — via Nim's
-  ## `posix_spawn` backend (`posix_spawnattr_setpgroup(attr, 0)` +
-  ## `POSIX_SPAWN_SETPGROUP`) — makes `p` the leader of its OWN new process
-  ## group, i.e. PGID == PID. Every descendant `p` forks inherits that same
-  ## PGID (a fork never changes process group on its own). `killpg` sends
-  ## the signal to every process in that group at once, so this reaches the
+  ## POSIX: `runProcess` arranges for `p` to be the leader of its OWN new
+  ## process group (PGID == its own PID) by wrapping the real command in
+  ## `setsid <exe> <args...>` — deliberately the ONLY mechanism used (see
+  ## `runProcess`'s comment for why both `poDaemon` and a parent-side
+  ## `setpgid` call were tried and dropped: the former is not just
+  ## backend-gated but actively conflicts with `setsid` when both fire, and
+  ## the latter always loses the race against the child's own
+  ## already-completed exec). This works identically regardless of which
+  ## internal osproc backend `startProcess` happens to use, which is what
+  ## makes it toolchain-independent rather than gated like `poDaemon`.
+  ## Every descendant `p` forks inherits that same PGID (a fork never
+  ## changes process group on its own), so `killpg` reaches the
   ## grandchildren directly instead of relying on the immediate child to
-  ## propagate anything. A plain single-PID `kill(p)` cannot do this: POSIX
-  ## `kill(pid, sig)` targets exactly one process.
+  ## propagate anything.
+  ##
+  ## Because grouping now happens BEFORE this proc ever runs (inside
+  ## `setsid`'s own pre-exec syscall), `p`'s actual group is read fresh via
+  ## `getpgid` rather than *assumed* to equal its PID. That fresh read is
+  ## also what makes the self-kill hazard structurally impossible: this
+  ## proc additionally reads the HARVESTER'S OWN group (`getpgid(Pid(0))`)
+  ## and refuses to call `killpg` at all unless `p`'s group is both valid
+  ## (> 0, i.e. `getpgid` didn't fail) AND strictly different from ours. If
+  ## the grouping above somehow didn't take (`setsid` missing from PATH, or
+  ## some other unexpected failure) then `p` is still sitting in the
+  ## harvester's own group, `childPgid == ownPgid`, and `killpg` is skipped
+  ## entirely — it is not merely unlikely to hit the
+  ## harvester's own group, the guard makes it impossible, because the one
+  ## case that would aim `killpg` at our own group is exactly the case this
+  ## `if` excludes. In that degraded case the fallback below (a plain
+  ## single-PID `kill(p)`, always run) still kills the immediate child; only
+  ## a grandchild that outlives `p` and keeps writing to the pipe would go
+  ## unreached — strictly worse (a possible hang) but never a self-kill.
   ##
   ## Windows: `poDaemon` there only means "no console window" (no process-
   ## group equivalent in osproc), so there is no cheap in-stdlib group kill.
   ## `taskkill /F /T` is the best-effort tree-kill parity path — not
   ## exercised by CI, which runs Linux-only Docker.
   when defined(posix):
+    # `getpgid`/`killpg` are raw `importc` wrappers around C library calls
+    # (`<unistd.h>`/`<signal.h>`) — no Nim GC interaction, so the compiler
+    # accepts them under this proc's own `{.gcsafe.}` pragma with no extra
+    # `{.cast(gcsafe).}` needed; that's what makes it safe to call this
+    # proc from `readOutputThread`'s worker thread.
     try:
-      if running(p):
-        discard killpg(Pid(processID(p)), SIGKILL)
+      let childPid = Pid(processID(p))
+      let childPgid = getpgid(childPid)
+      let ownPgid = getpgid(Pid(0))
+      if childPgid > Pid(0) and childPgid != ownPgid:
+        # Safe: `childPgid` is demonstrably NOT the harvester's own group,
+        # so this can never signal the harvester itself.
+        discard killpg(childPgid, SIGKILL)
     except OSError:
       discard
   else:
@@ -456,8 +488,10 @@ proc killProcessTree(p: Process) {.gcsafe.} =
       discard execCmd("taskkill /F /T /PID " & $processID(p))
     except OSError:
       discard
-  # Belt-and-suspenders: also signal the immediate child directly, in case
-  # the group/tree kill above silently no-ops (e.g. `p` already reaped).
+  # ALWAYS also signal the immediate child directly — the correct fallback
+  # both when the group kill above was skipped (grouping failed, degraded
+  # to single-PID) and as pure belt-and-suspenders when it wasn't (e.g. `p`
+  # already reaped by the time `killpg` ran).
   try:
     if running(p): kill(p)
   except OSError:
@@ -515,15 +549,88 @@ proc runProcess*(exe: string, args: seq[string], timeoutMs, maxOutputBytes: int)
   ## (`*`) so its bounded-time/bounded-output CONTRACT can be tested
   ## directly (`tests/tharvest.nim`) against real subprocesses (`sleep`,
   ## `yes`), not only observed indirectly through a full `harvest()` run.
-  # `poDaemon` is added here purely for its POSIX side effect (making `p`
-  # the leader of its own new process group, PGID == PID — see
-  # `killProcessTree`'s doc comment) — NOT for its literal "daemonize"
-  # meaning. It does not set `poParentStreams`, so it does not redirect or
-  # detach the merged stdout pipe this proc still reads via
-  # `readOutputThread`; the "normal command still returns its real output"
-  # test below pins that the success path is unaffected.
-  var p = startProcess(exe, args = args,
-                        options = {poStdErrToStdOut, poUsePath, poDaemon})
+  # Grouping `p` into its OWN new process group (PGID == its own PID) is
+  # what lets `killProcessTree` reach a grandchild compiler process via
+  # `killpg` — see that proc's doc comment. Two mechanisms were tried
+  # before arriving at the one actually used below; both are recorded here
+  # because either one, alone, LOOKS reasonable and this comment exists so
+  # nobody reintroduces them:
+  #
+  # 1. `poDaemon` in `startProcess`'s options: on osproc's `posix_spawn`
+  #    backend this passes `POSIX_SPAWN_SETPGROUP` (new group, PGID == own
+  #    PID) — race-free, in-kernel, before exec. But that backend is itself
+  #    gated by `useProcessAuxSpawn = declared(posix_spawn) and not
+  #    defined(useFork) and not defined(useClone) and not defined(linux)`
+  #    in vanilla upstream osproc (e.g. `nimlang/nim:2.2.0`) — the trailing
+  #    `not defined(linux)` makes this FALSE on standard Linux builds, so
+  #    `poDaemon` silently does nothing there (this repo's pinned
+  #    `ghcr.io/coreyleavitt/nim:2.2.10` image widens the gate to be
+  #    Linux-inclusive, so `poDaemon` alone happens to suffice THERE, but
+  #    this proc must not assume every downstream user's toolchain has that
+  #    patch). Not merely insufficient on its own — see "What actually
+  #    works" below for why it is actively HARMFUL once combined with the
+  #    fix that covers the gap it leaves.
+  # 2. A parent-side `setpgid(Pid(processID(p)), Pid(processID(p)))` call
+  #    right after `startProcess` returns, to cover the fork/exec backend
+  #    `poDaemon` misses. This is a DEAD END, empirically confirmed on
+  #    `nimlang/nim:2.2.0`: Nim's own fork/exec spawner
+  #    (`startProcessAuxFork` in `lib/pure/osproc.nim`) synchronizes with
+  #    the child over a CLOEXEC-tagged error pipe — the parent blocks
+  #    reading that pipe until the child's `exec*()` syscall either
+  #    succeeds (closing the pipe via CLOEXEC) or fails (writing an errno
+  #    into it) — so by the time `startProcess` returns control to this
+  #    proc, the child has, by construction, ALREADY completed its exec.
+  #    POSIX `setpgid` explicitly forbids a THIRD PARTY (the parent, here,
+  #    trying to change ITS OWN CHILD's group after the fact) from changing
+  #    a process's group once that process has exec'd — that's an EACCES,
+  #    not a narrow race to win. Confirmed: this call always returned
+  #    -1/EACCES(13) against `sh -c "sleep 30 & wait"` on `nimlang/nim:2.2.0`.
+  #
+  # What actually works: wrap the real command in `setsid <exe> <args...>`
+  # (below), WITHOUT `poDaemon`. `setsid(1)`'s own `setsid()` syscall runs
+  # INSIDE the wrapper's own process, before ITS OWN exec of the real
+  # command — no cross-process race at all, since a process changing its
+  # own group is unrestricted. It execs the real command in place (no
+  # extra fork, hence no extra PID/PGID layer to lose track of — confirmed:
+  # `setsid sh -c 'echo $$'` reports the SAME value as both its own pid and
+  # its process-group id) PROVIDED it isn't already a process-group leader
+  # when it tries; `setsid()` fails with EPERM on an existing leader, and
+  # `setsid(1)`'s fallback for that is to fork a detached grandchild and
+  # exit immediately itself (confirmed via `ps`: the wrapper's tracked PID
+  # gets reparented to PID 1 nearly instantly) — silently orphaning
+  # `runProcess`'s `p` from the real, still-running process it's supposed
+  # to be tracking. This is EXACTLY what `poDaemon` would trigger on a
+  # backend where it fires (`POSIX_SPAWN_SETPGROUP` already makes the
+  # spawned process its own group leader before `setsid`'s exec even runs)
+  # — confirmed empirically as a full regression back to ~30s on
+  # `ghcr.io/coreyleavitt/nim:2.2.10` when `poDaemon` and the `setsid`
+  # wrapper below were combined. A process freshly spawned by
+  # `startProcess` WITHOUT `poDaemon` always inherits the PARENT's PGID
+  # (never its own PID) on both backends, so it is never already a leader,
+  # so `setsid`'s inner call always succeeds cleanly — this is why
+  # `poDaemon` is deliberately NOT in the options set below, and doing so
+  # is backend-independent by construction: it does not matter whether
+  # `startProcess` used `posix_spawn` or fork/exec internally.
+  when defined(posix):
+    let setsidPath = findExe("setsid")
+  var spawnExe = exe
+  var spawnArgs = args
+  when defined(posix):
+    if setsidPath.len > 0:
+      # Graceful degradation (same policy as this repo's MSVC C23 gate): if
+      # `setsid` isn't on PATH (unusual on Linux — it ships in util-linux,
+      # present on every image this repo targets — but some minimal/non-
+      # Linux POSIX system might lack it), fall through to the plain,
+      # unwrapped `exe`. `p` then simply keeps whatever group it inherits
+      # (ours), and `killProcessTree`'s getpgid guard correctly refuses to
+      # `killpg` in that case (see its doc comment), falling back to its
+      # always-run single-PID `kill` — a real but bounded degradation (a
+      # grandchild could keep the pipe open), never a crash and never a
+      # self-kill hazard.
+      spawnArgs = @[exe] & args
+      spawnExe = setsidPath
+  var p = startProcess(spawnExe, args = spawnArgs,
+                        options = {poStdErrToStdOut, poUsePath})
   var chan: Channel[ReaderMsg]
   chan.open()
   var thr: Thread[ReaderArgs]
