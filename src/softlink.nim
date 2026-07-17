@@ -1319,6 +1319,19 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       newStmtList(newNimNode(nnkReturnStmt).add(cachedResultName))
     )))
 
+    # #20: past the idempotent-cache gate above, this is a genuine fresh
+    # load ATTEMPT (first-ever load, or a retry after a prior attempt
+    # unwound `handle` back to nil — e.g. a required-symbol drift refusal,
+    # C4c). Reset `softlinkDriftStories<Base>` here so a run of repeated
+    # failed loadXxx() calls can't accumulate one stale entry per attempt
+    # forever; unloadXxx (below) resets the same seq for the "explicitly
+    # unloaded" path, so between the two, the seq only ever holds stories
+    # from the CURRENT attempt. Guarded on the same condition as the var's
+    # own declaration above — a no-op statement would otherwise reference a
+    # var that was never declared when neither candidate list is populated.
+    if driftCandidates.len > 0 or requiredDriftCandidates.len > 0:
+      loadBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
+
     # handle = loadLibPattern(pattern)
     loadBody.add(newAssignment(handleName, newCall(ident("loadLibPattern"), libPatternLit)))
 
