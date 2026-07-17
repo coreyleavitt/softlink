@@ -112,6 +112,22 @@ proc parseIntervalArray(node: JsonNode, path, cname, key: string): seq[VersionIn
     if ivNode.hasKey("hi"): iv.hi = expectStr(ivNode["hi"], path, ivPath & ".hi")
     result.add iv
 
+const maxManifestBytes* = 8 * 1024 * 1024
+  ## Finding R2-5: `maxManifestBreadth` below only bounds
+  ## `symbols.len * corpus.len` — it says nothing about intervals-PER-cell,
+  ## so a manifest with a single symbol and a single corpus entry but
+  ## millions of `verified`/`absent`/... interval objects packed into that
+  ## one cell evades it entirely, while `parseJson` (which runs before any
+  ## breadth check gets a chance to reject anything) still has to build a
+  ## `JsonNode` tree over the whole hostile input. Parsing dominates and
+  ## runs first, so the correct place to cap is the raw byte length, BEFORE
+  ## `parseJson` ever sees the text — not by further extending the F16
+  ## count cap, which can't see cost that hasn't happened yet. 8 MiB is
+  ## generous (a real `<lib>.compat.json` — even for a sprawling library
+  ## harvested across a large corpus — is at most a few hundred KB of JSON)
+  ## but finite, so a deliberately-inflated or corrupted manifest is
+  ## rejected up front instead of driving a multi-megabyte-or-larger parse.
+
 const maxManifestBreadth = 1_000_000
   ## Finding F16: `validateDisjointExhaustive` is
   ## O(symbols.len * corpus.len * FactKind.len * intervals-per-cell) with no
@@ -197,6 +213,16 @@ proc parseManifest*(jsonText, path: string): CompatManifest =
   ## `CompatManifest`. Raises `ManifestError` — never returns a partially-
   ## populated manifest — on any structurally malformed input, per §B.3's
   ## "never a silent partial read".
+  ##
+  ## Finding R2-5: the raw-byte size cap runs FIRST, before
+  ## `checkNoDuplicateKeys`'s token walk or `parseJson` itself — both are
+  ## already O(input size), so rejecting an oversized input here is the one
+  ## place that actually bounds the cost of everything below it.
+  if jsonText.len > maxManifestBytes:
+    raise newException(ManifestError, "softlink: compat manifest " & path &
+      ": " & $jsonText.len & " bytes exceeds the " & $maxManifestBytes &
+      "-byte cap -- refusing to parse (finding R2-5); a genuine compat " &
+      "manifest is orders of magnitude smaller than this")
   checkNoDuplicateKeys(jsonText, path)
 
   var j: JsonNode
