@@ -58,4 +58,4 @@ suite "Drift refusal disabled per-block (RFC-0001 C4c) — compatManifest(refuse
     let c = testlibCompat()
     check c.attestation == atAttested
     check c.runtimeVersion == "4.0.0"
-    check not c.missing.anyIt(it.reason == mrDriftRefused)
+    check not c.missingReasons.anyIt(it.reason == mrDriftRefused)

@@ -72,12 +72,12 @@ suite "CompatReport degradation (RFC-0001 C5) — no probe, manifest attached (c
     # refusal machinery never runs without a probed version to reason
     # about (RFC-0001 §C.2: "no probe... degrades field-by-field to
     # empty" applies to the WHOLE report, not just attestation/version).
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
 
   test "unload resets to the identical zero state (nothing to reset FROM, in this mode)":
     unloadTestlib()
     let c = testlibCompat()
     check c.attestation == atNoProbe
     check c.runtimeVersion == ""
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
     check not testlibLoaded()

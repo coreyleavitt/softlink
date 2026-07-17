@@ -49,26 +49,37 @@ type
       discard
 
   Attestation* = enum
-    ## RFC-0001 §C.2, slice C2: `CompatReport.attestation` — five
-    ## diagnostically distinct "how much do we trust this runtime" states,
-    ## kept apart so a caller never has to infer "no information" from the
-    ## absence of some other field (`atUnattested` collapsing `atNoManifest`
-    ## and "probed but not in corpus" was the round-2 mistake the RFC
-    ## itself calls out).
-    atNoProbe      ## block declares no versionProbe, OR the probe never
-                   ## ran (the load failed in Phase 1, before Phase 3/the
-                   ## probe ever executed) — the zero value, by construction
-                   ## the default for a freshly zero-initialized `CompatReport`.
+    ## RFC-0001 §C.2, slice C2 (finding #11 split C2 into six): `CompatReport
+    ## .attestation` — six diagnostically distinct "how much do we trust this
+    ## runtime" states, kept apart so a caller never has to infer "no
+    ## information" from the absence of some other field (`atUnattested`
+    ## collapsing `atNoManifest` and "probed but not in corpus" was the
+    ## round-2 mistake the RFC itself calls out; `atNoProbe` collapsing "no
+    ## probe, ever" with "probe declared, hasn't run yet" was finding #11's
+    ## own instance of the same mistake).
+    atNoProbe      ## PERMANENT, structural: this block declares no
+                   ## `versionProbe` at all. True for the lifetime of the
+                   ## block; never transitions to any other value. The zero
+                   ## value, by construction the default for a freshly
+                   ## zero-initialized `CompatReport` in a probe-less block.
+    atProbeNotRun  ## TRANSIENT: this block DOES declare a `versionProbe`,
+                   ## but it has not (yet) run — before the block's first
+                   ## `loadX` call, after `unloadX()`, or after a load that
+                   ## failed in Phase 1/Phase 2 (before Phase 3/the probe
+                   ## ever executed). A later successful-enough load
+                   ## replaces this with `atProbeFailed`/`atNoManifest`/
+                   ## `atOutOfCorpus`/`atAttested`, whichever applies.
     atProbeFailed  ## probe ran and raised, or returned an unparseable string
     atNoManifest   ## probe ok, but no compatManifest attached to check against
     atOutOfCorpus  ## probed version outside the manifest's harvested corpus
     atAttested     ## probed version inside the manifest's harvested corpus
 
   MissingReason* = enum
-    ## RFC-0001 §C.2: why one `CompatReport.missing` symbol didn't resolve.
-    ## The type is defined now (public surface); the partition that
-    ## populates `missing` is later slices — C3 (`mrExpected`/`mrAnomalous`)
-    ## and C4b/C4c (`mrDriftRefused`). Slice C2 itself never adds an entry.
+    ## RFC-0001 §C.2: why one `CompatReport.missingReasons` symbol didn't
+    ## resolve. The type is defined now (public surface); the partition that
+    ## populates `missingReasons` is later slices — C3 (`mrExpected`/
+    ## `mrAnomalous`) and C4b/C4c (`mrDriftRefused`). Slice C2 itself never
+    ## adds an entry.
     mrExpected      ## manifest/since: this runtime predates the symbol
     mrAnomalous     ## this version's headers declare it, yet it did not resolve
     mrDriftRefused  ## resolved, but refused for known signature drift (§C.3)
@@ -79,14 +90,22 @@ type
     ## weight on every non-attestation-relevant failure kind). Written on
     ## EVERY `loadX` return path (including the Phase-1 early returns, which
     ## do not write the cached `LoadResult`); `unloadX` resets it to this
-    ## type's zero value (`atNoProbe`, `""`, `@[]`) alongside its other
-    ## pointer/cache resets — `fooCompat()` after `unloadFoo()` must never
-    ## serve a previous load's trust signals. `verifyProcs` generates no
-    ## `fooCompat` at all (no runtime footprint, consistent with its
-    ## `versionProbe` rejection).
+    ## block's OWN zero state (finding #11: `atProbeNotRun` if this block
+    ## declares a `versionProbe`, `atNoProbe` if it doesn't — never `""`/
+    ## `@[]` fields on their own, always alongside `runtimeVersion: ""` and
+    ## `missingReasons: @[]`) alongside its other pointer/cache resets —
+    ## `fooCompat()` after `unloadFoo()` must never serve a previous load's
+    ## trust signals. `verifyProcs` generates no `fooCompat` at all (no
+    ## runtime footprint, consistent with its `versionProbe` rejection).
+    ##
+    ## `missingReasons` (finding #12; was `missing` through slice C2 —
+    ## renamed to stop colliding, in name only, with the differently-typed
+    ## `LoadResult.missing: seq[string]` a caller frequently holds
+    ## alongside this report) partitions *why* each symbol in
+    ## `LoadResult.missing` didn't resolve — see `MissingReason` above.
     runtimeVersion*: string   ## "" unless the probe succeeded
     attestation*: Attestation
-    missing*: seq[tuple[symbol: string, reason: MissingReason]]
+    missingReasons*: seq[tuple[symbol: string, reason: MissingReason]]
 
 # Exported because macro-generated wrapper procs call this by ident at the call site.
 proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
@@ -127,7 +146,7 @@ proc computeMissingPartition(symbols: seq[SymbolFacts], missingSymbols: seq[stri
                               seq[tuple[symbol: string, reason: MissingReason]] =
   ## RFC-0001 §9/§C.2, slice C3: the runtime bridge between the pure
   ## `softlink/manifest.classifyAbsence` (facts + version + since ->
-  ## `AbsenceClass`) and `CompatReport.missing`'s `MissingReason`. Called
+  ## `AbsenceClass`) and `CompatReport.missingReasons`'s `MissingReason`. Called
   ## once per successful, manifest-attested `loadX` (bound via `bindSym`
   ## from generated code, like `parseVersion`/`isSome` above it — no
   ## export needed, `bindSym` resolves in THIS module's own scope) — only
@@ -1894,8 +1913,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # alongside `softlinkHandle<Base>`/`softlinkResult<Base>` above, same
   # convention. Unlike the probe state vars just below, this one is
   # emitted UNCONDITIONALLY: `fooCompat()` is generated for every dynlib
-  # block (a probe-less block's query proc simply always returns this
-  # var's zero value, `atNoProbe`).
+  # block. Its initial value depends on `hasProbe` (finding #11, computed
+  # further below): a probe-less block's query proc always returns the
+  # var's bare zero value, `atNoProbe`; a probe-bearing block's initial
+  # value is explicitly set to `atProbeNotRun` once `hasProbe` is known
+  # (see the assignment right after the probe state vars below).
   let compatReportName = ident("softlinkCompatReport" & baseName)
   let libPatternLit = newStrLitNode(resolvedPattern)
   # RFC-0001 §9/§C.1, slice C1b: the probe's outcome state (read by C2's
@@ -1934,9 +1956,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ## RFC-0001 §9/§C.2: build one `CompatReport(...)` object-constructor
     ## node — a closure only in spirit (no captures), grouped here purely
     ## so every report shape in `loadXxx`/`unloadXxx` below goes through one
-    ## place. `fields` omitted entirely means every field takes its
-    ## zero-value default (`""`, `atNoProbe`, `@[]`) — the report's zero
-    ## state.
+    ## place. `fields` omitted entirely means every OTHER field takes its
+    ## zero-value default (`""`, `@[]`) — callers wanting the block's own
+    ## "probe hasn't run" state (finding #11: `atProbeNotRun` if this block
+    ## has a probe, else bare `atNoProbe`) pass that explicitly via
+    ## `probeNotRunFields()` below rather than relying on the bare enum
+    ## zero value, which is only ever correct for probe-less blocks.
     result = newNimNode(nnkObjConstr).add(ident("CompatReport"))
     for (fieldName, valNode) in fields:
       result.add(newNimNode(nnkExprColonExpr).add(ident(fieldName), valNode))
@@ -1973,10 +1998,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ##     any function pointer was assigned): unwindStmt(unloadHandle = true,
     ##     resultKind = ident("lrSymbolNotFound"),
     ##     resultFields = @[("symbol", symName)])
-    ## Both currently pass `reportFields = @[]` (the zero-state report is
-    ## correct pre-first-load / right after unloadX resets state) — already
-    ## threaded through so C4c can pass a non-empty (drift-story) report
-    ## without touching this proc.
+    ## Both pass `reportFields = probeNotRunFields()` (finding #11: the
+    ## block's own "probe hasn't run" state — `atProbeNotRun` if this block
+    ## declares a `versionProbe`, otherwise the bare zero-value `atNoProbe`
+    ## — is correct pre-first-load / right after unloadX resets state, and
+    ## is exactly as correct after a Phase-1 early-fail, since Phase 3/the
+    ## probe never ran either way) — already threaded through so C4c can
+    ## pass a non-empty (drift-story) report without touching this proc.
     ##
     ## RFC-0001 §C.3, slice C4c: a THIRD shape is now wired, additively —
     ## the post-probe REQUIRED-symbol drift-refusal unwind (see the
@@ -1984,7 +2012,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     ## `atAttested` branch of `loadXxx`): unwindStmt(unloadHandle = true,
     ## resultKind = ident("lrSymbolNotFound"), resultFields = @[("symbol",
     ## symName)], reportFields = @[("runtimeVersion", ...), ("attestation",
-    ## ident("atAttested")), ("missing", ...)], resetPtrs = <every proc's
+    ## ident("atAttested")), ("missingReasons", ...)], resetPtrs = <every proc's
     ## ptrName in this block>, resetProbeState = true). Firing later in the
     ## pipeline than the other two shapes (after Phase 3 has assigned every
     ## pointer and the probe has run) is exactly why the two NEW leading
@@ -2085,11 +2113,15 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     )
   ))
 
-  # var compatReport: CompatReport — RFC-0001 §9/§C.2: zero-initializes to
-  # the zero state (atNoProbe, "", @[]), which is exactly right before the
-  # first load (mirrors `cachedResult` above). Emitted for EVERY dynlib
-  # block, unlike the probe state vars further below — `fooCompat()` is
-  # generated unconditionally (see its emission point near `xxxLoaded*`).
+  # var compatReport: CompatReport — RFC-0001 §9/§C.2: bare zero-initializes
+  # to `atNoProbe`, `""`, `@[]` here (mirrors `cachedResult` above); a
+  # PROBE-BEARING block's initial value is then corrected to `atProbeNotRun`
+  # (finding #11) by an explicit assignment emitted once `hasProbe` is known
+  # (below, right after the probe state vars) — a probe-less block needs no
+  # such correction, since `atNoProbe` IS its permanent, correct value.
+  # Emitted for EVERY dynlib block, unlike the probe state vars further
+  # below — `fooCompat()` is generated unconditionally (see its emission
+  # point near `xxxLoaded*`).
   result.add(newNimNode(nnkVarSection).add(
     newNimNode(nnkIdentDefs).add(
       compatReportName,
@@ -2203,6 +2235,28 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       newNimNode(nnkIdentDefs).add(probeFailedName, ident("bool"), newEmptyNode())))
     result.add(newNimNode(nnkVarSection).add(
       newNimNode(nnkIdentDefs).add(loadInProgressName, ident("bool"), newEmptyNode())))
+
+  proc probeNotRunFields(): seq[(string, NimNode)] =
+    ## RFC-0001 §C.2, finding #11: the report shape that means "this
+    ## block's probe (if any) has not run" — used at every site that needs
+    ## the pre-first-load / post-Phase-1-early-fail / post-unloadX report:
+    ## `atProbeNotRun` when this block declares a `versionProbe` (transient
+    ## — a later successful-enough load overwrites it), or the bare
+    ## zero-value `atNoProbe` when it doesn't (permanent — that block never
+    ## writes any other attestation). A closure over `hasProbe`, mirroring
+    ## `assignCompatReportStmt`'s own closure-over-`compatReportName` style.
+    if hasProbe: @[("attestation", ident("atProbeNotRun"))]
+    else: @[]
+
+  # RFC-0001 §C.2, finding #11: correct `softlinkCompatReport<Base>`'s
+  # initial value for a probe-bearing block — the bare var declaration
+  # above already zero-initialized it to `atNoProbe`, which is right for a
+  # probe-less block but WRONG here (a probe-bearing block that hasn't
+  # loaded yet, or was just unloaded, must report `atProbeNotRun`, not the
+  # permanent-structural `atNoProbe`). A probe-less block needs no such
+  # correction and gets none — `probeNotRunFields()` returns `@[]` for it,
+  # an idempotent no-op re-assignment of the same bare zero value.
+  result.add(assignCompatReportStmt(probeNotRunFields()))
 
   # RFC-0001 §4 B.1: dump this block's probe facts (no-op unless
   # -d:softlinkDumpProbes=<dir> is given). `libPattern` (the macro's
@@ -2524,14 +2578,17 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # handle = loadLibPattern(pattern)
     loadBody.add(newAssignment(handleName, newCall(ident("loadLibPattern"), libPatternLit)))
 
-    # if handle.isNil: write the zero-state compat report (RFC-0001 §9/
-    # §C.2 — this Phase-1 early return happens only before the first ever
-    # load, or right after unloadX already reset the probe state vars to
-    # their own zero values, so the zero-state report IS the correct value
-    # here, not merely a placeholder) + return LoadResult(kind: lrLibNotFound)
+    # if handle.isNil: write this block's own "probe hasn't run" report
+    # (RFC-0001 §9/§C.2, finding #11 — `probeNotRunFields()`: `atProbeNotRun`
+    # if this block has a probe, else the bare zero-value `atNoProbe` — this
+    # Phase-1 early return happens only before the first ever load, or right
+    # after unloadX already reset the probe state vars to their own zero
+    # values, so this IS the correct value here, not merely a placeholder)
+    # + return LoadResult(kind: lrLibNotFound)
     loadBody.add(newIfStmt((
       newCall(ident("isNil"), handleName),
-      unwindStmt(unloadHandle = false, resultKind = ident("lrLibNotFound"))
+      unwindStmt(unloadHandle = false, resultKind = ident("lrLibNotFound"),
+                 reportFields = probeNotRunFields())
     )))
 
     # Collect temp sym names for deferred assignment
@@ -2561,11 +2618,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # let sym = handle.symAddr("name")
       loadBody.add(newLetStmt(tempSym, newCall(ident("symAddr"), handleName, symName)))
 
-      # if sym.isNil: unload + nil handle + zero-state compat report
-      # (RFC-0001 §9/§C.2 — same "probe never ran" reasoning as the
-      # lrLibNotFound early return above) + return lrSymbolNotFound
+      # if sym.isNil: unload + nil handle + this block's own "probe hasn't
+      # run" compat report (RFC-0001 §9/§C.2, finding #11 — same reasoning
+      # as the lrLibNotFound early return above) + return lrSymbolNotFound
       let cleanupBlock = unwindStmt(unloadHandle = true,
-        resultKind = ident("lrSymbolNotFound"), resultFields = @[("symbol", symName)])
+        resultKind = ident("lrSymbolNotFound"), resultFields = @[("symbol", symName)],
+        reportFields = probeNotRunFields())
       loadBody.add(newIfStmt((newCall(ident("isNil"), tempSym), cleanupBlock)))
 
       syms.add(SymInfo(ptrName: p.ptrName, tempSym: tempSym, procTy: procTy, isOptional: false))
@@ -2719,7 +2777,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # `mrAnomalous`), computed AT MOST once per successful, manifest-
       # attested load — only when there is something to partition at all
       # (`hasOptional`; a block with no optional procs can never have a
-      # `missing` entry). Deliberately NOT gated on atAttested-vs-
+      # `missingReasons` entry). Deliberately NOT gated on atAttested-vs-
       # atOutOfCorpus: the manifest's header-fact INTERVALS (§B.3) are
       # ranges, independent of whether `probedVersion` is a literally-
       # harvested corpus point — that literal-membership question is what
@@ -2747,7 +2805,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           newLit(sinceVersions),
           probedVersionName
         ))
-        missingPartitionFields.add(("missing", missingPartitionSym))
+        missingPartitionFields.add(("missingReasons", missingPartitionSym))
 
       # RFC-0001 §C.3, slice C4b: drift refusal. Fires ONLY in the
       # atAttested branch below — policy: "refusal only on known
@@ -2812,11 +2870,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           newNimNode(nnkTupleConstr).add(
             newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
             newNimNode(nnkExprColonExpr).add(ident("story"), storyExpr))))
-        # RFC-0001 §C.3, slice C4c design guidance: the report's `missing`
-        # on a required refusal includes the C3 partition entries already
-        # computed for THIS load (more honest than a minimal one-entry
-        # report, and free — the partition was already computed above),
-        # plus this symbol's own `mrDriftRefused` entry.
+        # RFC-0001 §C.3, slice C4c design guidance: the report's
+        # `missingReasons` on a required refusal includes the C3 partition
+        # entries already computed for THIS load (more honest than a
+        # minimal one-entry report, and free — the partition was already
+        # computed above), plus this symbol's own `mrDriftRefused` entry.
         hitStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
           reqMissingSym,
           seqOfTupleType([("symbol", "string"), ("reason", "MissingReason")]),
@@ -2841,7 +2899,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           reportFields = @[
             ("runtimeVersion", versionSnapshotSym),
             ("attestation", ident("atAttested")),
-            ("missing", reqMissingSym)],
+            ("missingReasons", reqMissingSym)],
           resetPtrs = allPtrNames,
           resetProbeState = true))
         attestedStmts.add(newLetStmt(mismatchSym, newCall(bindSym("firstMismatchInterval"),
@@ -2880,12 +2938,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           attestedStmts.add(newIfStmt((
             prefix(newCall(ident("isNil"), p.ptrName), "not"),
             candBlock)))
-        # missingPartitionFields has exactly one entry, ("missing", <sym>),
-        # whenever driftCandidates is nonempty (its members are all
-        # optional, so hasOptional is necessarily true here too) — extend
-        # THAT node with `& driftPartitionSym` for this branch only.
+        # missingPartitionFields has exactly one entry,
+        # ("missingReasons", <sym>), whenever driftCandidates is nonempty
+        # (its members are all optional, so hasOptional is necessarily true
+        # here too) — extend THAT node with `& driftPartitionSym` for this
+        # branch only.
         let baseMissingNode = missingPartitionFields[0][1]
-        attestedMissingFields = @[("missing",
+        attestedMissingFields = @[("missingReasons",
           newNimNode(nnkInfix).add(ident("&"), baseMissingNode, driftPartitionSym))]
       attestedStmts.add(assignCompatReportStmt(@[
         ("runtimeVersion", probedVersionName),
@@ -3005,18 +3064,23 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # This is a behavior-preserving generalization, not a new runtime
     # effect, for every block reachable before C4c: every OTHER path that
     # leaves `handle` nil (the initial zero state; a Phase-1 early-fail,
-    # whose own `unwindStmt` call already writes the zero-state report
-    # directly) already has these vars at exactly these same zero values
-    # by the time unloadXxx would run, so re-assigning them here is an
-    # idempotent no-op in every one of those cases — only C4c's new
-    # non-zero-report-with-nil-handle state makes the distinction
-    # observable at all.
-    # RFC-0001 §9/§C.2: reset the compat report to its zero state —
-    # `fooCompat()` called after `unloadFoo()` must never serve a previous
-    # load's trust signals. Unconditional wrt `hasProbe` too, like the
-    # report var's own declaration (every dynlib block gets a report, not
-    # just probe-declaring ones) — unchanged from pre-C4c.
-    unloadBody.add(assignCompatReportStmt())
+    # whose own `unwindStmt` call already writes this block's own
+    # "probe hasn't run" report directly) already has these vars at
+    # exactly this same value by the time unloadXxx would run, so
+    # re-assigning them here is an idempotent no-op in every one of those
+    # cases — only C4c's new non-zero-report-with-nil-handle state makes
+    # the distinction observable at all.
+    # RFC-0001 §9/§C.2, finding #11: reset the compat report to this
+    # block's own "probe hasn't run" state — `atProbeNotRun` if this block
+    # declares a `versionProbe` (a reload will run it again), or the bare
+    # zero-value `atNoProbe` if it doesn't — via the same `probeNotRunFields
+    # ()` every other "not run yet" site uses. `fooCompat()` called after
+    # `unloadFoo()` must never serve a previous load's trust signals.
+    # Unconditional wrt `hasProbe` too, like the report var's own
+    # declaration (every dynlib block gets a report, not just
+    # probe-declaring ones) — unchanged from pre-C4c/pre-#11 in shape, only
+    # the probe-bearing block's actual VALUE differs now.
+    unloadBody.add(assignCompatReportStmt(probeNotRunFields()))
     if hasProbe:
       # RFC-0001 §9/§C.1: reset the probe's outcome alongside the report
       # above — `fooCompat()` (RFC-0001 §C.2) called after `unloadFoo()`
@@ -3043,7 +3107,9 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
   # xxxCompat*(): CompatReport — RFC-0001 §9/§C.2, slice C2: generated for
   # EVERY dynlib block, unconditionally (a probe-less block's query proc
-  # simply always returns the report var's zero value, `atNoProbe`).
+  # simply always returns the report var's permanent zero value,
+  # `atNoProbe`; a probe-bearing block's returns `atProbeNotRun` before its
+  # first load and after every unload — finding #11).
   # `verifyProcs` has no counterpart — see `CompatReport`'s own doc comment.
   let compatProcName = ident(baseNameLower & "Compat")
   result.add(newProc(

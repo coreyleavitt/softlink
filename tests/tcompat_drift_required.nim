@@ -81,7 +81,7 @@ suite "Drift refusal (RFC-0001 C4c) — required symbols":
       let c = testlibCompat()
       check c.attestation == atAttested
       check c.runtimeVersion == "4.0.0"
-      check (symbol: "testlib_gated", reason: mrDriftRefused) in c.missing
+      check (symbol: "testlib_gated", reason: mrDriftRefused) in c.missingReasons
       var caught: SoftlinkError
       try:
         discard testlib_gated()
@@ -102,7 +102,7 @@ suite "Drift refusal (RFC-0001 C4c) — required symbols":
     check testlib_gated() == 21
     let c = testlibCompat()
     check c.attestation == atAttested
-    check not c.missing.anyIt(it.reason == mrDriftRefused)
+    check not c.missingReasons.anyIt(it.reason == mrDriftRefused)
 
   test "out-of-corpus probe mode loads normally despite an unbounded mismatch interval":
     corpusProbeMode = cpmOutOfCorpus
@@ -115,7 +115,7 @@ suite "Drift refusal (RFC-0001 C4c) — required symbols":
     check c.attestation == atOutOfCorpus
     check c.runtimeVersion == "9.9.9"
 
-  test "unload after a refused load resets the report; reload at a verified version restores usability":
+  test "unload after a refused load resets the report to atProbeNotRun; reload at a verified version restores usability":
     if not driftRefusalOverridden:
       corpusProbeMode = cpmMismatch
       unloadTestlib()
@@ -123,10 +123,15 @@ suite "Drift refusal (RFC-0001 C4c) — required symbols":
       check not testlibLoaded()
       unloadTestlib()
       let zero = testlibCompat()
-      check zero.attestation == atNoProbe
-      check zero.missing.len == 0
+      # RFC-0001 §C.2, finding #11: this block DOES declare a versionProbe
+      # (above), so its post-unload state is the TRANSIENT `atProbeNotRun`
+      # (a reload will run the probe again) — never the permanent-
+      # structural `atNoProbe`, which would wrongly claim this block has no
+      # probe at all.
+      check zero.attestation == atProbeNotRun
+      check zero.missingReasons.len == 0
       corpusProbeMode = cpmVerified
       let r = loadTestlib()
       check r.kind == lrOk
       check testlib_gated() == 21
-      check not testlibCompat().missing.anyIt(it.reason == mrDriftRefused)
+      check not testlibCompat().missingReasons.anyIt(it.reason == mrDriftRefused)

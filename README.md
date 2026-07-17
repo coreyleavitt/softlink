@@ -390,8 +390,10 @@ proc z3Compat*(): CompatReport
 ```nim
 type
   Attestation* = enum
-    atNoProbe      ## no versionProbe declared, or the probe never ran
-                   ## (the load failed before symbols resolved)
+    atNoProbe      ## PERMANENT: this block declares no versionProbe at all
+    atProbeNotRun  ## TRANSIENT: a versionProbe IS declared, but hasn't run
+                   ## yet — before the first load, after unloadX(), or
+                   ## after a load that failed before symbols resolved
     atProbeFailed  ## probe ran and raised, or returned an unparseable string
     atNoManifest   ## probe succeeded, but no compatManifest is attached
     atOutOfCorpus  ## probed version outside the manifest's harvested corpus
@@ -400,10 +402,16 @@ type
   CompatReport* = object
     runtimeVersion*: string   ## "" unless the probe succeeded
     attestation*: Attestation
-    missing*: seq[tuple[symbol: string, reason: MissingReason]]
+    missingReasons*: seq[tuple[symbol: string, reason: MissingReason]]
 ```
 
-`missing` partitions *why* each symbol in `LoadResult.missing` didn't
+`atNoProbe` and `atProbeNotRun` are easy to conflate but mean different
+things: `atNoProbe` is a permanent, structural fact about the block (it
+never declared a probe, so it can never report anything else); `atProbeNotRun`
+is a transient fact about a block that *does* declare a probe, valid only
+until the next load attempt gives the probe a chance to actually run.
+
+`missingReasons` partitions *why* each symbol in `LoadResult.missing` didn't
 resolve, against the manifest's header facts:
 
 | `MissingReason` | Meaning |
@@ -412,9 +420,11 @@ resolve, against the manifest's header facts:
 | `mrAnomalous` | this version's headers declare it, yet it did not resolve |
 | `mrDriftRefused` | it resolved, but was refused for known signature drift |
 
-`unloadX()` resets the report to its zero value (`atNoProbe`, `""`, no
-missing entries) alongside its other resets — `fooCompat()` after
-`unloadFoo()` never serves a previous load's trust signals.
+`unloadX()` resets the report to this block's own "probe hasn't run" state
+(`atProbeNotRun` if a `versionProbe` is declared, `atNoProbe` if not; `""`
+runtime version, no `missingReasons` entries either way) alongside its
+other resets — `fooCompat()` after `unloadFoo()` never serves a previous
+load's trust signals.
 
 #### Drift refusal
 
@@ -479,7 +489,7 @@ let r = loadMylib()
 if r.kind in {lrOk, lrOkPartial}:
   let c = mylibCompat()
   echo c.attestation, " @ ", c.runtimeVersion
-  for (symbol, reason) in c.missing:
+  for (symbol, reason) in c.missingReasons:
     echo symbol, ": ", reason
 ```
 

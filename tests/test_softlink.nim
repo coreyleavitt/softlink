@@ -770,7 +770,7 @@ suite "softlink":
     let c = testlibCompat()
     check c.attestation == atNoManifest
     check c.runtimeVersion == "1.5"
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
     probeMode = pmNormal
 
   # TDD suite item 3 — reusing pmUnparseable (already proven to fail
@@ -783,13 +783,19 @@ suite "softlink":
     let c = testlibCompat()
     check c.attestation == atProbeFailed
     check c.runtimeVersion == ""
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
     probeMode = pmNormal
 
-  # TDD suite item 6: unloadTestlib() must reset fooCompat() to the zero
-  # report, and a subsequent reload must repopulate it — never serving a
-  # previous load's trust signals.
-  test "CompatReport: unloadTestlib resets to zero report; reload repopulates (item 6)":
+  # TDD suite item 6: unloadTestlib() must reset fooCompat() to this
+  # block's own "probe hasn't run" state, and a subsequent reload must
+  # repopulate it — never serving a previous load's trust signals.
+  # RFC-0001 §C.2, finding #11: TestLib's block DOES declare a
+  # `versionProbe` (see `dynlib TestLib:` above), so its post-unload
+  # zero-ish state is `atProbeNotRun` (transient — a reload will run the
+  # probe again), never the permanent-structural `atNoProbe` (reserved for
+  # blocks that declare no probe at all — see the "probe-less block stays
+  # atNoProbe" suite further below for that contrast).
+  test "CompatReport: unloadTestlib resets to atProbeNotRun; reload repopulates (item 6)":
     probeMode = pmNormal
     unloadTestlib()
     discard loadTestlib()
@@ -797,9 +803,9 @@ suite "softlink":
     check testlibCompat().runtimeVersion == "1.5"
     unloadTestlib()
     let zero = testlibCompat()
-    check zero.attestation == atNoProbe
+    check zero.attestation == atProbeNotRun
     check zero.runtimeVersion == ""
-    check zero.missing.len == 0
+    check zero.missingReasons.len == 0
     discard loadTestlib()
     let reloaded = testlibCompat()
     check reloaded.attestation == atNoManifest
@@ -835,12 +841,14 @@ suite "softlink":
 dynlib "libdefinitely_not_real.so":
   proc testlib_notreal(): cint {.cdecl, header: "tests/testlib.h".}
 
-# RFC-0001 §9/§C.2, slice C2 — TDD suite item 5: a versionProbe DECLARED on
-# a library that never loads. Phase 1 fails before Phase 3/the probe ever
-# runs, so `fooCompat()` must report the zero state (atNoProbe) — not a
-# fabricated atProbeFailed — per the judgment call recorded in the C2
-# handoff (softlink.nim's loadX codegen: the Phase-1 early-return report
-# writes are always the zero-field form, regardless of hasProbe).
+# RFC-0001 §9/§C.2, slice C2 — TDD suite item 5, revised for finding #11: a
+# versionProbe DECLARED on a library that never loads. Phase 1 fails before
+# Phase 3/the probe ever runs, so `fooCompat()` must report `atProbeNotRun`
+# (the probe exists but hasn't run yet — transient, not the permanent
+# `atNoProbe`) — not a fabricated `atProbeFailed` — per the judgment call
+# recorded in the C2 handoff (softlink.nim's loadX codegen: the Phase-1
+# early-return report writes always use `probeNotRunFields()`, never a
+# fabricated post-probe classification, regardless of `hasProbe`).
 dynlib "libdefinitely_not_real_c2.so":
   proc testlib_notreal_c2(): cint {.cdecl, header: "tests/testlib.h".}
   versionProbe:
@@ -943,27 +951,38 @@ suite "softlink — error paths":
 
   # RFC-0001 §9/§C.5 — degradation matrix, cell 3 ("neither" — no
   # versionProbe, no compatManifest at all, the plain pre-Stage-C shape):
-  # `definitelyNotRealC2Compat` (directly below) already pins this for a
-  # block that DOES declare a probe but never reaches it (Phase 1 fails
-  # first). The genuinely probe-less/manifest-less `libdefinitely_not_real.so`
-  # block above must degrade identically after a failed load — zero
-  # report, unconditionally, exactly like every other return path.
+  # `definitelyNotRealC2Compat` (directly below) pins the DIFFERENT,
+  # finding-#11 outcome for a block that DOES declare a probe but never
+  # reaches it (Phase 1 fails first) — `atProbeNotRun`, not `atNoProbe`. The
+  # genuinely probe-less/manifest-less `libdefinitely_not_real.so` block
+  # above is this test's own control: it degrades to the PERMANENT
+  # `atNoProbe`, unconditionally, exactly like every other return path.
   test "CompatReport: zero report (atNoProbe) after a failed load, no probe declared at all":
     check loadDefinitelyNotReal().kind == lrLibNotFound
     let c = definitelyNotRealCompat()
     check c.attestation == atNoProbe
     check c.runtimeVersion == ""
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
 
-  # RFC-0001 §9/§C.2, slice C2 — TDD suite item 5: fooCompat() after a
-  # FAILED load, even with a versionProbe declared on the block, must
-  # report the zero state — the probe never got a chance to run.
-  test "CompatReport: zero report (atNoProbe) after a failed load, even with a probe declared":
+  # RFC-0001 §9/§C.2, slice C2 — TDD suite item 5, revised for finding #11:
+  # fooCompat() on a block that DOES declare a versionProbe must report
+  # `atProbeNotRun` — both in its pristine, never-loaded state (this block
+  # is touched nowhere else in this file, so `definitelyNotRealC2Compat()`
+  # below observes it genuinely untouched) and after a FAILED load (Phase 1
+  # fails before Phase 3/the probe ever runs) — `atProbeNotRun` is
+  # TRANSIENT, distinct from the permanent-structural `atNoProbe` the
+  # probe-less sibling test above pins for `libdefinitely_not_real.so`.
+  test "CompatReport: atProbeNotRun before load and after a failed load, when a probe IS declared":
+    block:
+      let c = definitelyNotRealC2Compat()
+      check c.attestation == atProbeNotRun
+      check c.runtimeVersion == ""
+      check c.missingReasons.len == 0
     check loadDefinitelyNotRealC2().kind == lrLibNotFound
     let c = definitelyNotRealC2Compat()
-    check c.attestation == atNoProbe
+    check c.attestation == atProbeNotRun
     check c.runtimeVersion == ""
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
 
 when defined(linux):
   suite "softlink — angle-bracket includes":
@@ -1043,7 +1062,7 @@ suite "CompatReport degradation (RFC-0001 C5) — unloadX on a never-loaded bloc
     let c = magicCompat()
     check c.attestation == atNoProbe
     check c.runtimeVersion == ""
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
     # A subsequent, real load still works — the no-op unload didn't
     # corrupt anything.
     check loadMagic().kind == lrOk
@@ -1066,19 +1085,19 @@ suite "CompatReport (RFC-0001 C2) — probe-less block stays atNoProbe":
       let c = magicCompat()
       check c.attestation == atNoProbe
       check c.runtimeVersion == ""
-      check c.missing.len == 0
+      check c.missingReasons.len == 0
     check loadMagic().kind == lrOk
     block:
       let c = magicCompat()
       check c.attestation == atNoProbe
       check c.runtimeVersion == ""
-      check c.missing.len == 0
+      check c.missingReasons.len == 0
     unloadMagic()
     block:
       let c = magicCompat()
       check c.attestation == atNoProbe
       check c.runtimeVersion == ""
-      check c.missing.len == 0
+      check c.missingReasons.len == 0
     discard loadMagic()
 
 

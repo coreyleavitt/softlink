@@ -114,7 +114,7 @@ suite "CompatReport (RFC-0001 C2) — manifest attached, in/out of corpus (item 
     # ignorance. testlib_future_nv's since ("9.5.0") does not cover "9.9.9"
     # either (9.9.9 >= 9.5.0) -- no entry from since. Both missing
     # symbols, therefore, contribute nothing to the partition here.
-    check c.missing.len == 0
+    check c.missingReasons.len == 0
     # RFC-0001 §C.3/§C.4b policy test: "9.9.9" ALSO falls inside
     # testlib_gated's unbounded `mismatch` interval (lo: "4.0.0") -- but
     # refusal fires ONLY on a KNOWN (attested) mismatch; an out-of-corpus
@@ -133,14 +133,14 @@ suite "CompatReport (RFC-0001 C3) — absence partition":
     unloadTestlib()
     discard loadTestlib()
     let c = testlibCompat()
-    check (symbol: "testlib_future", reason: mrAnomalous) in c.missing
+    check (symbol: "testlib_future", reason: mrAnomalous) in c.missingReasons
 
   test "missing symbol, probed version in an absent interval -> mrExpected":
     corpusProbeMode = cpmAbsentInterval
     unloadTestlib()
     discard loadTestlib()
     let c = testlibCompat()
-    check (symbol: "testlib_future", reason: mrExpected) in c.missing
+    check (symbol: "testlib_future", reason: mrExpected) in c.missingReasons
 
   test "probed version unknown-classified for this symbol -> no entry (honest ignorance)":
     corpusProbeMode = cpmUnknownInterval
@@ -150,21 +150,21 @@ suite "CompatReport (RFC-0001 C3) — absence partition":
     let c = testlibCompat()
     check c.attestation == atAttested
     check c.runtimeVersion == "3.0.0"
-    check not c.missing.anyIt(it.symbol == "testlib_future")
+    check not c.missingReasons.anyIt(it.symbol == "testlib_future")
 
   test "{.since.} alone contributes mrExpected when facts don't cover the probed version":
     corpusProbeMode = cpmVerifiedInterval  # "2.0.0" -- well short of since: "9.5.0"
     unloadTestlib()
     discard loadTestlib()
     let c = testlibCompat()
-    check (symbol: "testlib_future_nv", reason: mrExpected) in c.missing
+    check (symbol: "testlib_future_nv", reason: mrExpected) in c.missingReasons
 
   test "resolved symbols never appear in the partition":
     corpusProbeMode = cpmVerifiedInterval
     unloadTestlib()
     discard loadTestlib()
     let c = testlibCompat()
-    check not c.missing.anyIt(it.symbol == "testlib_add")
+    check not c.missingReasons.anyIt(it.symbol == "testlib_add")
 
   test "partition is mutually exclusive: each missing symbol appears at most once":
     corpusProbeMode = cpmVerifiedInterval
@@ -172,7 +172,7 @@ suite "CompatReport (RFC-0001 C3) — absence partition":
     discard loadTestlib()
     let c = testlibCompat()
     var seen: seq[string] = @[]
-    for entry in c.missing:
+    for entry in c.missingReasons:
       check entry.symbol notin seen
       seen.add entry.symbol
 
@@ -180,9 +180,9 @@ suite "CompatReport (RFC-0001 C3) — absence partition":
     corpusProbeMode = cpmVerifiedInterval
     unloadTestlib()
     discard loadTestlib()
-    check testlibCompat().missing.len > 0
+    check testlibCompat().missingReasons.len > 0
     unloadTestlib()
-    check testlibCompat().missing.len == 0
+    check testlibCompat().missingReasons.len == 0
 
 # RFC-0001 §C.3, slice C4b: drift refusal for OPTIONAL symbols —
 # `testlib_gated` resolves at runtime but the fixture manifest records a
@@ -199,7 +199,7 @@ suite "CompatReport (RFC-0001 C4b) — drift refusal, optional symbols":
     check not testlib_gatedAvailable()
     let c = testlibCompat()
     check c.attestation == atAttested
-    check (symbol: "testlib_gated", reason: mrDriftRefused) in c.missing
+    check (symbol: "testlib_gated", reason: mrDriftRefused) in c.missingReasons
 
   test "wrapper raises SoftlinkError naming the symbol, interval, and refusal":
     corpusProbeMode = cpmMismatchInterval
@@ -224,7 +224,7 @@ suite "CompatReport (RFC-0001 C4b) — drift refusal, optional symbols":
     check testlib_gatedAvailable()
     check testlib_gated() == 21
     let c = testlibCompat()
-    check not c.missing.anyIt(it.symbol == "testlib_gated")
+    check not c.missingReasons.anyIt(it.symbol == "testlib_gated")
 
   test "no double-count: an already-absent symbol whose facts also carry " &
        "a mismatch interval at the probed version -> single mrAnomalous entry":
@@ -232,21 +232,24 @@ suite "CompatReport (RFC-0001 C4b) — drift refusal, optional symbols":
     unloadTestlib()
     discard loadTestlib()
     let c = testlibCompat()
-    let entries = c.missing.filterIt(it.symbol == "testlib_future")
+    let entries = c.missingReasons.filterIt(it.symbol == "testlib_future")
     check entries.len == 1
     check entries[0].reason == mrAnomalous
 
-  test "unload resets drift state; reload in a non-refusing mode restores usability":
+  test "unload resets drift state to atProbeNotRun; reload in a non-refusing mode restores usability":
     corpusProbeMode = cpmMismatchInterval
     unloadTestlib()
     discard loadTestlib()
     check not testlib_gatedAvailable()
     unloadTestlib()
     let zero = testlibCompat()
-    check zero.attestation == atNoProbe
-    check zero.missing.len == 0
+    # RFC-0001 §C.2, finding #11: this block declares a versionProbe
+    # (above), so post-unload is the TRANSIENT `atProbeNotRun`, not the
+    # permanent-structural `atNoProbe`.
+    check zero.attestation == atProbeNotRun
+    check zero.missingReasons.len == 0
     corpusProbeMode = cpmVerifiedInterval
     discard loadTestlib()
     check testlib_gatedAvailable()
     check testlib_gated() == 21
-    check not testlibCompat().missing.anyIt(it.symbol == "testlib_gated")
+    check not testlibCompat().missingReasons.anyIt(it.symbol == "testlib_gated")

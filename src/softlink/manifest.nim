@@ -397,7 +397,7 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
 type
   AbsenceClass* = enum
     ## RFC-0001 §C.2, slice C3: the pure classification behind the runtime
-    ## absence partition. `CompatReport.missing`'s `MissingReason` (defined
+    ## absence partition. `CompatReport.missingReasons`'s `MissingReason` (defined
     ## in `src/softlink.nim`, since it's a `dynlib`-facing public type) is
     ## NOT reused here directly — this module must stay macro-free and
     ## independently `unittest`-able, and `MissingReason` also carries
