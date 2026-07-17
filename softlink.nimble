@@ -61,7 +61,7 @@ proc validateProbeJson(path, expectKind, expectBaseName: string) =
 proc expectCompileFailure(cmd: string) =
   ## RFC-0001 slice A4: assert a compile FAILS by exit code alone. Every
   ## other tfail_* check in this file greps compiler/softlink output for a
-  ## specific diagnostic string via `exec cmd | grep -q ...` — `exec`
+  ## specific diagnostic string via `exec cmd | grep -Fq ...` — `exec`
   ## itself raises (failing the task) on a nonzero exit, so piping through
   ## a grep that succeeds exactly when the expected wording is present is
   ## how those checks turn "found the message" into "task step passes".
@@ -402,7 +402,7 @@ task test, "Run tests":
   # this file. That makes it portable to all four CI legs (gcc/g++/clang/
   # clang++/MSVC) by construction. Exercised under both `nim c` and `nim cpp`
   # (the `extern "C"` path is exactly what makes the C++ leg meaningful — see
-  # `emitPrototypeDecl`'s doc comment in src/softlink.nim).
+  # `emitPrototypeDecl`'s doc comment in src/softlink/verify.nim).
   const dupFailCheck = "nim c --path:src tests/tfail_duplicate_dynlib.nim"
   const gateFailCheck = "nim c --path:src --passC:-I. tests/tfail_verifywhen_mismatch.nim"
   # Finding #19.2: `gateFailCheck`'s fixture (tfail_verifywhen_mismatch.nim)
@@ -416,8 +416,8 @@ task test, "Run tests":
   # Finding #19.1: both `contraFailCheck` and `protoContraFailCheck` bind a
   # proc named "foo" and both of their respective macro errors contain the
   # bare word "contradicts" (`{.verifyWhen.} contradicts {.noverify.}` vs.
-  # `{.prototype.} contradicts {.noverify.}` — see src/softlink.nim's
-  # `parseProcPragmas`), so a bare `grep -q 'contradicts'` on either check
+  # `{.prototype.} contradicts {.noverify.}` — see src/softlink/pragmas.nim's
+  # `parseProcPragmas`), so a bare `grep -Fq 'contradicts'` on either check
   # can't tell which of the two contradictions actually fired — it would
   # still "pass" if the WRONG one fired. Each anchor below names the exact
   # pragma pair so the grep can only match its own fixture's diagnostic.
@@ -502,8 +502,8 @@ task test, "Run tests":
     ## must never appear is the malformed empty-string directive a
     ## missing `headerFile != ""` guard would produce.
     ##
-    ## This is an ABSENCE assertion, so (unlike every `grep -q` presence
-    ## check in this file) it can't just be `exec cmd | grep -q ...`: that
+    ## This is an ABSENCE assertion, so (unlike every `grep -Fq` presence
+    ## check in this file) it can't just be `exec cmd | grep -Fq ...`: that
     ## pattern makes the task FAIL when the string is absent, the opposite
     ## polarity of what's wanted here.
     ##
@@ -515,7 +515,7 @@ task test, "Run tests":
     ## looked identical to "inspected real files and found nothing bad";
     ## (2) the flat glob (`dir/*.c`) is NON-RECURSIVE, unlike the sibling
     ## presence checks on these same nimcache dirs (`expectAnchor`'s
-    ## `grep -rq`/`findstr /s`), so a nested nimcache subtree would silently
+    ## `grep -rFq`/`findstr /s`), so a nested nimcache subtree would silently
     ## go uninspected. Both are closed by enumerating files Nim-side via the
     ## existing recursive `walkGenSources` and reading them directly with
     ## `readFile` — no shell dump command, no OS split, and a hard failure
@@ -723,7 +723,7 @@ task test, "Run tests":
   # as tcheck_dump_probes.nim. tests/tcheck_probe_only_verifyprocs.nim
   # proves the identical mechanism through `verifyProcs` alone (suppression/
   # probing/existence classification lives once, in the shared
-  # `genVerifyBlock`, so both macros get it for free — see src/softlink.nim).
+  # `genVerifyBlock`, so both macros get it for free — see src/softlink/verify.nim).
   #
   # Verification is inspected DIRECTLY against softlink's own emitted C via
   # `walkGenSources`/`expectAnchor` below (NimScript's own `listDirs`/
@@ -744,7 +744,7 @@ task test, "Run tests":
   #      keeps BOTH symbols' verification, suppresses the other two procs.
   #   M8 -d:softlinkProbeOnly=testlib_add,<space>testlib_noop — pins this
   #      slice's whitespace-not-trimmed decision (see the `softlinkProbeOnly`
-  #      const's doc comment in src/softlink.nim): the untrimmed, space-
+  #      const's doc comment in src/softlink/verify.nim): the untrimmed, space-
   #      padded second element never equals any real C name, so it behaves
   #      as if absent from the list (fails closed) rather than matching.
   const probeOnlyM5 = "tests/nimcache_probeonly_m5"
@@ -852,6 +852,16 @@ task test, "Run tests":
     ## `windowLines` newlines, then `find` again for `decl` within that byte
     ## range) touches the same text without materializing a full line seq,
     ## and stays well under the VM budget.
+    ##
+    ## Finding R2-6: when fewer than `windowLines` newlines remain after
+    ## `anchor` (anchor near EOF, or the file has no trailing newline), the
+    ## inner loop used to `break` with `pos` still sitting at the last
+    ## newline it DID find, so `windowEnd` silently TRUNCATED the window
+    ## instead of extending it to EOF — a `decl` that appears after that
+    ## last newline but before EOF could never be found, a false FAILURE
+    ## (fail-safe direction, but still wrong). Snapping `pos` to `text.len`
+    ## when the newline search runs dry makes the window extend all the way
+    ## to EOF instead, matching grep -A's own end-of-file behavior.
     const windowLines = 5
     for f in walkGenSources(dir):
       let text = readFile(f)
@@ -863,7 +873,9 @@ task test, "Run tests":
         var nlCount = 0
         while nlCount < windowLines:
           let nlIdx = text.find('\n', pos)
-          if nlIdx < 0: break
+          if nlIdx < 0:
+            pos = text.len
+            break
           pos = nlIdx + 1
           inc nlCount
         let windowEnd = min(text.len, pos)
@@ -875,6 +887,36 @@ task test, "Run tests":
          "' to appear within " & $windowLines & " lines after a line " &
          "containing '" & anchor & "' in some generated file under " &
          dir & ", but no such adjacent pair was found")
+
+  proc runAdjacentPairEofRegressionCheck() =
+    ## Finding R2-6 regression test: synthesizes a tiny fixture "generated
+    ## source" file whose `anchor` sits close enough to EOF (and with NO
+    ## trailing newline) that fewer than `windowLines` newlines remain
+    ## after it — exactly the shape the finding describes as "currently
+    ## inert" in every REAL generated-C anchor `expectAdjacentPair` checks
+    ## elsewhere in this file (all mid-file). Before the R2-6 fix, the
+    ## inner loop left `pos`/`windowEnd` sitting at the last newline it did
+    ## find, so `decl` sitting on the FINAL, newline-less line was outside
+    ## `windowEnd` by construction — a false FAILURE. Worked by hand: the
+    ## single newline between `anchor`'s line and `decl`'s line is the only
+    ## one in the file, so the old code's `windowEnd` would equal `decl`'s
+    ## own start offset (`dIdx < windowEnd` false, not found); the R2-6 fix
+    ## snaps `pos` to `text.len` instead, so `windowEnd` covers the whole
+    ## file and the match succeeds. `expectAdjacentPair` reports failure by
+    ## calling `quit` itself, so simply calling it here and returning
+    ## normally IS the regression proof — no separate assertion needed.
+    const dir = "tests/nimcache_adjacentpair_eof_regression"
+    if dirExists(dir): rmDir(dir)
+    mkDir(dir)
+    let anchor = "REGRESSION_ANCHOR_R2_6"
+    let decl = "REGRESSION_DECL_R2_6"
+    # No trailing newline after `decl` -- the exact "anchor near EOF, file
+    # doesn't end with a newline" shape R2-6 names.
+    writeFile(dir & "/synthetic.c",
+      "line0\nline1\nline2\n" & anchor & "\n" & decl)
+    expectAdjacentPair(dir, anchor, decl,
+      "R2-6 regression: decl on the final, newline-less line after anchor")
+    rmDir(dir)
 
   proc runProbeOnlyChecks() =
     ## Compiles both probe-mode fixtures under every configuration the
@@ -955,7 +997,7 @@ task test, "Run tests":
     expectAnchor(probeOnlyM5, poProtoDeclAdd, "M5 probe-list(add,noop): testlib_add prototype decl", true)
 
     # M8: the whitespace-not-trimmed decision (see `softlinkProbeOnly`'s doc
-    # comment in src/softlink.nim) — a list element padded with a leading
+    # comment in src/softlink/verify.nim) — a list element padded with a leading
     # space is used VERBATIM, so it never equals the real C name and simply
     # never matches (fails closed), rather than being trimmed or rejected.
     exec cBase & probeOnlyM8 &
@@ -985,7 +1027,7 @@ task test, "Run tests":
     # Code-review finding F9 (Medium): a -d:softlinkProbeOnly name matching
     # NO proc in this block must emit a compile-time WARNING (never a
     # silent total suppression with no signal anything is wrong) — see
-    # genVerifyBlock's own doc comment in src/softlink.nim for why this is
+    # genVerifyBlock's own doc comment in src/softlink/verify.nim for why this is
     # a warning rather than a hard error (the define is GLOBAL to the whole
     # compilation; a module may legitimately contain multiple dynlib/
     # verifyProcs blocks, and a name targeting a DIFFERENT block correctly
@@ -1349,6 +1391,22 @@ task test, "Run tests":
     "nim c --compileOnly --path:src --expandMacro:dynlib tests/thint_noverify.nim"
   expectWrapperBeforeLoad(wrapperOrderCheck)
 
+  # Finding R2-6 regression check (see `runAdjacentPairEofRegressionCheck`'s
+  # own doc comment) — pure Nim-side, no compiler invoked, so it runs once,
+  # unconditionally, like `expectWrapperBeforeLoad` immediately above.
+  runAdjacentPairEofRegressionCheck()
+
+  # Findings R2-5 and #24(b)/(c)/(d) (code-review round 2): four standalone
+  # `std/unittest` fixtures, none needing a built testlib/libmagic/libvern
+  # (they only import `softlink/manifest` or `tools/harvest/harvest_cli`
+  # directly), so — like `tests/tharvest_cli.nim` — they run once,
+  # unconditionally, identically on every OS leg rather than being
+  # duplicated into all three `when`/`elif`/`else` branches below.
+  exec "nim c -r --path:src tests/tcov_manifest_bytecap.nim"
+  exec "nim c -r --path:src tests/tcov_manifest_shape_guards.nim"
+  exec "nim c -r --path:src tests/tcov_classify_absence_multi_pair.nim"
+  exec "nim c -r --path:src tests/tcov_harvest_cli_help_ordering.nim"
+
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   if dirExists(protoOnlyDir): rmDir(protoOnlyDir)
   when defined(windows):
@@ -1477,7 +1535,7 @@ task test, "Run tests":
     # already uses (POSIX `VAR=val cmd` syntax works the same way here).
     exec "DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I. tests/test_softlink.nim"
     exec "DYLD_LIBRARY_PATH=./tests nim cpp -r --path:src --passC:-I. tests/test_softlink.nim"
-    exec dupFailCheck & " 2>&1 | grep -q 'collides with an earlier dynlib block'"
+    exec dupFailCheck & " 2>&1 | grep -Fq 'collides with an earlier dynlib block'"
     exec gateFailCheck & " 2>&1 | grep -Fq '" & gateFailAnchor & "'"
     exec contraFailCheck & " 2>&1 | grep -Fq '" & contraFailAnchor & "'"
     exec protoContraFailCheck & " 2>&1 | grep -Fq '" & protoContraFailAnchor & "'"
@@ -1494,24 +1552,24 @@ task test, "Run tests":
     expectCompileFailure(vpProtoConflictCppCheck)
     # Code-review finding F4: {.optional.} rejection in verifyProcs, pinned
     # to its exact diagnostic wording.
-    exec vpOptionalFailCheck & " 2>&1 | grep -q \"" & vpOptionalFailAnchor & "\""
-    exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
-    exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
-    exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
-    exec reasonHintCheck & " 2>&1 | grep -q '(no justification)'"
-    exec reasonWarnCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Warning:'"
-    exec reasonWarnCheck & " 2>&1 | grep -q '(no justification)'"
-    exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
-    exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
+    exec vpOptionalFailCheck & " 2>&1 | grep -Fq \"" & vpOptionalFailAnchor & "\""
+    exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -Fq 'Hint:'"
+    exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -Fq 'Warning:'"
+    exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -Fq 'Hint:'"
+    exec reasonHintCheck & " 2>&1 | grep -Fq '(no justification)'"
+    exec reasonWarnCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -Fq 'Warning:'"
+    exec reasonWarnCheck & " 2>&1 | grep -Fq '(no justification)'"
+    exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Hint:'"
+    exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Warning:'"
     # RFC-0001 slice A8: verifyProcs parity analog of the A6 non-builtin
     # hint check directly above.
-    exec vpNonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
-    exec vpNonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
+    exec vpNonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Hint:'"
+    exec vpNonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Warning:'"
     exec protoEmitCheck
-    exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    exec "grep -rFq 'extern int testlib_protoonly(void);' " & protoEmitDir
     # RFC-0001 slice A8: verifyProcs parity analog of A2's dynlib
     # prototype-only emission proof directly above.
-    exec "grep -rq '" & vpProtoOnlyDecl & "' " & protoEmitDir
+    exec "grep -rFq '" & vpProtoOnlyDecl & "' " & protoEmitDir
     exec protoGateTrueCheck
     exec protoGateFalseCheck
     # RFC-0001 slice A8: verifyProcs parity analogs of the A5 true/false-gate
@@ -1534,7 +1592,7 @@ task test, "Run tests":
     rmDir(protoEmitDir)
     exec protoOnlyCheck
     expectNoEmptyInclude(protoOnlyDir)
-    exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
+    exec "grep -rFq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
     runDumpProbesCheck()
     # RFC-0001 §4 B.2: define-gated probe modes.
@@ -1542,8 +1600,8 @@ task test, "Run tests":
     exec probeMismatchExistenceSuccessCheck
     expectCompileFailure(probeAbsentCCheck)
     expectCompileFailure(probeAbsentCppCheck)
-    exec probeNoTargetUnsetCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
-    exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
+    exec probeNoTargetUnsetCheck & " 2>&1 | grep -Fq '" & probeNoTargetAnchor & "'"
+    exec probeNoTargetSentinelCheck & " 2>&1 | grep -Fq '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
     runCorpusChecks()
     runManifestChecks()
@@ -1558,7 +1616,7 @@ task test, "Run tests":
     exec "gcc -shared -fPIC -o tests/libvern.so.3 tests/testlib.c"
     exec "LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I. tests/test_softlink.nim"
     exec "LD_LIBRARY_PATH=./tests nim cpp -r --path:src --passC:-I. tests/test_softlink.nim"
-    exec dupFailCheck & " 2>&1 | grep -q 'collides with an earlier dynlib block'"
+    exec dupFailCheck & " 2>&1 | grep -Fq 'collides with an earlier dynlib block'"
     exec gateFailCheck & " 2>&1 | grep -Fq '" & gateFailAnchor & "'"
     exec contraFailCheck & " 2>&1 | grep -Fq '" & contraFailAnchor & "'"
     exec protoContraFailCheck & " 2>&1 | grep -Fq '" & protoContraFailAnchor & "'"
@@ -1575,7 +1633,7 @@ task test, "Run tests":
     expectCompileFailure(vpProtoConflictCppCheck)
     # Code-review finding F4: {.optional.} rejection in verifyProcs, pinned
     # to its exact diagnostic wording.
-    exec vpOptionalFailCheck & " 2>&1 | grep -q \"" & vpOptionalFailAnchor & "\""
+    exec vpOptionalFailCheck & " 2>&1 | grep -Fq \"" & vpOptionalFailAnchor & "\""
     # RFC-0001 slice A4, optional extra confidence (gcc/clang-gated only —
     # never on the Windows/MSVC branch above): also inspect the compiler's
     # own wording for the redeclaration conflict. Deliberately NOT required
@@ -1585,27 +1643,27 @@ task test, "Run tests":
     # gcc version, kept out of the required path since gcc's exact phrasing
     # ("conflicting types for ...") is not a stable cross-version/cross-
     # compiler contract the way softlink's own diagnostic strings are.
-    exec protoConflictCCheck & " 2>&1 | grep -q 'conflicting types for'"
+    exec protoConflictCCheck & " 2>&1 | grep -Fq 'conflicting types for'"
     # RFC-0001 slice A8: same optional gcc-gated wording sanity check, for
     # the verifyProcs conflict fixture.
-    exec vpProtoConflictCCheck & " 2>&1 | grep -q 'conflicting types for'"
-    exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Hint:'"
-    exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -q 'Warning:'"
-    exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Hint:'"
-    exec reasonHintCheck & " 2>&1 | grep -q '(no justification)'"
-    exec reasonWarnCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -q 'Warning:'"
-    exec reasonWarnCheck & " 2>&1 | grep -q '(no justification)'"
-    exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
-    exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
+    exec vpProtoConflictCCheck & " 2>&1 | grep -Fq 'conflicting types for'"
+    exec hintCheck & " 2>&1 | grep 'not header-verified' | grep -Fq 'Hint:'"
+    exec warnCheck & " 2>&1 | grep 'not header-verified' | grep -Fq 'Warning:'"
+    exec reasonHintCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -Fq 'Hint:'"
+    exec reasonHintCheck & " 2>&1 | grep -Fq '(no justification)'"
+    exec reasonWarnCheck & " 2>&1 | grep 'private symbol, no public header at any version' | grep -Fq 'Warning:'"
+    exec reasonWarnCheck & " 2>&1 | grep -Fq '(no justification)'"
+    exec nonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Hint:'"
+    exec nonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Warning:'"
     # RFC-0001 slice A8: verifyProcs parity analog of the A6 non-builtin
     # hint check directly above.
-    exec vpNonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Hint:'"
-    exec vpNonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -q 'Warning:'"
+    exec vpNonBuiltinHintCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Hint:'"
+    exec vpNonBuiltinWarnCheck & " 2>&1 | grep 'may need `header:` to resolve' | grep -Fq 'Warning:'"
     exec protoEmitCheck
-    exec "grep -rq 'extern int testlib_protoonly(void);' " & protoEmitDir
+    exec "grep -rFq 'extern int testlib_protoonly(void);' " & protoEmitDir
     # RFC-0001 slice A8: verifyProcs parity analog of A2's dynlib
     # prototype-only emission proof directly above.
-    exec "grep -rq '" & vpProtoOnlyDecl & "' " & protoEmitDir
+    exec "grep -rFq '" & vpProtoOnlyDecl & "' " & protoEmitDir
     exec protoGateTrueCheck
     exec protoGateFalseCheck
     # RFC-0001 slice A8: verifyProcs parity analogs of the A5 true/false-gate
@@ -1628,7 +1686,7 @@ task test, "Run tests":
     rmDir(protoEmitDir)
     exec protoOnlyCheck
     expectNoEmptyInclude(protoOnlyDir)
-    exec "grep -rq '" & protoOnlyDecl & "' " & protoOnlyDir
+    exec "grep -rFq '" & protoOnlyDecl & "' " & protoOnlyDir
     rmDir(protoOnlyDir)
     runDumpProbesCheck()
     # RFC-0001 §4 B.2: define-gated probe modes.
@@ -1636,8 +1694,8 @@ task test, "Run tests":
     exec probeMismatchExistenceSuccessCheck
     expectCompileFailure(probeAbsentCCheck)
     expectCompileFailure(probeAbsentCppCheck)
-    exec probeNoTargetUnsetCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
-    exec probeNoTargetSentinelCheck & " 2>&1 | grep -q '" & probeNoTargetAnchor & "'"
+    exec probeNoTargetUnsetCheck & " 2>&1 | grep -Fq '" & probeNoTargetAnchor & "'"
+    exec probeNoTargetSentinelCheck & " 2>&1 | grep -Fq '" & probeNoTargetAnchor & "'"
     runProbeOnlyChecks()
     runCorpusChecks()
     runManifestChecks()
@@ -1678,6 +1736,22 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
   expectCompileFailure("nim cpp" & vccFlags & "tests/tfail_prototype_conflict.nim")
   expectCompileFailure("nim c" & vccFlags & "tests/tfail_verifyprocs_prototype_conflict.nim")
   expectCompileFailure("nim cpp" & vccFlags & "tests/tfail_verifyprocs_prototype_conflict.nim")
+
+  # Finding #24(a) (code-review round 2 coverage gap): `task test`'s
+  # `probeAbsentCCheck`/`probeAbsentCppCheck` (RFC-0001 §4 B.2 — an
+  # existence probe of a symbol the header does NOT declare must FAIL) are
+  # exit-code-only checks, same mold as the four `expectCompileFailure`
+  # calls directly above -- a raw "undeclared identifier" compiler
+  # diagnostic, not softlink's own string -- yet they were never wired into
+  # this task, unlike the A4 prototype-conflict pair. Same fixture
+  # (tests/tfail_probe_existence_absent.nim) and defines as `task test`'s
+  # own consts, `--cc:vcc`/`/I.`/`/std:clatest` swapped in for gcc/`-I.`.
+  expectCompileFailure("nim c" & vccFlags &
+    "-d:softlinkProbeOnly=testlib_totally_absent -d:softlinkProbeExistence " &
+    "tests/tfail_probe_existence_absent.nim")
+  expectCompileFailure("nim cpp" & vccFlags &
+    "-d:softlinkProbeOnly=testlib_totally_absent -d:softlinkProbeExistence " &
+    "tests/tfail_probe_existence_absent.nim")
 
   # RFC-0001 slice B3: the harvester's calibration preflight must REFUSE
   # under MSVC's DEFAULT compile mode (`--cc:vcc`, no `/std:clatest`) — the
