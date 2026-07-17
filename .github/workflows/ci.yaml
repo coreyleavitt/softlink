@@ -94,6 +94,7 @@ jobs:
         if: matrix.cc == 'vcc'
         shell: cmd
         run: |
+          set PATH=%CD%\tests;%CD%\nim-2.2.0\bin;%PATH%
           nimble testMsvcExitCodes -y
 
       # RFC-0001 slice A9: previously this leg ran `nim c -r`/`nim cpp -r`
