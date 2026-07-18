@@ -581,7 +581,14 @@ proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string])
   ## matching `mismatchCNames` — this block's own symbols (required OR
   ## optional; required-symbol RUNTIME refusal is C4c's territory, but the
   ## call-safety risk this scan guards against exists for both) that carry
-  ## ANY `mismatch` interval in the attached manifest. The dot-call/UFCS
+  ## ANY `mismatch` interval in the attached manifest. This scan is
+  ## deliberately UNCONDITIONAL — unlike runtime refusal it is NOT lifted by
+  ## `refuse = false` / `-d:softlinkNoDriftRefusal` (code-review #10, resolved
+  ## Option A: keep unconditional, explain in the diagnostic). The escape
+  ## hatches relax how your APP treats drifted symbols; they say nothing about
+  ## whether the version-detection probe — which runs first and keys the whole
+  ## drift machinery — may itself rest on one. The error message spells this
+  ## out. The dot-call/UFCS
   ## form (`x.P(...)`, AST `Call(DotExpr(x, P), ...)`) is ALSO matched: the
   ## callee's `P` half is exactly as direct and exactly as detectable as
   ## the bare-ident form `P(x)` — UFCS is sugar, not an indirection, so
@@ -601,8 +608,16 @@ proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string])
             "', which has a recorded 'mismatch' interval in the attached " &
             "compat manifest — the version probe may only call symbols " &
             "with no known drift ranges (RFC-0001 §C.1: \"the probe must " &
-            "not be the drift\"); indirect calls cannot be detected " &
-            "statically and remain a documented residual risk", stmts)
+            "not be the drift\"). This is deliberately NOT suppressed by " &
+            "refuse = false or -d:softlinkNoDriftRefusal: those relax the " &
+            "RUNTIME refusal of drifted symbols in your own code, but the " &
+            "probe runs earlier — to determine the version the whole drift " &
+            "machinery is keyed on — so a probe built on a symbol of " &
+            "uncertain signature can misreport that version before any " &
+            "refusal policy could apply; its soundness stays unconditional. " &
+            "Read the version through a drift-free symbol instead. (Indirect " &
+            "calls cannot be detected statically and remain a documented " &
+            "residual risk.)", stmts)
       return true
   for child in stmts:
     if scanProbeBodyForDriftCalls(child, mismatchCNames):

@@ -1212,7 +1212,10 @@ task test, "Run tests":
     # calling a wrapper with NO mismatch interval (`testlib_add`, recorded
     # `verified`) compiles fine.
     expectManifestCompileFail(mcBase & "tests/tfail_probe_drift_call.nim",
-      ["the version probe may only call symbols with no known drift ranges"])
+      ["the version probe may only call symbols with no known drift ranges",
+       # #10 (Option A): the diagnostic must explain that this check is NOT
+       # lifted by the runtime-refusal escape hatches, and why.
+       "deliberately NOT suppressed by refuse = false or -d:softlinkNoDriftRefusal"])
 
     # Code-review finding F3: the UFCS/dot-call form of the same direct-call
     # scan (`x.testlib_add(2)`, callee `DotExpr(x, testlib_add)`) must be

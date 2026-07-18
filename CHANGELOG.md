@@ -4,6 +4,9 @@ All notable changes to softlink are documented here.
 
 ## [Unreleased]
 
+### Changed
+- The `versionProbe` drift-call compile error now explains that this check is deliberately **not** lifted by `refuse = false` / `-d:softlinkNoDriftRefusal`: those relax runtime refusal of drifted symbols in your own code, but the probe runs first — to determine the version the drift machinery is keyed on — so a probe resting on a symbol of uncertain signature could misreport that version before any refusal policy applies. Its soundness stays unconditional; the message now says so and points you at reading the version through a drift-free symbol (code review #10).
+
 ## [0.8.0] - 2026-07-17
 
 RFC-0001 **Verified Version Compat Set** — softlink learns to answer "will
