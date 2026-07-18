@@ -16,6 +16,13 @@ tests/tcompat_drift_refuse_false
 # RFC-0001 §9/§C.2, slice C5: tests/tcompat_degradation.nim's own runtime
 # binary (built by `runDegradationChecks` in the nimble test task).
 tests/tcompat_degradation
+# RFC-0001 code-review Lows (#24/R2-5): the tcov_* coverage fixtures are run
+# with `nim c -r` (unconditional block in the `test` task), leaving compiled
+# binaries next to their sources.
+tests/tcov_classify_absence_multi_pair
+tests/tcov_harvest_cli_help_ordering
+tests/tcov_manifest_bytecap
+tests/tcov_manifest_shape_guards
 # RFC-0001 slice B5: tests/tharvest.nim's drift-alarm exit-code integration
 # test compiles+runs the harvester CLI shim itself (`nim c -r
 # tools/harvest/harvester.nim ...`), which builds this binary in place.
