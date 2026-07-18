@@ -186,10 +186,16 @@ const
   calibAbsentSym = "calib_absent"
   calibMismatchedSym = "calib_mismatched"
 
-func defaultHarvestOptions*(): HarvestOptions =
+proc defaultHarvestOptions*(): HarvestOptions =
   ## gcc/clang-tuned defaults — the slice's required minimum leg. Callers
   ## targeting another toolchain (MSVC) override `extraFlags`/
   ## `includeFlagPrefix` explicitly; nothing here is auto-detected.
+  ##
+  ## `proc`, not `func`: `scratchDir: getTempDir()` reads the environment,
+  ## which Nim's effect analysis treats as a genuine side effect on Windows
+  ## (it infers it pure on POSIX, which is why a `func` here compiled on the
+  ## Linux/macOS legs but errored under MSVC). No caller uses it in a
+  ## `const`/compile-time context, so plain `proc` is the correct signature.
   HarvestOptions(
     nimPaths: @["src"],
     extraFlags: @["--passC:-Werror=implicit-function-declaration"],

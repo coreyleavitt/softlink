@@ -244,11 +244,16 @@ proc expectWrapperBeforeLoad(cmd: string) =
 proc corpusBaseName(path: string): string =
   ## Last path component of a NimScript `listDirs`/`listFiles` result
   ## (`"tests/corpus/1.0.0"` -> `"1.0.0"`). NimScript's directory walkers
-  ## consistently return forward-slash-joined paths on every OS this task
-  ## runs on (the existing `walkGenSources` helper above already relies on
-  ## the same assumption for `.c`/`.cpp` suffix checks), so a plain `rfind`
-  ## on `'/'` is enough — no `std/os` import needed.
-  let i = path.rfind('/')
+  ## return NATIVE-separator paths — forward slashes on POSIX, but
+  ## BACKslashes on Windows (`"tests\corpus\1.0.0"`) — so split on whichever
+  ## separator appears last rather than assuming `'/'` (that assumption made
+  ## every corpus version look absent on the Windows CI leg). `walkGenSources`
+  ## above is unaffected: it only does suffix `.c`/`.cpp` checks and re-feeds
+  ## whole paths back to `listDirs`/`listFiles`/`readFile`, all of which are
+  ## separator-agnostic — no `std/os` import needed here either.
+  var i = path.rfind('/')
+  let j = path.rfind('\\')
+  if j > i: i = j
   if i < 0: path else: path[i + 1 .. ^1]
 
 proc runCorpusChecks() =
