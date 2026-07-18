@@ -13,6 +13,6 @@
 ## compiler output. NOT compiled by the regular test suite.
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   proc testlib_protoonly(): cdouble
     {.cdecl, prototype: "int testlib_protoonly(void)".}

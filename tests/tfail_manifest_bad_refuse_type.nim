@@ -6,6 +6,6 @@
 ## NOT compiled by the regular test suite; see the `nimble test` task.
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   compatManifest("manifests/testlib.compat.json", refuse = "yes")
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}

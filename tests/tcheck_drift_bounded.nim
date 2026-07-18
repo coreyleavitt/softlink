@@ -20,7 +20,7 @@
 import std/unittest
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   compatManifest "manifests/testlib_drift_required.compat.json"
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   proc testlib_gated(): cint {.cdecl, header: "tests/testlib.h".}

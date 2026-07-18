@@ -47,7 +47,7 @@ type CorpusProbeMode = enum
 
 var corpusProbeMode = cpmVerified
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   compatManifest "manifests/testlib_drift_required.compat.json"
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   # testlib_gated: REQUIRED here (a separate module from C4b's own binding,

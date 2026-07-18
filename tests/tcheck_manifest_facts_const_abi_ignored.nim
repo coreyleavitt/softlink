@@ -14,7 +14,7 @@
 ## NOT compiled by the regular test suite; see the `nimble test` task.
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   compatManifest "manifests/testlib_abi_mismatch.compat.json"
   proc testlib_add(a: cint, b: cint): cint {.cdecl, since: "1.0.0", header: "tests/testlib.h".}
 

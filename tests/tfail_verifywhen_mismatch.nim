@@ -11,6 +11,6 @@
 ## NOT compiled by the regular test suite; see the `nimble test` task.
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   proc testlib_gated(): cdouble
     {.cdecl, verifyWhen: "TESTLIB_VERSION >= 1", header: "tests/testlib.h".}

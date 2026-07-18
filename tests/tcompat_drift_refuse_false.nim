@@ -26,7 +26,7 @@ type CorpusProbeMode = enum
 
 var corpusProbeMode = cpmVerified
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   compatManifest("manifests/testlib_refuse_false.compat.json", refuse = false)
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   proc testlib_gated(): cint {.cdecl, header: "tests/testlib.h".}

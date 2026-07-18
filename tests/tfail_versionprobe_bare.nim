@@ -7,6 +7,6 @@
 ## NOT compiled by the regular test suite; see the `nimble test` task.
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   versionProbe

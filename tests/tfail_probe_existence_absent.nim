@@ -20,5 +20,5 @@
 ## decltype tier). NOT compiled by the regular test suite.
 import softlink
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   proc testlib_totally_absent(): cint {.cdecl, header: "tests/testlib.h".}

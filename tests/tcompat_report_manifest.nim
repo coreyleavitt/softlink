@@ -55,7 +55,7 @@ type CorpusProbeMode = enum
 
 var corpusProbeMode = cpmVerifiedInterval
 
-dynlib "libtestlib.so":
+dynlib "testlib":
   compatManifest "manifests/testlib_compat_report.compat.json"
   proc testlib_add(a: cint, b: cint): cint {.cdecl, header: "tests/testlib.h".}
   # testlib_future: declared in tests/testlib.h, never implemented in
