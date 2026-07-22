@@ -50,6 +50,39 @@ func emitPrototypeDecl(prototype: string, verifyWhen: string): string =
       decl & "#endif /* softlink verifyWhen */\n"
   decl
 
+func emitVersionMacroGuards(macros: openArray[string]): string =
+  ## RFC-0002 §4.5/§5/§6, slice E2 — the ONE `verify.nim` touch §2 promises:
+  ## a defensive `#ifndef NAME` / `#error "..."` / `#endif` guard per
+  ## SYNTHESIZED-gate macro. In `#if`/`#elif`, an undefined identifier is
+  ## silently replaced by `0` — no error, no warning by default (§4.5); a
+  ## synthesized gate referencing a macro no included header actually
+  ## defines would therefore silently misverify (or silently under-verify)
+  ## instead of failing loud. Emitted UNCONDITIONALLY into the verify TU —
+  ## same treatment `genVerifyBlock` already gives `#include` directives
+  ## themselves (built from `procs`, never gated by `isSuppressed` — see the
+  ## header-collection loop above/below this call site).
+  ##
+  ## Scope: SYNTHESIZED gates only — `SoftlinkProc.synthesizedGateMacros`
+  ## is populated exclusively by `softlink/pragmas.synthesizeVersionGates`,
+  ## which never touches a proc carrying an explicit, hand-written
+  ## `{.verifyWhen.}` (§5's documented override "forgoes... the visibility
+  ## guards"). A hand-written gate's macros are an unparsed opaque C
+  ## expression string this module cannot safely extract identifiers from
+  ## (§4.5: "for hand-written gates softlink cannot parse the predicate to
+  ## extract identifiers; E3's docs carry the undefined-macro warning
+  ## instead") — so only the synthesizer's OWN, precisely-known macro list
+  ## ever reaches this function.
+  result = ""
+  for name in macros:
+    result.add("#ifndef " & name & "\n")
+    result.add("#error \"softlink: versionMacros identifier '" & name &
+      "' is not defined by this block's included headers — a synthesized " &
+      "{.until/since.} gate referenced it, but #if/#elif silently treats " &
+      "an undefined macro as 0, which would misverify rather than fail " &
+      "loud; make sure the header declaring '" & name &
+      "' is included by this block (RFC-0002 §4.5)\"\n")
+    result.add("#endif\n")
+
 const softlinkProbeOnly {.strdefine.} = ""
   ## RFC-0001 §4 B.2: with `-d:softlinkProbeOnly=<CName>`, `genVerifyBlock`
   ## suppresses the ENTIRE verification apparatus (the call-based
@@ -328,6 +361,27 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     for p in procs:
       if p.prototype.len > 0 and not isSuppressed(p) and not isProbedExistence(p):
         includeCode.add(emitPrototypeDecl(p.prototype, p.verifyWhen))
+
+    # RFC-0002 §4.5/§5/§6, slice E2: the macro-visibility guards for every
+    # SYNTHESIZED gate in this block — deduplicated (several procs can
+    # reference the same versionMacros identifiers) and emitted ONCE each,
+    # after the block's #includes (so a real definition from those headers
+    # is visible by the time the guard checks) and before the verify-proc
+    # body. Built from `procs` (like the header-include loop above), NOT
+    # gated by `isSuppressed`/`isProbedExistence` — same rationale as
+    # `#include`s themselves: the guard is a property of THIS compile's
+    # header set, independent of which symbol probe mode happens to be
+    # targeting this run.
+    block:
+      var seenMacros: HashSet[string]
+      var orderedMacros: seq[string]
+      for p in procs:
+        for m in p.synthesizedGateMacros:
+          if m notin seenMacros:
+            seenMacros.incl(m)
+            orderedMacros.add(m)
+      if orderedMacros.len > 0:
+        includeCode.add(emitVersionMacroGuards(orderedMacros))
 
     # Emit #include directives + C++ type_traits if needed
     nodes.add(newNimNode(nnkPragma).add(

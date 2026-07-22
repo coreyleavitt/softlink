@@ -46,7 +46,7 @@ proc validateProbeJson(path, expectKind, expectBaseName: string) =
   if j["procs"].kind != JArray or j["procs"].len == 0:
     quit("softlink: RFC-0001 slice B1: " & path & " has no procs array (or it's empty)")
   const procKeys = ["nimName", "cName", "header", "prototype", "verifyWhen",
-                     "optional", "noverify", "noverifyReason", "since"]
+                     "optional", "noverify", "noverifyReason", "since", "until"]
   for p in j["procs"]:
     for key in procKeys:
       if not p.hasKey(key):
@@ -82,6 +82,37 @@ proc expectCompileFailure(cmd: string) =
     quit("softlink: RFC-0001 slice A4 expected a compile FAILURE (header " &
          "vs. prototype conflict on testlib_add) but the compile " &
          "SUCCEEDED: " & cmd)
+
+proc runDualNimcacheCompile(dir1, dir2, baseFlags, extraFlag2, fixture,
+                             exePath: string) =
+  ## Shared "dual-compile" shape behind RFC-0002's gated-drift and
+  ## synthesized-gate checks: the SAME fixture compiled TWICE via `nim c`,
+  ## each invocation getting its own `--nimcache` dir. A `-D`/`/D` define
+  ## changes no Nim-emitted C, so a shared nimcache risks Nim's
+  ## content-hashed cache reusing the first invocation's object file and the
+  ## second "passing" without recompiling anything under the new header
+  ## shape at all — see each call site's own doc comment for the
+  ## hand-verified RED evidence this per-invocation isolation is built to
+  ## catch. `baseFlags` is shared by both invocations (already carrying its
+  ## own leading/trailing spaces, e.g. `" --path:src --passC:-I. "` or the
+  ## MSVC `vccFlags`); `extraFlag2` (e.g. a `-DTESTLIB_VERSION=2` define) is
+  ## appended after `baseFlags`, before `fixture`, to the SECOND invocation
+  ## only — the flag that flips the header branch under test. Cleans up
+  ## both nimcache dirs (before AND after, matching every call site's
+  ## pre-existing stale-dir defensiveness) and the compiled executable
+  ## (`exePath`) once both compiles have run.
+  ##
+  ## Hoisted to file scope (code-review finding CR1-10) so both `task
+  ## test`'s nested `runGatedDriftChecks`/`runVersionMacrosGateChecks` and
+  ## `task testMsvcExitCodes`'s top-level vcc-flavored pair can share ONE
+  ## definition instead of repeating the same six-line shape four times.
+  if dirExists(dir1): rmDir(dir1)
+  if dirExists(dir2): rmDir(dir2)
+  exec "nim c --nimcache:" & dir1 & baseFlags & fixture
+  exec "nim c --nimcache:" & dir2 & baseFlags & extraFlag2 & fixture
+  if dirExists(dir1): rmDir(dir1)
+  if dirExists(dir2): rmDir(dir2)
+  if fileExists(exePath): rmFile(exePath)
 
 proc walkGenSources(dir: string): seq[string] =
   ## All generated .c/.cpp files under one --nimcache dir. NimScript's
@@ -618,6 +649,16 @@ task test, "Run tests":
   # form) are exercised in the same compile.
   const reasonHintCheck = "nim c --compileOnly --path:src tests/thint_noverify_reason.nim"
   const reasonWarnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify_reason.nim"
+  # RFC-0002 §4.1/§6, slice A3: a required (non-{.optional.}) proc carrying
+  # {.until.} gets the same hint/warning treatment, precedent-named in the
+  # RFC as "the per-block noverify hint" above. The fixture header-verifies
+  # for real (`header: "tests/testlib.h"`), so this needs `--passC:-I.`
+  # like the manifest checks' `mcBase`, unlike the noverify-only fixtures
+  # above which need no header at all.
+  const untilRequiredHintCheck =
+    "nim c --compileOnly --path:src --passC:-I. tests/thint_until_required.nim"
+  const untilRequiredWarnCheck = "nim c --compileOnly --path:src --passC:-I. " &
+    "-d:softlinkStrictVerify tests/thint_until_required.nim"
   # RFC-0001 slice A6: a {.prototype.}-only proc (no {.header.}) whose
   # prototype references a non-builtin identifier (found via the shared
   # A1 tokenizer) must emit a hint naming it — "this prototype may need
@@ -627,6 +668,18 @@ task test, "Run tests":
     "nim c --compileOnly --path:src tests/thint_prototype_nonbuiltin.nim"
   const nonBuiltinWarnCheck = "nim c --compileOnly --path:src " &
     "-d:softlinkStrictVerify tests/thint_prototype_nonbuiltin.nim"
+  # Code-review finding CR1-12: a versionMacros(...) directive nothing in
+  # the block consumes (no {.until.} proc synthesized a gate from it) must
+  # hint, saying so — unlike every OTHER hint in this group, this one is
+  # deliberately NOT upgraded to a warning under -d:softlinkStrictVerify
+  # (see `checkVersionMacrosConsumed`'s doc comment, src/softlink/
+  # pragmas.nim, for why: it's a lint on dead source, not a verification
+  # trust point). `versionMacrosUnusedStrictCheck` below proves that
+  # non-escalation directly, rather than merely asserting the plain hint.
+  const versionMacrosUnusedHintCheck =
+    "nim c --compileOnly --path:src tests/thint_versionmacros_unused.nim"
+  const versionMacrosUnusedStrictCheck = "nim c --compileOnly --path:src " &
+    "-d:softlinkStrictVerify tests/thint_versionmacros_unused.nim"
   # RFC-0001 slice A2: a {.prototype.}-only proc (testlib_protoonly, no
   # {.header.}) must be verified for real against its vendored C prototype —
   # emitted as a file-scope `extern` declaration in the verify TU, ahead of
@@ -1141,6 +1194,114 @@ task test, "Run tests":
     for d in probeOnlyDirs:
       if dirExists(d): rmDir(d)
 
+  # RFC-0002 §6, slice C3a: the dual-header compile test —
+  # tests/tverify_gated_drift.nim compiled TWICE, once against each of
+  # tests/testlib.h's two `#if TESTLIB_VERSION >= 2` branches for
+  # `testlib_drifted`. Distinct --nimcache dirs per invocation, same
+  # isolation precedent as `probeOnlyDirs` above: a `-D` flag changes no
+  # Nim-emitted C, so a shared nimcache risks Nim's content-hashed cache
+  # reusing the first invocation's object file and the second invocation
+  # "passing" without recompiling anything under the new header shape at
+  # all. Both invocations are REAL compiles (no --compileOnly, unlike
+  # `runProbeOnlyChecks` above) — the point is that gcc's own
+  # `_Static_assert`/call-based checking actually runs against each
+  # branch's real declaration; see the fixture's own doc comment for the
+  # hand-verified RED evidence (a deliberately wrong signature under a
+  # true gate fails the C compile) this shape is built to catch.
+  const gatedDriftDir1 = "tests/nimcache_gated_drift_v1"
+  const gatedDriftDir2 = "tests/nimcache_gated_drift_v2"
+  const gatedDriftExe = "tests/tverify_gated_drift"
+
+  proc runGatedDriftChecks() =
+    # Default (TESTLIB_VERSION=1, testlib.h's own `#ifndef` default): the
+    # fixture's first `verifyProcs` block (`TESTLIB_VERSION < 2`) is TRUE
+    # and genuinely type-checks against the header's `int *`-param
+    # declaration; the second block's gate is FALSE, its declaration
+    # absent from this build. `--passC:-DTESTLIB_VERSION=2` (the second
+    # invocation's `extraFlag2`) is the reverse — the second block's gate
+    # opens against the header's now-`double *`-param declaration; the
+    # first block's gate closes.
+    runDualNimcacheCompile(gatedDriftDir1, gatedDriftDir2,
+      " --path:src --passC:-I. ", "--passC:-DTESTLIB_VERSION=2 ",
+      "tests/tverify_gated_drift.nim", gatedDriftExe)
+
+  # RFC-0002 §5/§6, slice E2: the SYNTHESIZED-gate sibling of
+  # `runGatedDriftChecks` above — same dual-compile, distinct-nimcache
+  # isolation, but `tests/tverify_synthesized_gate.nim`'s gate is never
+  # hand-written: `versionMacros("TESTLIB_VERSION")` + `{.until: "2".}`
+  # synthesizes it. Proves a SYNTHESIZED gate opens (TESTLIB_VERSION=1: the
+  # real `int *`-param declaration genuinely type-checks) and closes
+  # (TESTLIB_VERSION=2: the declaration is absent, compiles clean, nothing
+  # checked) against real headers — see the fixture's own doc comment for
+  # the hand-verified RED evidence (a deliberately wrong `ptr cdouble`
+  # under the TESTLIB_VERSION=1 true-gate branch fails the real gcc compile
+  # with "incompatible pointer type", proving the synthesized gate's TRUE
+  # branch checks real, present content, not merely compiles vacuously).
+  const synthGateDir1 = "tests/nimcache_synth_gate_v1"
+  const synthGateDir2 = "tests/nimcache_synth_gate_v2"
+  const synthGateExe = "tests/tverify_synthesized_gate"
+
+  proc runVersionMacrosGateChecks() =
+    runDualNimcacheCompile(synthGateDir1, synthGateDir2,
+      " --path:src --passC:-I. ", "--passC:-DTESTLIB_VERSION=2 ",
+      "tests/tverify_synthesized_gate.nim", synthGateExe)
+
+    # Code-review finding CR1-12 control: a versionMacros directive that IS
+    # consumed by a synthesized gate must NOT trigger the "declared but
+    # never used" hint — proves `checkVersionMacrosConsumed`'s detection
+    # (via `p.synthesizedGateMacros`) correctly distinguishes "used" from
+    # "unused" rather than firing unconditionally whenever the directive is
+    # merely present. See tests/thint_versionmacros_unused.nim for the
+    # positive (actually-unused) case this is the negative mirror of.
+    const synthGateUnusedCheckDir = "tests/nimcache_synth_gate_unused_check"
+    if dirExists(synthGateUnusedCheckDir): rmDir(synthGateUnusedCheckDir)
+    expectManifestCompileOk("nim c --compileOnly --nimcache:" &
+      synthGateUnusedCheckDir & " --path:src --passC:-I. " &
+      "tests/tverify_synthesized_gate.nim", [], ["declared but never used"])
+    if dirExists(synthGateUnusedCheckDir): rmDir(synthGateUnusedCheckDir)
+
+    # RFC-0002 §4.5/§5/§6, slice E2: the negative guard check — a
+    # `versionMacros` name NOT defined by any header this block includes
+    # must fail the verify TU's REAL C compile with the `#ifndef`/`#error`
+    # guard's exact wording (`softlink/verify.emitVersionMacroGuards`).
+    # Deliberately NOT run through `--compileOnly` (unlike every
+    # `mcBase`-driven check in `runManifestChecks` below): `--compileOnly`
+    # only emits Nim's generated C and never invokes the C compiler at all,
+    # so it could never observe a C-level `#error` — only a real `nim c`
+    # actually runs gcc/clang against the generated TU. `expectDiag` is
+    # exit-code-agnostic (it only asserts the needle appears in output),
+    # which is fine here since the compile genuinely fails either way.
+    const undefinedMacroDir = "tests/nimcache_versionmacros_undefined"
+    if dirExists(undefinedMacroDir): rmDir(undefinedMacroDir)
+    expectDiag("nim c --nimcache:" & undefinedMacroDir &
+      " --path:src --passC:-I. tests/tfail_versionmacros_undefined_macro.nim",
+      "versionMacros undefined-macro guard fires a real C #error",
+      "versionMacros identifier 'TESTLIB_NO_SUCH_MACRO' is not defined by " &
+      "this block's included headers")
+    if dirExists(undefinedMacroDir): rmDir(undefinedMacroDir)
+
+    # Code review CR1-8, cell 3: the C++ backend leg of the SAME guard.
+    # `emitVersionMacroGuards` emits the `#ifndef`/`#error` text
+    # unconditionally into the verify TU's shared include prologue — not
+    # gated on which backend tier (C++ `decltype`+`is_same`, GCC/Clang
+    # `__builtin_types_compatible_p`, MSVC `_Generic`) ends up checking the
+    # signature itself — but until now only the `nim c` (GCC) leg above
+    # ever compiled this fixture for real, so the guard's behavior under
+    # the C++ backend/compiler (g++, not gcc) had no real-compiler
+    # coverage at all. Own `--nimcache` dir, matching every other
+    # dual-backend pattern in this file (e.g. `runGatedDriftChecks`'s own
+    # C/C++ pair) — a shared nimcache across two different backends risks
+    # a stale/vacuous pass exactly as those functions' own doc comments
+    # warn.
+    const undefinedMacroCppDir = "tests/nimcache_versionmacros_undefined_cpp"
+    if dirExists(undefinedMacroCppDir): rmDir(undefinedMacroCppDir)
+    expectDiag("nim cpp --nimcache:" & undefinedMacroCppDir &
+      " --path:src --passC:-I. tests/tfail_versionmacros_undefined_macro.nim",
+      "versionMacros undefined-macro guard fires a real C++ #error too",
+      "versionMacros identifier 'TESTLIB_NO_SUCH_MACRO' is not defined by " &
+      "this block's included headers")
+    if dirExists(undefinedMacroCppDir): rmDir(undefinedMacroCppDir)
+
   # RFC-0001 §B.5/§B.5a, slice B6a: the `compatManifest` body directive —
   # grammar, erroring stub, path resolution, and every compile-time
   # consumption check (schema, lib identity, ABI, disjoint/exhaustive,
@@ -1152,7 +1313,8 @@ task test, "Run tests":
   # `writeManifestFromTemplate` above.
   const manifestTmplBases = ["testlib", "testlib_schema2", "testlib_wronglib",
     "testlib_overlap", "testlib_gap", "testlib_since", "testlib_vp_subset",
-    "testlib_vp_since", "testlib_abi_mismatch"]
+    "testlib_vp_since", "testlib_abi_mismatch", "testlib_until",
+    "testlib_until_unknown"]
 
   proc runManifestChecks() =
     const mdir = "tests/manifests/"
@@ -1198,8 +1360,72 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_manifest_since_contradiction.nim",
       ["corrected lower bound is 2.0.0"])
 
+    # RFC-0002 §4.2/§6, slice B2: `checkUntil` wired into the same call site
+    # as `checkSince` above (`softlink/directives.applyCompatManifest`'s
+    # Check 6) — the dangerous over-claim direction (rule (a)): a declared
+    # `until` later than the corpus's own recorded drift.
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_until_contradiction.nim",
+      ["corrected upper bound is until: \"2.0.0\""])
+
+    # Finding R2-A: `checkUntil` rule (b)'s at-or-above-`until` scan now also
+    # contradicts on a non-decisive (`fkUnknown`) corpus fact, not just a
+    # re-verified one — see `src/softlink/manifest.nim`'s `checkUntil` doc
+    # comment and this fixture's own header comment.
+    expectManifestCompileFail(mcBase & "tests/tfail_manifest_until_unknown.nim",
+      ["no decisive classification"])
+
     expectManifestCompileFail(mcBase & "tests/tfail_since_unparseable.nim",
       ["does not parse as a version"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_until_unparseable.nim",
+      ["does not parse as a version"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_since_until_empty_interval.nim",
+      ["is an empty interval"])
+
+    # RFC-0002 §4.1/§6, slice A3: `until` requires corpus-trackability —
+    # rejected alongside `noverify` (nothing to falsify the bound against)
+    # and alongside a prototype-only proc with no `header` (a vendored
+    # prototype verifies against a corpus-invariant declaration with no
+    # per-version facts to harvest). `prototype` + `header` TOGETHER stays
+    # accepted (cross-check mode) — positive control below.
+    expectManifestCompileFail(mcBase & "tests/tfail_until_noverify.nim",
+      ["{.until.} contradicts {.noverify.}"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_until_prototype_only.nim",
+      ["not corpus-trackable"])
+
+    # RFC-0002 §4.1/§5/§6, slice D1: `until` requires `verifyWhen` —
+    # unconditional, post-body-scan, no `compatManifest` involved at all
+    # (mcBase's `--passC:-I.` is needed only because the fixture's proc
+    # carries a real `{.header.}`).
+    expectManifestCompileFail(mcBase & "tests/tfail_until_without_gate.nim",
+      ["requires a {.verifyWhen.} gate"])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_until_verifywhen_ok.nim", [], [])
+
+    # RFC-0002 §5/§6, slice E1: `versionMacros(...)` directive parse +
+    # validation — mirrors the `compatManifest`/`versionProbe` dup-guard and
+    # malformed-shape checks above/below. Parsed and stored only in this
+    # slice (no synthesis consumer yet — that's Stage E2).
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_malformed.nim",
+      ["is not a valid C identifier"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_duplicate.nim",
+      ["duplicate versionMacros directive"])
+
+    # RFC-0002 §5/§6, slice E2: gate-synthesis bound validation — both are
+    # NIM macro-time errors (`error()`-raised inside `synthesizeVersionGates`
+    # itself, from a `softlink/gates.GateResult` failure case), so
+    # `--compileOnly` (never invoking the C compiler) is sufficient to catch
+    # them, same as every other `mcBase` check in this proc. Contrast the
+    # undefined-macro guard (`runVersionMacrosGateChecks`, above `task test`)
+    # — a genuine C-level `#error`, which needs a real compile.
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_alpha_bound.nim",
+      ["the bound contains a non-numeric (alphabetic) run"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_excess_components.nim",
+      ["there is no C macro for the extra component(s)"])
 
     expectManifestCompileOk(mcBase & "tests/tcheck_manifest_mismatch_warning.nim",
       ["recorded a 'mismatch' interval"], [])
@@ -1245,6 +1471,16 @@ task test, "Run tests":
 
     expectManifestCompileOk(mcBase & "tests/tcheck_manifest_not_in_manifest_hint.nim",
       ["not in compat manifest"], [])
+
+    # RFC-0002 §4.4, code-review finding CR1-1: Check 8's not-in-manifest
+    # hint now gets the same Hint/Warning strict-mode escalation the
+    # `{.noverify.}`/drifted-but-required hints already have — reuses the
+    # SAME fixture directly above (its manifest is already materialized by
+    # this proc's own `writeManifestFromTemplate` loop).
+    expectDiag(mcBase & "tests/tcheck_manifest_not_in_manifest_hint.nim",
+      "not-in-manifest hint", "not in compat manifest", "Hint:")
+    expectDiag(mcBase & "-d:softlinkStrictVerify tests/tcheck_manifest_not_in_manifest_hint.nim",
+      "not-in-manifest warning (strict)", "not in compat manifest", "Warning:")
 
     expectManifestCompileOk(mcBase & "tests/tcheck_manifest_abi_mismatch.nim",
       ["ignoring the compat manifest entirely"], ["corrected lower bound"])
@@ -1515,6 +1751,10 @@ task test, "Run tests":
     "private symbol, no public header at any version", "Hint:", "(no justification)")
   expectDiag(reasonWarnCheck, "noverify reason warning (strict)",
     "private symbol, no public header at any version", "Warning:", "(no justification)")
+  expectDiag(untilRequiredHintCheck, "until required-symbol hint",
+    "drifted-but-required", "did you mean {.optional.}?", "Hint:")
+  expectDiag(untilRequiredWarnCheck, "until required-symbol warning (strict)",
+    "drifted-but-required", "did you mean {.optional.}?", "Warning:")
   expectDiag(nonBuiltinHintCheck, "prototype non-builtin identifier hint",
     "may need `header:` to resolve", "Hint:")
   expectDiag(nonBuiltinWarnCheck, "prototype non-builtin identifier warning (strict)",
@@ -1525,6 +1765,16 @@ task test, "Run tests":
     "may need `header:` to resolve", "Hint:")
   expectDiag(vpNonBuiltinWarnCheck, "verifyProcs prototype non-builtin warning (strict)",
     "may need `header:` to resolve", "Warning:")
+  expectDiag(versionMacrosUnusedHintCheck, "versionMacros unused hint",
+    "declared but never used", "Hint:")
+  # Flip side of every OTHER strict-mode check above: those assert
+  # escalation TO a Warning; this asserts the DELIBERATE ABSENCE of one —
+  # the hint text is present, but never as a Warning, confirming
+  # `checkVersionMacrosConsumed` really is exempt from the
+  # -d:softlinkStrictVerify escalation every other trust-point hint gets.
+  expectManifestCompileOk(versionMacrosUnusedStrictCheck,
+    ["declared but never used", "Hint:"],
+    ["Warning: softlink: dynlib: versionMacros"])
 
   if dirExists(protoEmitDir): rmDir(protoEmitDir)
   exec protoEmitCheck
@@ -1566,6 +1816,8 @@ task test, "Run tests":
     probeNoTargetAnchor)
 
   runProbeOnlyChecks()
+  runGatedDriftChecks()
+  runVersionMacrosGateChecks()
   runCorpusChecks()
   runManifestChecks()
   runVersionProbeChecks()
@@ -1696,3 +1948,47 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
   # the harvester's INTERNAL probe compiles (configured inside that test
   # file) target vcc; see its doc comment for the full rationale.
   exec "nim c -r --path:src tests/tharvest_msvc_calibration_refusal.nim"
+
+  # RFC-0002 §6, slice C3a: the dual-header gated-drift fixture
+  # (tests/tverify_gated_drift.nim), vcc-flavored — `task test`'s
+  # `runGatedDriftChecks` already exercises the C++ `decltype`+`is_same`
+  # and GCC/Clang `__builtin_types_compatible_p`+`__typeof__` tiers; the
+  # MSVC leg does not run `task test` at all (see this task's own opening
+  # comment), so the third (`_Generic`+`__typeof__`) tier gets NO coverage
+  # of a TRUE `{.verifyWhen.}` gate branch type-checking against a real,
+  # present declaration unless it's added here too. Two REAL compiles
+  # (successful — `expectCompileFailure` doesn't apply), same distinct-
+  # --nimcache-per-invocation isolation `runGatedDriftChecks` uses (a `/D`
+  # flag changes no Nim-emitted C, so a shared nimcache risks a vacuous
+  # pass exactly as documented there), `/D` swapped in for `-D` to match
+  # cl.exe's define syntax (`vccFlags` above already swaps `/I.`/
+  # `/std:clatest` in for gcc's `-I.`).
+  const vccGatedDriftDir1 = "tests/nimcache_gated_drift_vcc_v1"
+  const vccGatedDriftDir2 = "tests/nimcache_gated_drift_vcc_v2"
+  runDualNimcacheCompile(vccGatedDriftDir1, vccGatedDriftDir2, vccFlags,
+    "--passC:/DTESTLIB_VERSION=2 ", "tests/tverify_gated_drift.nim",
+    "tests/tverify_gated_drift.exe")
+
+  # RFC-0002 §5/§6, slice E2: the SYNTHESIZED-gate sibling of the
+  # dual-compile just above (`tests/tverify_synthesized_gate.nim`,
+  # `task test`'s own `runVersionMacrosGateChecks` exercises the C++/GCC
+  # tiers) — same MSVC-leg-only third-tier coverage rationale, same
+  # distinct-per-invocation --nimcache isolation.
+  const vccSynthGateDir1 = "tests/nimcache_synth_gate_vcc_v1"
+  const vccSynthGateDir2 = "tests/nimcache_synth_gate_vcc_v2"
+  runDualNimcacheCompile(vccSynthGateDir1, vccSynthGateDir2, vccFlags,
+    "--passC:/DTESTLIB_VERSION=2 ", "tests/tverify_synthesized_gate.nim",
+    "tests/tverify_synthesized_gate.exe")
+
+  # Code review CR1-8, cell 3: the vcc-leg sibling of `task test`'s own
+  # `runVersionMacrosGateChecks` undefined-macro `#ifndef`/`#error` guard
+  # check (GCC and, as of this same finding, C++ tiers) —
+  # `tests/tfail_versionmacros_undefined_macro.nim`'s guard fires a real C
+  # preprocessor `#error`, genuinely observable as a nonzero exit under
+  # MSVC too. Per this task's own opening comment, softlink-authored-
+  # string greps stay Linux/gcc-only (MSVC diagnostic/preprocessor text
+  # quoting can differ enough to be flaky) — so, exactly like the four
+  # `expectCompileFailure` checks and the probe-existence-absent pair
+  # above, this is pattern-only (exit-code only), no needle.
+  expectCompileFailure("nim c" & vccFlags &
+    "tests/tfail_versionmacros_undefined_macro.nim")

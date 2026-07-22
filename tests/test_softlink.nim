@@ -7,6 +7,7 @@ import std/[unittest, math, strutils, sequtils]
 import softlink {.all.}
 import softlink/versions
 import softlink/manifest
+import softlink/gates
 # code-review finding #13: the prototype tokenizer/analyzer this suite unit-
 # tests directly (`tokenizePrototype`/`analyzePrototype`/
 # `nonBuiltinIdentifiers` below) moved from `softlink.nim` itself into the
@@ -97,6 +98,31 @@ type ProbeMode = enum
   pmNormal          ## returns a real, parseable version built from a bound wrapper (item 1)
   pmUnparseable     ## returns a string with NO digit/alpha runs at all (item 4)
   pmReentrantUnload ## calls unloadTestlib() recursively (item 3, unload variant)
+  # RFC-0002 §4.4/§4.9, slice C4b/C4c: declared-bound refusal at the
+  # manifest-LESS `atNoManifest` site. This block carries THREE bounded
+  # procs sharing the identical declared interval `[1.0.0, 99.0.0)` by
+  # fixture coincidence: `testlib_add` (REQUIRED, `until` only —
+  # slice A3's own prototype+until control), `testlib_noop` (REQUIRED,
+  # both bounds — slice A2's own control), and `testlib_gated_v2`
+  # (OPTIONAL, both bounds — C4b's original target). Declared-bound
+  # candidates are checked REQUIRED-then-optional, in PROC DECLARATION
+  # ORDER within each list (mirrors the attested loop's own ordering) —
+  # `testlib_add` is declared before `testlib_noop`, so at a probe that
+  # decisively hits `until` (both required procs' shared bound), C4c's
+  # "first hit wins" unwind fires on `testlib_add`, short-circuiting
+  # `testlib_noop`'s own check and EVERY optional check (incl.
+  # `testlib_gated_v2`'s) for that same load attempt. At a probe that
+  # decisively hits `since` (below "1.0.0"), only `testlib_noop` carries
+  # a `since` bound at all (`testlib_add` has none), so it is the one
+  # that fires.
+  pmAboveUntil      ## "100.0" — decisively at-or-above the shared until;
+                    ## `testlib_add` (REQUIRED, first in decl order) wins
+  pmBelowSince      ## "0.5" — decisively below the shared since;
+                    ## `testlib_add` has no since bound, so `testlib_noop`
+                    ## (REQUIRED) wins
+  pmTieUntil        ## "99.0.0-rc1" — numeric prefix ties until for all
+                    ## three procs, alpha tail -> not comparable for all;
+                    ## no refusal fires for anyone, load proceeds normally
 
 var probeMode = pmNormal
 var probeRunCount = 0  ## bumped once per ACTUAL probe run — item 8 (idempotency)
@@ -115,9 +141,30 @@ dynlib TestLib:
   # emitted; the C compiler itself enforces same-scope agreement (C11
   # 6.7p4), so this compiling at all is a live conflict-free-agreement check
   # (the deliberate-conflict case is slice A4).
+  # RFC-0002 §4.1/§6, slice A3 positive control: {.until.} + {.prototype.} +
+  # {.header.} together is the one prototype-only shape `until` DOES accept
+  # (cross-check mode — trackable via the header; see
+  # tfail_until_prototype_only.nim for the no-header rejection this proves
+  # isn't overbroad).
+  # RFC-0002 §4.1/§5/§6, slice D1: `until` requires `verifyWhen` — gated on
+  # `TESTLIB_VERSION < 99`, trivially true under the header's real (default
+  # `TESTLIB_VERSION == 1`) value, so this stays a LIVE verification, not a
+  # vacuous one — behavior-preserving for every check below.
   proc testlib_add(a: cint, b: cint): cint
-    {.cdecl, header: "tests/testlib.h", prototype: "int testlib_add(int a, int b)".}
-  proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
+    {.cdecl, header: "tests/testlib.h", prototype: "int testlib_add(int a, int b)",
+      until: "99.0.0", verifyWhen: "TESTLIB_VERSION < 99".}
+  # RFC-0002 §4.1/§6, slice A1: {.until: "x.y.z".} parses, validates, and
+  # carries through exactly like {.since.} — no manifest/probe consumption
+  # yet (later slices), so a valid claim here must compile and load/call
+  # exactly as testlib_noop always has. Slice A2: carrying BOTH bounds
+  # together is a non-empty interval [1.0.0, 99.0.0) — this proc is the
+  # positive control proving the since>=until contradiction check (below,
+  # tfail_since_until_empty_interval.nim) doesn't also reject valid,
+  # correctly-ordered pairs.
+  # RFC-0002 §4.1/§5/§6, slice D1: `until` requires `verifyWhen` — same
+  # trivially-true-under-the-real-header gate as `testlib_add` above.
+  proc testlib_noop() {.cdecl, since: "1.0.0", until: "99.0.0",
+    verifyWhen: "TESTLIB_VERSION < 99", header: "tests/testlib.h".}
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
   # Regression: #11 — const-qualified pointer returns must verify
   # against cstring without "signature mismatch" errors under any
@@ -143,8 +190,14 @@ dynlib TestLib:
   # from testlib.h, present in the .so). Condition is false → verification
   # skipped; unlike {.noverify.}, a system with version >= 2 headers would
   # verify this signature.
+  # RFC-0002 §4.1/§6, slice A3 positive control: `until` coexisting with
+  # `since` + `header` + `verifyWhen` + `optional` all on one proc — the
+  # full allowlist minus `prototype` (that combination is testlib_add
+  # above). Bounds are parse/carry only through A3 (no runtime effect yet),
+  # so this is behavior-preserving for the dispatch check below.
   proc testlib_gated_v2(): cint
-    {.cdecl, optional, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
+    {.cdecl, optional, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h",
+      since: "1.0.0", until: "99.0.0".}
   # RFC-0001 §3 A.1 slice A2 happy path: {.prototype.} alone (no {.header.})
   # is accepted, header requirement lifted, AND now fully verified — the
   # vendored prototype is emitted as a file-scope `extern` declaration ahead
@@ -197,6 +250,9 @@ dynlib TestLib:
     of pmReentrantUnload:
       unloadTestlib()
       "unreachable — unloadTestlib() above always raises reentrantly"
+    of pmAboveUntil: "100.0"
+    of pmBelowSince: "0.5"
+    of pmTieUntil: "99.0.0-rc1"
 
 # verifyProcs: compile-time signature verification ONLY (no loading, no
 # wrappers). Correct signatures must compile; the const-return case (#11)
@@ -223,8 +279,14 @@ verifyProcs:
   # verified (testlib_gated is declared in testlib.h); false condition →
   # skipped entirely, so a symbol absent from the header must NOT be an
   # implicit-declaration error.
+  # RFC-0002 §4.1/§6, slice A1 verifyProcs parity: {.until.} must parse and
+  # carry here too, composing harmlessly with an unrelated {.verifyWhen.}.
+  # Slice A2 parity: {.since.} + {.until.} together form a non-empty
+  # interval [1.0.0, 99.0.0) — the verifyProcs-side positive control for the
+  # since>=until contradiction check (dynlib's is testlib_noop above).
   proc testlib_gated(): cint
-    {.cdecl, verifyWhen: "TESTLIB_VERSION >= 1", header: "tests/testlib.h".}
+    {.cdecl, verifyWhen: "TESTLIB_VERSION >= 1", since: "1.0.0", until: "99.0.0",
+      header: "tests/testlib.h".}
   proc testlib_gated_v2(): cint
     {.cdecl, verifyWhen: "TESTLIB_VERSION >= 2", header: "tests/testlib.h".}
   # RFC-0001 slice A5, deliverable 3: {.prototype.} + {.verifyWhen.}
@@ -819,6 +881,103 @@ suite "softlink":
     check reloaded.attestation == atNoManifest
     check reloaded.runtimeVersion == "1.5"
 
+  # RFC-0002 §4.4/§4.9, slice C4b/C4c: declared-bound refusal at the
+  # manifest-LESS `atNoManifest` site — the second of §4.4's two sites
+  # (the first, manifest-attached `atOutOfCorpus`, is
+  # `tests/tcompat_report_manifest.nim`'s own suite). `pmAboveUntil` was
+  # C4b's original OPTIONAL-only target (`testlib_gated_v2`); C4c adds
+  # `testlib_add` (REQUIRED, `until` only, declared BEFORE `testlib_noop`
+  # in the block — see the `ProbeMode` doc comment above) to the SAME
+  # bound, "first hit wins" REQUIRED-then-declaration-order — so at this
+  # probe the REQUIRED refusal fires and unwinds the WHOLE load before
+  # `testlib_noop`'s or `testlib_gated_v2`'s own checks ever run.
+  test "declared-bound refusal (RFC-0002 C4c): probe decisively ABOVE until, no manifest -> REQUIRED symbol unwinds the whole load":
+    probeMode = pmAboveUntil
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrSymbolNotFound
+    check r.symbol == "testlib_add"
+    check not testlibLoaded()
+    let c = testlibCompat()
+    check c.attestation == atNoManifest
+    check c.runtimeVersion == "100.0"
+    # §4.4: no facts-driven partition to compute in a manifest-less block —
+    # missingReasons carries ONLY this refusal's own entry.
+    check c.missingReasons.len == 1
+    check c.missingReasons.anyIt(it.symbol == "testlib_add" and it.reason == mrDriftRefused)
+    check c.missingReasons.filterIt(it.symbol == "testlib_add")[0].interval ==
+      VersionInterval(lo: "", hi: "99.0.0")
+    var caught: SoftlinkError
+    try:
+      discard testlib_add(2, 3)
+      fail()
+    except SoftlinkError as e:
+      caught = e
+    check caught != nil
+    check "testlib_add" in caught.msg
+    check "<99.0.0" in caught.msg
+    check "refus" in caught.msg
+    probeMode = pmNormal
+    unloadTestlib()
+
+  # C4c's "first hit wins" required-then-declaration-order check means a
+  # probe hitting ONLY `since` (`testlib_add` has no `since` bound) skips
+  # `testlib_add` entirely and lands on `testlib_noop` (REQUIRED, both
+  # bounds) instead — proving the below-since symmetry for a REQUIRED
+  # candidate too, for free (same shared `buildBoundCheck` fragment C4b's
+  # own below-since test already exercises for the optional case).
+  test "declared-bound refusal (RFC-0002 C4c): probe decisively BELOW since -> REQUIRED symbol unwinds the whole load (both-bounds symmetry)":
+    probeMode = pmBelowSince
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrSymbolNotFound
+    check r.symbol == "testlib_noop"
+    check not testlibLoaded()
+    let c = testlibCompat()
+    check c.attestation == atNoManifest
+    check c.runtimeVersion == "0.5"
+    check c.missingReasons.len == 1
+    check c.missingReasons.anyIt(it.symbol == "testlib_noop" and it.reason == mrDriftRefused)
+    check c.missingReasons.filterIt(it.symbol == "testlib_noop")[0].interval ==
+      VersionInterval(lo: "1.0.0", hi: "99.0.0")
+    var caught: SoftlinkError
+    try:
+      testlib_noop()
+      fail()
+    except SoftlinkError as e:
+      caught = e
+    check caught != nil
+    check "testlib_noop" in caught.msg
+    check ">=1.0.0" in caught.msg
+    check "refus" in caught.msg
+    probeMode = pmNormal
+    unloadTestlib()
+
+  # RFC-0002 §4.4, slice C4c: the tie is decided per bound, independently,
+  # so it applies to `testlib_add`/`testlib_noop` (REQUIRED) exactly as it
+  # does to `testlib_gated_v2` (OPTIONAL) — none of the three is refused,
+  # and the load proceeds (required candidates never get a chance to
+  # short-circuit anything here, since neither of them ever decides).
+  test "declared-bound refusal (RFC-0002 C4b/C4c): boundary tie with an alpha run -> loads normally, probeNotComparable = true":
+    probeMode = pmTieUntil
+    unloadTestlib()
+    let r = loadTestlib()
+    check r.kind == lrOkPartial
+    check "testlib_gated_v2" notin r.missing
+    check testlib_gated_v2Available()
+    check testlib_gated_v2() == 42
+    check testlibLoaded()
+    check testlib_add(2, 3) == 5
+    testlib_noop()
+    let c = testlibCompat()
+    check c.attestation == atNoManifest
+    check c.probeNotComparable
+    check not c.missingReasons.anyIt(it.symbol == "testlib_gated_v2")
+    check not c.missingReasons.anyIt(it.symbol == "testlib_add")
+    check not c.missingReasons.anyIt(it.symbol == "testlib_noop")
+    probeMode = pmNormal
+    unloadTestlib()
+
   # Compile-time validation tests
   test "compile-time: rejects proc without calling convention":
     check not compiles(block:
@@ -1321,6 +1480,52 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
     let m = parseManifest(fixtureText, fixturePath)
     check not checkSince(m, "corpuslib_nonexistent", "1.0.0").contradicted
 
+  # Finding R2-A: `checkSince`'s symmetric hole below `since` — an
+  # `fkUnknown` fact there is not decisive evidence the symbol was
+  # genuinely absent (as `since` claims), yet the pre-fix rule 2 only
+  # checked `fkVerified`/`fkMismatch`, letting `fkUnknown` pass vacuously.
+  # Hand-built manifests (like the `checkUntil` suite below), not the
+  # golden fixture — the golden fixture has no `since`-bearing scenario
+  # with an `unknown` fact below the bound.
+  test "checkSince: fkUnknown below since — contradicted (Finding R2-A)":
+    var sf = SymbolFacts(cname: "corpuslib_maybe")
+    sf.header[fkUnknown].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                            corpus: @["1.0.0", "2.0.0", "3.0.0"], symbols: @[sf])
+    let sc = checkSince(m, "corpuslib_maybe", "2.0.0")
+    check sc.contradicted
+    check "1.0.0" in sc.message
+    check "no decisive classification" in sc.message
+
+  test "checkSince: fkMismatch below since — still contradicted (existing rule unaffected)":
+    var sf = SymbolFacts(cname: "corpuslib_early")
+    sf.header[fkMismatch].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                            corpus: @["1.0.0", "2.0.0", "3.0.0"], symbols: @[sf])
+    let sc = checkSince(m, "corpuslib_early", "2.0.0")
+    check sc.contradicted
+    check "1.0.0" in sc.message
+    check "no decisive classification" notin sc.message
+
+  test "checkSince: fkAbsent below since — still NOT contradicted (expected, agrees)":
+    var sf = SymbolFacts(cname: "corpuslib_late")
+    sf.header[fkAbsent].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                            corpus: @["1.0.0", "2.0.0", "3.0.0"], symbols: @[sf])
+    check not checkSince(m, "corpuslib_late", "2.0.0").contradicted
+
+  test "checkSince: fkUnknown at/above since (valid region) — NOT contradicted (honest ignorance)":
+    var sf = SymbolFacts(cname: "corpuslib_settled")
+    sf.header[fkAbsent].add VersionInterval(lo: "", hi: "1.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "1.0.0", hi: "2.0.0")
+    sf.header[fkUnknown].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                            corpus: @["0.5.0", "1.0.0", "2.0.0", "3.0.0"], symbols: @[sf])
+    check not checkSince(m, "corpuslib_settled", "1.0.0").contradicted
+
   test "mismatchedSymbols / notInManifest":
     let m = parseManifest(fixtureText, fixturePath)
     check mismatchedSymbols(m, @["corpuslib_changed", "corpuslib_stable"]) ==
@@ -1335,11 +1540,11 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
   # interval shapes (see the fixture read above) are reused as-is.
   test "classifyAbsence: version in an absent interval -> acExpected":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "corpuslib_added", "1.0.0", "") == acExpected
+    check classifyAbsence(m.symbols, "corpuslib_added", "1.0.0", "", "") == acExpected
 
   test "classifyAbsence: version in a verified interval -> acAnomalous":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "corpuslib_added", "2.5.0", "") == acAnomalous
+    check classifyAbsence(m.symbols, "corpuslib_added", "2.5.0", "", "") == acAnomalous
 
   test "classifyAbsence: version in a mismatch interval -> acAnomalous (judgment call)":
     # A symbol that never resolved, whose headers at this version are
@@ -1347,27 +1552,53 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
     # it did not resolve" (RFC-0001 §C.2's own wording for mrAnomalous) —
     # not a separate case, and not honest-ignorance either.
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "corpuslib_changed", "2.5.0", "") == acAnomalous
+    check classifyAbsence(m.symbols, "corpuslib_changed", "2.5.0", "", "") == acAnomalous
 
   test "classifyAbsence: version in an unknown interval, no since -> acNone":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "") == acNone
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "", "") == acNone
 
   test "classifyAbsence: unknown interval, but since is still ahead -> acExpected":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "5.0.0") == acExpected
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "5.0.0", "") == acExpected
 
   test "classifyAbsence: unknown interval, since already passed -> acNone":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "1.0.0") == acNone
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "1.0.0", "") == acNone
 
   test "classifyAbsence: symbol entirely absent from manifest, no since -> acNone":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "") == acNone
+    check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "", "") == acNone
 
   test "classifyAbsence: symbol entirely absent from manifest, since covers it -> acExpected":
     let m = parseManifest(fixtureText, fixturePath)
-    check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "5.0.0") == acExpected
+    check classifyAbsence(m.symbols, "not_a_real_symbol", "1.0.0", "5.0.0", "") == acExpected
+
+  # RFC-0002 §4.3/§6, slice C1: `until` threaded into `classifyAbsence` as a
+  # 5th param. The demotion branches BEFORE the anomalous-mismatch rule —
+  # `corpuslib_changed` carries mismatch/[2.0.0,3.0.0), which would
+  # classify acAnomalous on its own (see the mismatch-interval test above);
+  # declaring `until` at-or-below the probed version overrides that.
+  test "classifyAbsence: until threaded, probed version AT until -> acExpected (tracer, wins over an anomalous mismatch fact)":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_changed", "2.0.0", "", "2.0.0") == acExpected
+
+  test "classifyAbsence: probed version ABOVE until -> acExpected (also wins over an anomalous mismatch fact)":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_changed", "2.5.0", "", "2.0.0") == acExpected
+
+  test "classifyAbsence: probed version BELOW until, header still says mismatch -> acAnomalous (unchanged)":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_changed", "2.5.0", "", "3.0.0") == acAnomalous
+
+  test "classifyAbsence: probed version BELOW until, no since, no header coverage -> acNone (§4.3 silent on until here; pre-until rule stands)":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_stable", "3.5.0", "", "5.0.0") == acNone
+
+  test "classifyAbsence: until absent (\"\") -> behaves exactly as before C1 (regression)":
+    let m = parseManifest(fixtureText, fixturePath)
+    check classifyAbsence(m.symbols, "corpuslib_changed", "2.5.0", "", "") == acAnomalous
+    check classifyAbsence(m.symbols, "corpuslib_added", "1.0.0", "", "") == acExpected
 
   # RFC-0001 §C.3, slice C4b: `firstMismatchInterval`/`formatInterval` —
   # the pure runtime drift-refusal lookup and its story-text renderer,
@@ -1409,6 +1640,446 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
   # branch — see src/softlink/manifest.nim).
   test "formatInterval: unbounded both ways -> exact fallback text \"any version\"":
     check formatInterval(VersionInterval(lo: "", hi: "")) == "any version"
+
+# RFC-0002 §4.2/§6, slice B1: `checkUntil` — the `{.until.}` cross-check.
+# NOT a mechanical mirror of `checkSince` above: rule (a)'s absence check is
+# scoped by whether `since` is present, rule (b) is a revert-detection check
+# `checkSince` has no analogue of, and rule (c) requires positive evidence
+# `checkSince` doesn't either. Every manifest here is hand-built (`mkManifest`
+# below) rather than drawn from the golden fixture — the pinned scenarios
+# (corpus gaps, beyond-corpus-max bounds, all-absent symbols) don't exist in
+# `tests/corpus/expected.compat.json` and don't need a real harvest to test a
+# pure function.
+suite "softlink/manifest — checkUntil (RFC-0002 §4.2, slice B1)":
+  proc mkManifest(corpus: seq[string], sf: SymbolFacts): CompatManifest =
+    CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                    corpus: corpus, symbols: @[sf])
+
+  test "checkUntil: mismatch inside the window — hard error (tracer bullet)":
+    var sf = SymbolFacts(cname: "corpuslib_drifted")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_drifted", "1.0.0", "3.0.0")
+    check uc.contradicted
+    check "2.0.0" in uc.message
+
+  test "checkUntil: until-without-since, early-corpus absence — passes (absence is since's business)":
+    # Introduced late (absent through 2.0.0, verified from 2.0.0), until:
+    # "3.0.0" declared with NO since. Rule (a)'s absence check must not
+    # fire for the pre-introduction absence, since only `since` scopes
+    # that — a naive copy-paste of `checkSince`'s two-fact-kind scan
+    # would wrongly flag "1.0.0" here (§4.2's own worked example).
+    # Header verified only in [2.0.0, 3.0.0) and drifted at-or-above
+    # 3.0.0 — an open-ended `fkVerified` reaching to the corpus end would
+    # itself trip rule (b)'s revert detection, which is a DIFFERENT
+    # scenario than this test targets.
+    var sf = SymbolFacts(cname: "corpuslib_added")
+    sf.header[fkAbsent].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "3.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "3.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    check not checkUntil(m, "corpuslib_added", "", "3.0.0").contradicted
+
+  test "checkUntil: re-verified above until — revert detection, drafted wording verbatim":
+    # RFC-0002 §4.2's own worked example, reproduced exactly (down to the
+    # symbol/version numbers) so the produced message can be asserted
+    # equal to the drafted, grep-pinned string.
+    var sf = SymbolFacts(cname: "Z3_fpa_get_numeral_sign")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "4.16.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "4.16.0", hi: "4.18.0")
+    sf.header[fkVerified].add VersionInterval(lo: "4.18.0", hi: "")
+    let m = mkManifest(@["4.10.0", "4.16.0", "4.18.0"], sf)
+    let uc = checkUntil(m, "Z3_fpa_get_numeral_sign", "", "4.16.0")
+    check uc.contradicted
+    check uc.message == "softlink: {.until: \"4.16.0\".} on 'Z3_fpa_get_numeral_sign' " &
+      "contradicts the compat manifest: the corpus re-verifies the declared " &
+      "signature at 4.18.0, at or above the declared bound — softlink's " &
+      "single-interval model cannot express drift-then-revert (RFC-0002 §3); " &
+      "drop 'until' for this symbol to fall back to unbounded verification."
+
+  test "checkUntil: fkVerified exactly AT until — half-open window, 'above' triggers revert detection":
+    var sf = SymbolFacts(cname: "corpuslib_boundary")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_boundary", "", "2.0.0")
+    check uc.contradicted
+    check "2.0.0" in uc.message
+
+  test "checkUntil: corpus gap at the boundary — passes (cmpVersion tolerance)":
+    # until: "4.16.0" declared in a gap the corpus doesn't sample exactly
+    # (4.15.0 -> 4.17.0) — the same granularity tolerance checkSince has.
+    var sf = SymbolFacts(cname: "corpuslib_gapped")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "4.16.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "4.16.0", hi: "")
+    let m = mkManifest(@["4.15.0", "4.17.0"], sf)
+    check not checkUntil(m, "corpuslib_gapped", "", "4.16.0").contradicted
+
+  test "checkUntil: until beyond corpus max — passes vacuously":
+    var sf = SymbolFacts(cname: "corpuslib_stable")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    check not checkUntil(m, "corpuslib_stable", "", "9.0.0").contradicted
+
+  test "checkUntil: all-absent symbol with until — fails rule (c), no positive evidence":
+    var sf = SymbolFacts(cname: "corpuslib_ghost")
+    sf.header[fkAbsent].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_ghost", "", "9.0.0")
+    check uc.contradicted
+    check "extend the corpus" in uc.message
+
+  test "checkUntil: fkAbsent inside the window when since IS present — hard error (checkSince's rule extended)":
+    var sf = SymbolFacts(cname: "corpuslib_holed")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkAbsent].add VersionInterval(lo: "2.0.0", hi: "3.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "3.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0", "4.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_holed", "1.0.0", "4.0.0")
+    check uc.contradicted
+    check "ABSENT" in uc.message
+    check "2.0.0" in uc.message
+
+  test "checkUntil: symbol entirely absent from manifest — no check possible":
+    var sf = SymbolFacts(cname: "corpuslib_real")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0"], sf)
+    check not checkUntil(m, "not_a_real_symbol", "", "5.0.0").contradicted
+
+  # Finding R2-A: rule (b)'s at-or-above-`until` scan checked ONLY
+  # `fkVerified` — an `fkUnknown` fact there (harvester couldn't classify)
+  # passed vacuously, even though it is no more decisive evidence of
+  # invalidity than a re-verification is evidence of validity. Left
+  # unfixed, an attested probe landing exactly on that corpus version
+  # would sail through the runtime attested-path exemption (which trusts
+  # this proc having validated the whole declared-invalid window), and a
+  # drifted pointer would dispatch silently.
+  test "checkUntil: fkUnknown at/above until — contradicted (Finding R2-A)":
+    var sf = SymbolFacts(cname: "corpuslib_hazy")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkUnknown].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_hazy", "", "2.0.0")
+    check uc.contradicted
+    check "2.0.0" in uc.message
+    check "no decisive classification" in uc.message
+
+  test "checkUntil: fkMismatch at/above until — still NOT contradicted (agrees with the bound)":
+    var sf = SymbolFacts(cname: "corpuslib_confirmed_drift")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    check not checkUntil(m, "corpuslib_confirmed_drift", "", "2.0.0").contradicted
+
+  test "checkUntil: fkAbsent at/above until — still NOT contradicted (dropped, expected per §4.3)":
+    var sf = SymbolFacts(cname: "corpuslib_retired")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkAbsent].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    check not checkUntil(m, "corpuslib_retired", "", "2.0.0").contradicted
+
+  test "checkUntil: fkUnknown BELOW until (inside the valid window) — NOT contradicted (honest ignorance)":
+    var sf = SymbolFacts(cname: "corpuslib_early_unknown")
+    sf.header[fkUnknown].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "3.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "3.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    check not checkUntil(m, "corpuslib_early_unknown", "", "3.0.0").contradicted
+
+# RFC-0002 §4.4/§6, slice C4a: `compareToBound` — the declared-bound
+# runtime comparison rule's pure comparator (numeric-prefix-only, tie/
+# unparseable -> not comparable). This is the tracer bullet AND the pinned
+# cases the slice brief calls out: decisive prefix above/below, a genuine
+# boundary tie with an alpha run, an unparseable probe, and the flagship
+# distro-suffix case ("4.16.3-ubuntu3" vs until "4.16.0") that must refuse.
+suite "softlink/versions — compareToBound (RFC-0002 §4.4, slice C4a)":
+  test "decisive: probe's numeric prefix sorts strictly ABOVE the bound (tracer bullet)":
+    check compareToBound("4.17.0", "4.16.0") == some(1)
+
+  test "decisive: probe's numeric prefix sorts strictly BELOW the bound":
+    check compareToBound("4.15.0", "4.16.0") == some(-1)
+
+  test "boundary tie with an alpha run: \"4.16.0-rc1\" vs until \"4.16.0\" -> not comparable":
+    # Genuinely ambiguous under the codebase's no-pre-release-semantics
+    # stance (RFC-0001 §5 C.0): is a release candidate "before" or "at"
+    # its own release? Declines to decide rather than risk a false refusal.
+    check compareToBound("4.16.0-rc1", "4.16.0").isNone
+
+  test "unparseable probe -> not comparable":
+    check compareToBound("unknown", "4.16.0").isNone
+    check compareToBound("", "4.16.0").isNone
+
+  test "flagship distro-suffix case: \"4.16.3-ubuntu3\" vs until \"4.16.0\" -> decisively ABOVE":
+    # The numeric prefix (4.16.3) already decides above the bound (4.16.0)
+    # before the trailing alpha run is ever consulted — this is the
+    # must-refuse input C4b's declared-bound refusal depends on: a distro
+    # patch release the corpus never harvested must still be recognized as
+    # past `until` and refused, not silently treated as "not comparable".
+    check compareToBound("4.16.3-ubuntu3", "4.16.0") == some(1)
+
+  test "an alpha tail that does not create a tie is irrelevant to the decision":
+    # Both sides can carry alpha tails; only an exact numeric-prefix TIE
+    # triggers the ambiguity check.
+    check compareToBound("4.17.0-rc1", "4.16.0-beta") == some(1)
+
+  test "exact tie, neither side has an alpha tail -> comparable, zero":
+    check compareToBound("4.16.0", "4.16.0") == some(0)
+
+# Code-review finding CR1-3: `numericPrefixRuns`/`parseVersion` used to
+# accumulate a digit run with an uncapped `val = val*10 + digit`, which
+# raises `OverflowDefect` (uncaught anywhere in the generated loader —
+# the probe's own try/except catches only `CatchableError`, and
+# `compareToBound` runs outside it entirely) on a 19+-digit run, in both
+# default AND `-d:release` builds — a runtime-probed, attacker/corruption-
+# controlled version string could crash the whole process. A 19-digit
+# run is the smallest that can overflow `int64` mid-accumulation; 18
+# digits is the widest safe width, so that is exactly where the cap
+# sits. Fixed by capping accumulation at 18 digits and treating an
+# oversized run as making the WHOLE string unparseable (the existing
+# `none`/"not comparable" decline path) rather than saturating to some
+# invented value.
+suite "softlink/versions — CR1-3: oversized digit run never raises":
+  test "compareToBound: a 19+-digit run on the PROBE side declines instead of raising":
+    check compareToBound("999999999999999999999999.0.0", "4.16.0").isNone
+
+  test "compareToBound: a 19+-digit run on the BOUND side declines instead of raising":
+    check compareToBound("4.16.0", "999999999999999999999999.0.0").isNone
+
+  test "parseVersion: a 19+-digit run makes the whole string unparseable":
+    check parseVersion("999999999999999999999999.0.0").isNone
+    # A leading, otherwise-valid run before the oversized one is also
+    # discarded, not partially kept -- the design choice is "the whole
+    # string is unparseable", never a silently-truncated partial parse.
+    check parseVersion("4.16.99999999999999999999.3").isNone
+
+  test "parseVersion: exactly 18 digits is the safe boundary and still parses":
+    # `int(...)` conversions, not bare literals: an unsuffixed integer
+    # literal too large for int32 infers as `int64` regardless of the
+    # native `int` width, which would otherwise mismatch `seq[int]` here.
+    let parsed = parseVersion("999999999999999999.0.0")
+    check parsed.isSome
+    check parsed.get == @[int(999999999999999999), int(0), int(0)]
+
+  test "cmpVersion: an oversized run never raises, and compares as the unparseable/empty sequence":
+    # Matches cmpVersion's own documented fallback for any unparseable
+    # string (module doc comment): sorts below any version with a
+    # positive leading component.
+    check cmpVersion("999999999999999999999999.0.0", "4.16.0") < 0
+    check cmpVersion("4.16.0", "999999999999999999999999.0.0") > 0
+
+# CR1-3 follow-up: the alpha-run base-26 accumulation in `parseVersion` has
+# the exact same unbounded `val*26 + ...` shape the digit-run suite above
+# guards -- a long-enough pure-letter run overflows int64 the same way a
+# long-enough pure-digit run does. Same treatment, same design: decline the
+# whole string rather than raise or silently saturate/wrap.
+suite "softlink/versions — CR1-3 follow-up: oversized alpha run never raises":
+  test "parseVersion: a 14+-letter run makes the whole string unparseable":
+    check parseVersion("a".repeat(20)).isNone
+    # A leading, otherwise-valid run before the oversized one is also
+    # discarded, not partially kept -- same "whole string is unparseable"
+    # design choice as the digit-run case.
+    check parseVersion("4.16." & "z".repeat(20)).isNone
+
+  test "parseVersion: exactly 13 letters is the safe boundary and still parses":
+    let parsed = parseVersion("z".repeat(13))
+    check parsed.isSome
+    check parsed.get == @[int(2_580_398_988_131_886_038)]
+
+  test "cmpVersion: an oversized alpha run never raises, and compares as the unparseable/empty sequence":
+    # Matches cmpVersion's own documented fallback for any unparseable
+    # string: sorts below any version with a positive leading component.
+    check cmpVersion("a".repeat(20), "4.16.0") < 0
+    check cmpVersion("4.16.0", "a".repeat(20)) > 0
+
+  test "VersionInterval.contains: an oversized alpha run never raises":
+    let iv = VersionInterval(lo: "1.0.0", hi: "")
+    check contains(iv, "1.0.0" & "a".repeat(20)) == false
+
+  test "compareToBound: a 20-letter run on the PROBE side never raises and declines":
+    check compareToBound("a".repeat(20), "4.16.0").isNone
+
+  test "compareToBound: a 20-letter run on the BOUND side never raises and declines":
+    check compareToBound("4.16.0", "a".repeat(20)).isNone
+
+  test "evaluateBoundRefusal: a 20-letter run on the probed side never raises, declines instead of refusing":
+    let r = evaluateBoundRefusal("1.0.0" & "a".repeat(20), "1.0.0", "")
+    check r.refuse == false
+    check r.notComparable == true
+
+  test "evaluateBoundRefusal: a 20-letter run on the since/until side never raises, declines instead of refusing":
+    let r = evaluateBoundRefusal("2.0.0", "a".repeat(20), "")
+    check r.refuse == false
+    check r.notComparable == true
+
+# RFC-0002 §4.4, code-review finding CR1-4: `evaluateBoundRefusal` — the
+# single pure decision function extracted from the `dynlib` macro's
+# `buildBoundCheck` (previously hand-assembled NimNode trees with no
+# direct unit test). Every case below is a golden pinned directly against
+# `buildBoundCheck`'s pre-extraction semantics: `until` is the exclusive
+# upper bound (at-until refuses), `since` is the inclusive lower bound
+# (at-since accepts), "" means an absent bound on either side, and a
+# `none` result from `compareToBound` on EITHER bound independently sets
+# `notComparable` without necessarily setting `refuse` (or vice versa).
+suite "softlink/versions — evaluateBoundRefusal (RFC-0002 §4.4, code-review CR1-4)":
+  test "in range for both bounds: no refusal, comparable":
+    let r = evaluateBoundRefusal("4.16.5", "4.16.0", "4.17.0")
+    check not r.refuse
+    check not r.notComparable
+
+  test "at-until: refuses (until is an EXCLUSIVE upper bound, half-open)":
+    let r = evaluateBoundRefusal("4.17.0", "4.16.0", "4.17.0")
+    check r.refuse
+    check not r.notComparable
+
+  test "at-since: accepts (since is an INCLUSIVE lower bound)":
+    let r = evaluateBoundRefusal("4.16.0", "4.16.0", "4.17.0")
+    check not r.refuse
+    check not r.notComparable
+
+  test "below-since: refuses":
+    let r = evaluateBoundRefusal("4.15.9", "4.16.0", "4.17.0")
+    check r.refuse
+    check not r.notComparable
+
+  test "decisive despite an alpha tail: distro-suffixed probe past until still refuses":
+    let r = evaluateBoundRefusal("4.16.3-ubuntu3", "", "4.16.0")
+    check r.refuse
+    check not r.notComparable
+
+  test "boundary tie with an alpha run: not comparable, does not refuse":
+    let r = evaluateBoundRefusal("4.16.0-rc1", "", "4.16.0")
+    check not r.refuse
+    check r.notComparable
+
+  test "unparseable probe against a real bound: not comparable on both bounds, never refuses":
+    let r = evaluateBoundRefusal("unknown", "4.16.0", "4.17.0")
+    check not r.refuse
+    check r.notComparable
+
+  test "both bounds absent (\"\"): never refuses regardless of probe":
+    check not evaluateBoundRefusal("4.16.0", "", "").refuse
+    check not evaluateBoundRefusal("4.16.0", "", "").notComparable
+    check not evaluateBoundRefusal("garbage", "", "").refuse
+    check not evaluateBoundRefusal("garbage", "", "").notComparable
+
+  test "CR1-3 interaction: an overflow-length probe is not comparable and never crashes":
+    let r = evaluateBoundRefusal("999999999999999999999999.0.0", "4.16.0", "4.17.0")
+    check not r.refuse
+    check r.notComparable
+
+# RFC-0002 §5/§6, slice E2: `softlink/gates` — the pure gate synthesizer.
+# Golden-tested outside the macro, per §5's own instruction; every case
+# below is pinned directly against §5's worked examples/counterexample.
+suite "softlink/gates — gate synthesis (RFC-0002 §5, slice E2)":
+  test "until \"4.16.0\" against 3 macros — trailing zero strips to a 2-component compare":
+    # The RFC's own worked example (§4/§5), reproduced verbatim.
+    let r = synthesizeBoundPredicate(
+      @["Z3_MAJOR_VERSION", "Z3_MINOR_VERSION", "Z3_BUILD_NUMBER"], "4.16.0", bkUntil)
+    check r.ok
+    check r.predicate ==
+      "(Z3_MAJOR_VERSION < 4) || (Z3_MAJOR_VERSION == 4 && Z3_MINOR_VERSION < 16)"
+    check r.usedMacros == @["Z3_MAJOR_VERSION", "Z3_MINOR_VERSION"]
+
+  test "since \"4.0.5\" against 3 macros — the non-trailing-zero counterexample (§5)":
+    # The pinned counterexample: the middle "0" is NOT trailing (patch is
+    # "5", nonzero) so nothing strips — all 3 components stay against all 3
+    # macros. A naive "elide any zero" reading would misalign the remaining
+    # components against the wrong macros; this asserts the full,
+    # correctly-positioned 3-component expansion instead.
+    let r = synthesizeBoundPredicate(
+      @["MAJOR", "MINOR", "PATCH"], "4.0.5", bkSince)
+    check r.ok
+    check r.predicate ==
+      "(MAJOR > 4) || (MAJOR == 4 && MINOR > 0) || (MAJOR == 4 && MINOR == 0 && PATCH >= 5)"
+    check r.usedMacros == @["MAJOR", "MINOR", "PATCH"]
+    # Sanity-check the predicate's actual truth table against the claim
+    # "since: 4.0.5 means valid from 4.0.5 onward" — 4.5.3 is genuinely in
+    # range (naive elision would wrongly exclude it, per §5); 4.0.6 is in
+    # range (patch above the bound); 4.0.4 is NOT (patch below the bound).
+    proc evalGe(major, minor, patch: int): bool =
+      (major > 4) or (major == 4 and minor > 0) or
+        (major == 4 and minor == 0 and patch >= 5)
+    check evalGe(4, 5, 3)   # in range
+    check evalGe(4, 0, 6)   # in range
+    check not evalGe(4, 0, 4)  # out of range
+
+  test "until \"4.16\" against 3 macros — short bound zero-pads then strips identically to \"4.16.0\"":
+    let r = synthesizeBoundPredicate(
+      @["Z3_MAJOR_VERSION", "Z3_MINOR_VERSION", "Z3_BUILD_NUMBER"], "4.16", bkUntil)
+    check r.ok
+    check r.predicate ==
+      "(Z3_MAJOR_VERSION < 4) || (Z3_MAJOR_VERSION == 4 && Z3_MINOR_VERSION < 16)"
+    check r.usedMacros == @["Z3_MAJOR_VERSION", "Z3_MINOR_VERSION"]
+
+  test "both bounds present — AND-combined (since \">=\" predicate, until \"<\" predicate)":
+    let r = synthesizeGate(@["MAJOR", "MINOR", "BUILD"], "4.0.0", "4.16.0")
+    check r.ok
+    check r.predicate == "(MAJOR >= 4) && ((MAJOR < 4) || (MAJOR == 4 && MINOR < 16))"
+    check r.usedMacros == @["MAJOR", "MINOR"]
+
+  test "until-only — just the < predicate, no AND":
+    let r = synthesizeGate(@["MAJOR", "MINOR"], "", "4.16")
+    check r.ok
+    check r.predicate == "(MAJOR < 4) || (MAJOR == 4 && MINOR < 16)"
+
+  test "bound with an alpha run is a synthesis error (no C macro to compare a suffix against)":
+    let r = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "4.16.0-rc1", bkUntil)
+    check not r.ok
+    check r.error.kind == geAlphaRun
+    check r.error.bound == bkUntil
+    check r.error.value == "4.16.0-rc1"
+
+  test "bound with more components than the macro list is a synthesis error":
+    let r = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "4.16.3", bkUntil)
+    check not r.ok
+    check r.error.kind == geExcessComponents
+    check r.error.componentCount == 3
+    check r.error.macroCount == 2
+
+  test "CR1-2: \"2.0.0\" against 1 macro synthesizes identically to \"2\" (raw-count excess bug)":
+    # Regression for CR1-2: the excess-components check used to run on the
+    # RAW parsed component count (3, for "2.0.0") BEFORE the trailing-zero
+    # strip, so this canonicalized-equivalent-to-"2" bound wrongly errored
+    # as 3-components-vs-1-macro even though "2.0.0" == "2" per this
+    # module's own documented equivalence invariant.
+    let rLong = synthesizeBoundPredicate(@["TESTLIB_VERSION"], "2.0.0", bkUntil)
+    let rShort = synthesizeBoundPredicate(@["TESTLIB_VERSION"], "2", bkUntil)
+    check rLong.ok
+    check rShort.ok
+    check rLong.predicate == rShort.predicate
+    check rLong.usedMacros == rShort.usedMacros
+    check rLong.predicate == "(TESTLIB_VERSION < 2)"
+
+  test "CR1-2: \"4.16.0\" against 2 macros synthesizes identically to \"4.16\"":
+    let rLong = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "4.16.0", bkUntil)
+    let rShort = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "4.16", bkUntil)
+    check rLong.ok
+    check rShort.ok
+    check rLong.predicate == rShort.predicate
+    check rLong.usedMacros == rShort.usedMacros
+
+  test "CR1-2: genuine excess (\"4.16.3\" against 2 macros) is still rejected":
+    let r = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "4.16.3", bkUntil)
+    check not r.ok
+    check r.error.kind == geExcessComponents
+
+  test "CR1-8: single-macro golden — bound \"4\" against 1 macro is an exact, unparenthesized-junction compare":
+    let r = synthesizeBoundPredicate(@["MAJOR"], "4", bkUntil)
+    check r.ok
+    check r.predicate == "(MAJOR < 4)"
+    check "||" notin r.predicate
+    check "&&" notin r.predicate
+    check r.usedMacros == @["MAJOR"]
+
+  test "degenerate all-zero bound: until -> always-false, since -> always-true, no macro referenced":
+    let ru = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "0.0", bkUntil)
+    check ru.ok
+    check ru.predicate == "0"
+    check ru.usedMacros.len == 0
+    let rs = synthesizeBoundPredicate(@["MAJOR", "MINOR"], "0.0", bkSince)
+    check rs.ok
+    check rs.predicate == "1"
+    check rs.usedMacros.len == 0
 
 # Code-review findings (2026-07 round 1, RFC-0001 §B.3/§B.5 hardening;
 # IDs F1/F2/F7/F8/F16 refer to that review's ledger). Every test below

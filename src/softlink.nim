@@ -105,6 +105,18 @@ type
     mrAnomalous     ## this version's headers declare it, yet it did not resolve
     mrDriftRefused  ## resolved, but refused for known signature drift (§C.3)
 
+  MissingReasonEntry* = tuple[symbol: string, reason: MissingReason,
+                              interval: VersionInterval]
+    ## Code-review finding CR1-7: `CompatReport.missingReasons`'s element
+    ## type, named once so the 4 codegen sites in the `dynlib` macro
+    ## (`bindSym("MissingReasonEntry")` call sites building the var
+    ## holding this shape at macro-expansion time) reference ONE
+    ## declaration instead of each re-deriving the same anonymous tuple
+    ## structurally.
+    ## Since Nim tuples are structural, this is purely a name for the
+    ## existing shape — no behavior change, and any caller code written
+    ## against the old anonymous tuple keeps compiling unchanged.
+
   CompatReport* = object
     ## RFC-0001 §C.2: a query proc (`fooCompat*(): CompatReport`) generated
     ## per `dynlib` block — deliberately NOT fields on `LoadResult` (dead
@@ -126,7 +138,36 @@ type
     ## `LoadResult.missing` didn't resolve — see `MissingReason` above.
     runtimeVersion*: string   ## "" unless the probe succeeded
     attestation*: Attestation
-    missingReasons*: seq[tuple[symbol: string, reason: MissingReason]]
+    missingReasons*: seq[MissingReasonEntry]
+      ## RFC-0002 §4.9/§6, slice C2: the evidence interval behind `reason`.
+      ## Sourced per §4.9's evidence-interval rule, which varies by WHICH
+      ## code path produced the entry, not by `reason`'s own value: on the
+      ## attested-mismatch path (both drift-refusal loops below, required
+      ## and optional — `mrDriftRefused` entries only), it is the
+      ## manifest's own `firstMismatchInterval` for that symbol at the
+      ## probed version — already computed there to build the drift
+      ## story's text, strictly more precise than the author's `since`/
+      ## `until` claim. Everywhere else — `computeMissingPartition`'s
+      ## `mrExpected`/`mrAnomalous` entries, C1's classification path —
+      ## it is the proc's own DECLARED `[since, until)`
+      ## (`VersionInterval(lo: since, hi: until)`), `""` legs rendering as
+      ## open/unbounded (`formatInterval`'s "any version" fallback) when
+      ## the proc carries neither bound.
+    probeNotComparable*: bool
+      ## RFC-0002 §4.4/§4.9, slice C4a/C4b: `false` unless the
+      ## declared-bound refusal check (`versions.evaluateBoundRefusal`)
+      ## hits a genuine boundary tie (numeric prefixes equal, an alpha
+      ## run on either side) or an unparseable probe string when
+      ## comparing a probed version against a `{.since/until.}` bound —
+      ## in that case the check declines to refuse and sets this `true`
+      ## instead (report-don't-block for that one ambiguous case). Set by
+      ## `declaredBoundRefusalStmts`, which is shared by three emission
+      ## sites: `atNoManifest` and `atOutOfCorpus` (search
+      ## `assignCompatReportStmt`), plus the `atAttested` path for
+      ## manifest-absent bounded procs. `atProbeFailed` is NOT reused for
+      ## this: it already means "the probe raised, or returned no string
+      ## at all" — a different failure than "the probe returned a string
+      ## that couldn't be compared against a bound".
 
 # Exported because macro-generated wrapper procs call this by ident at the call site.
 proc raiseNotLoaded*(library, symbol: string) {.noreturn, noinline.} =
@@ -162,9 +203,8 @@ proc findDriftStory(stories: seq[tuple[symbol: string, story: string]],
   ""
 
 proc computeMissingPartition(symbols: seq[SymbolFacts], missingSymbols: seq[string],
-                              sinceCNames, sinceVersions: seq[string],
-                              probedVersion: string):
-                              seq[tuple[symbol: string, reason: MissingReason]] =
+                              sinceCNames, sinceVersions, untilVersions: seq[string],
+                              probedVersion: string): seq[MissingReasonEntry] =
   ## RFC-0001 §9/§C.2, slice C3: the runtime bridge between the pure
   ## `softlink/manifest.classifyAbsence` (facts + version + since ->
   ## `AbsenceClass`) and `CompatReport.missingReasons`'s `MissingReason`. Called
@@ -175,21 +215,48 @@ proc computeMissingPartition(symbols: seq[SymbolFacts], missingSymbols: seq[stri
   ## proc (nothing to partition otherwise). `missingSymbols` is the exact
   ## `softlinkMissing` seq the load pipeline already built (Phase 2);
   ## `sinceCNames`/`sinceVersions` are macro-time-computed PARALLEL arrays
-  ## (this block's OPTIONAL procs' own `{.since.}` claims only — required
-  ## symbols never appear in `missingSymbols` on a successful load, so
-  ## their claims are irrelevant here) rather than a `seq` of pairs, purely
-  ## so the macro can embed them with the same plain `newLit(seq[string])`
-  ## shape already proven elsewhere in this file (`corpusLit`), with no new
-  ## exported aggregate type for generated code to reference by name.
+  ## rather than a `seq` of pairs, purely so the macro can embed them with
+  ## the same plain `newLit(seq[string])` shape already proven elsewhere in
+  ## this file (`corpusLit`), with no new exported aggregate type for
+  ## generated code to reference by name.
+  ##
+  ## RFC-0002 §4.9, slice C4a: the caller now passes the ONE canonical
+  ## bounds embedding (`boundCNames`/`boundSinceVersions` — EVERY proc in
+  ## the block carrying a `since` and/or `until` claim, required or
+  ## optional, not just this proc's original "optional procs' own
+  ## `{.since.}` claims" subset). Behavior here is unchanged regardless:
+  ## required symbols never appear in `missingSymbols` on a successful load
+  ## (Phase 1 fails the whole load first), so their now-included rows are
+  ## never matched by the lookup below; an until-only row's `since` is `""`,
+  ## identical to "not found" for this function's purposes.
+  ##
+  ## RFC-0002 §4.3, slice C1: `untilVersions` is the same-shaped, same-
+  ## indexed third parallel array (row `i` is `boundCNames[i]`'s declared
+  ## `until`, `""` if it carries none) — threaded straight through to
+  ## `classifyAbsence`'s own new `untilVersion` parameter, no local
+  ## decision logic added here.
+  ##
+  ## RFC-0002 §4.9, slice C2: every entry's `interval` is the proc's own
+  ## DECLARED `[since, until)` — `since`/`until` are already looked up
+  ## per-symbol just below for `classifyAbsence` itself, so this is a
+  ## free byproduct, not a second lookup. This is the "declared interval
+  ## elsewhere" leg of §4.9's evidence-interval rule — the OTHER leg (the
+  ## manifest's own `firstMismatchInterval`, for attested-mismatch
+  ## `mrDriftRefused` entries) never reaches this function at all; those
+  ## entries are built directly in the `dynlib` macro's drift-refusal
+  ## loops, which already hold the matched `firstMismatchInterval` result.
   for sym in missingSymbols:
     var since = ""
+    var until = ""
     for i in 0 ..< sinceCNames.len:
       if sinceCNames[i] == sym:
         since = sinceVersions[i]
+        until = untilVersions[i]
         break
-    case classifyAbsence(symbols, sym, probedVersion, since)
-    of acExpected: result.add (symbol: sym, reason: mrExpected)
-    of acAnomalous: result.add (symbol: sym, reason: mrAnomalous)
+    let iv = VersionInterval(lo: since, hi: until)
+    case classifyAbsence(symbols, sym, probedVersion, since, until)
+    of acExpected: result.add (symbol: sym, reason: mrExpected, interval: iv)
+    of acAnomalous: result.add (symbol: sym, reason: mrAnomalous, interval: iv)
     of acNone: discard
 
 # `toIncludeDirective`/`emitPrototypeDecl` moved to `softlink/verify` (code-
@@ -432,6 +499,11 @@ proc probeFactsJson(p: SoftlinkProc): JsonNode =
   ## is absent, same as every other optional fact here. The key itself was
   ## already reserved (always `""`) before this slice, precisely so the
   ## harvester's key set would not churn when a real value arrived.
+  ##
+  ## `until` (RFC-0002 §6, slice A1b): mirrors `since` exactly — the real
+  ## per-proc `{.until: "x.y.z".}` value, "" when the pragma is absent. Like
+  ## `since`, this is descriptive metadata only: the harvester carries it
+  ## but does not yet consume it (that's a later RFC-0002 slice).
   %*{
     "nimName": p.nameStr,
     "cName": p.nameStr,
@@ -441,7 +513,8 @@ proc probeFactsJson(p: SoftlinkProc): JsonNode =
     "optional": p.isOptional,
     "noverify": p.noVerify,
     "noverifyReason": p.noVerifyReason,
-    "since": p.sinceVersion
+    "since": p.sinceVersion,
+    "until": p.untilVersion
   }
 
 proc dumpProbeFacts(kind, modulePath, libPattern, baseName: string,
@@ -894,6 +967,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var seenNames: HashSet[string]
   var manifestDirective: CompatManifestDirective
   var versionProbeDirective: VersionProbeDirective
+  var versionMacrosDirective: VersionMacrosDirective
 
   for stmt in body:
     # RFC-0001 §B.5, slice B6a: the `compatManifest` body directive — at
@@ -922,9 +996,22 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         versionProbeDirective = d
       continue
 
+    # RFC-0002 §5/§6, slice E1: the `versionMacros` body directive — Stage
+    # E gate-synthesis input (§5 Layer 2). At most one per block, any
+    # position, mirroring `compatManifest`/`versionProbe` above. This slice
+    # only parses and stores the result (`versionMacrosDirective`); nothing
+    # consumes the macro list yet — see the `discard` near this macro's end.
+    if isVersionMacrosCall(stmt):
+      let d = parseVersionMacrosDirective(stmt, "dynlib")
+      if versionMacrosDirective.present:
+        error(versionMacrosDupError("dynlib", versionMacrosDirective, d), stmt)
+      else:
+        versionMacrosDirective = d
+      continue
+
     if stmt.kind != nnkProcDef:
       error("dynlib body must contain only proc declarations (or a " &
-            "compatManifest directive)", stmt)
+            "compatManifest, versionProbe, or versionMacros directive)", stmt)
 
     let procName = stmt[0]
     let nameStr = $procName
@@ -947,6 +1034,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
                         noVerify: facts.noVerify, noVerifyReason: facts.noVerifyReason,
                         verifyWhen: facts.verifyWhen,
                         prototype: facts.prototype, sinceVersion: facts.sinceVersion,
+                        untilVersion: facts.untilVersion,
                         hasReturn: hasReturn))
 
     # Build proc type for the var — C functions can't raise Nim exceptions
@@ -1061,6 +1149,66 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       else:
         hint(msg, body)
 
+  # RFC-0002 §4.1/§6, slice A3: another trust-point hint, same convention
+  # as the {.noverify.} one directly above (precedent it explicitly names).
+  # Required-symbol drift refusal unwinds the ENTIRE load (see the
+  # required-symbol declared-bound-refusal path, softlink.nim:~1611 in the
+  # RFC's numbering) — so a required proc carrying {.until.} takes every
+  # other symbol in this block down with it once the probed version reaches
+  # the bound, which is usually not what the author wants. `{.optional.}`
+  # procs are exempt: their drift refusal only re-nils that one symbol.
+  # Aggregated per block, enumerating every offending symbol, exactly like
+  # the noverify hint — a hint in normal builds, a warning under
+  # -d:softlinkStrictVerify (a required+until symbol is a HIGHER-severity
+  # trust point than a bare noverify: it can silently take the whole block
+  # down, not just leave one symbol unverified).
+  block:
+    var driftedRequired: seq[string]
+    for p in procs:
+      if p.untilVersion.len > 0 and not p.isOptional:
+        driftedRequired.add(p.nameStr & " (until " & p.untilVersion & ")")
+    if driftedRequired.len > 0:
+      let msg = "softlink: dynlib \"" & libPattern & "\": " &
+        $driftedRequired.len &
+        (if driftedRequired.len == 1: " symbol" else: " symbols") &
+        " drifted-but-required (" & driftedRequired.join(", ") &
+        "): drifted-but-required symbols fail the whole load above " &
+        "until; did you mean {.optional.}?"
+      when defined(softlinkStrictVerify):
+        warning(msg, body)
+      else:
+        hint(msg, body)
+
+  # RFC-0002 §5/§6, slice E2: gate synthesis — MUST run before
+  # `checkUntilRequiresGate` right below: a successfully-synthesized
+  # predicate is assigned straight into `p.verifyWhen`, so that check sees
+  # a satisfied gate and never fires for a proc this pass covered. See
+  # `synthesizeVersionGates`'s own doc comment for the full scope rule
+  # (until-carrying procs only, explicit verifyWhen always wins, no-op
+  # without a versionMacros directive).
+  synthesizeVersionGates(procs, versionMacrosDirective.present,
+                          versionMacrosDirective.macroNames, "dynlib")
+
+  # RFC-0002 §4.1/§5/§6, slice D1: `until` requires `verifyWhen` —
+  # unconditional, post-body-scan (`procs` is fully collected by this
+  # point), and deliberately called BEFORE `applyCompatManifest` just
+  # below: unlike the since/until contradiction checks inside it (Check
+  # 6/6b), this requirement does not depend on a `compatManifest` being
+  # attached at all — see `checkUntilRequiresGate`'s own doc comment. Runs
+  # AFTER synthesis just above, so a `versionMacros`-satisfied gate never
+  # trips this check.
+  checkUntilRequiresGate(procs, "dynlib")
+
+  # Code-review finding CR1-12: a `versionMacros` directive nothing ended up
+  # consuming (no `until` proc synthesized a gate from it) is a silent no-op
+  # otherwise — hint the author, same post-synthesis timing as the check
+  # just above. See `checkVersionMacrosConsumed`'s own doc comment for why
+  # this stays a plain hint at every verify tier, unlike the noverify/
+  # drifted-but-required hints above.
+  checkVersionMacrosConsumed(procs, versionMacrosDirective.present,
+                              versionMacrosDirective.macroNames, "dynlib",
+                              versionMacrosDirective.node)
+
   # RFC-0001 §B.5, slice B6a: compile-time compat-manifest consumption —
   # no-op unless a `compatManifest` directive was found above. Must run
   # before `genVerifyBlock` so its `attached` bit (whether a manifest is
@@ -1154,18 +1302,79 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   for p in driftCandidates: driftCandidateNames.incl(p.nameStr)
   for p in requiredDriftCandidates: driftCandidateNames.incl(p.nameStr)
 
+  # RFC-0002 §4.4/§4.9, slice C4b/C4c: procs carrying a declared
+  # `since`/`until` bound — candidates for the declared-bound refusal
+  # fragment emitted into the two non-attested success sites below
+  # (`atOutOfCorpus`, `atNoManifest`). Deliberately INDEPENDENT of
+  # `appliedManifest.attached`/`mismatchCNames` (unlike `driftCandidates`
+  # above, which is keyed on attested manifest facts) — §4.4's whole point
+  # is refusing off the AUTHOR'S declaration where manifest facts can't
+  # decide, including the manifest-less `atNoManifest` site. Gated only on
+  # `hasProbe` (nothing to compare a bound against without a probed
+  # version) and `driftRefusalEnabled` (the same escape hatches
+  # `driftCandidates`/`requiredDriftCandidates` honor — "absent, not
+  # merely disabled", same degradation argument). Split into the OPTIONAL
+  # subset (`declaredBoundOptionalCandidates`, C4b: re-nil + continue) and
+  # the REQUIRED subset (`declaredBoundRequiredCandidates`, C4c: unwind the
+  # whole load) — mirrors the attested `driftCandidates`/
+  # `requiredDriftCandidates` split above exactly.
+  var declaredBoundOptionalCandidates: seq[SoftlinkProc]
+  var declaredBoundRequiredCandidates: seq[SoftlinkProc]
+  if hasProbe and driftRefusalEnabled:
+    for p in procs:
+      if p.sinceVersion.len > 0 or p.untilVersion.len > 0:
+        if p.isOptional: declaredBoundOptionalCandidates.add(p)
+        else: declaredBoundRequiredCandidates.add(p)
+  for p in declaredBoundOptionalCandidates: driftCandidateNames.incl(p.nameStr)
+  for p in declaredBoundRequiredCandidates: driftCandidateNames.incl(p.nameStr)
+
+  # RFC-0002 §4.4, code-review finding CR1-1 (Critical): the ATTESTED
+  # path's own subset of the two lists above — bounded procs that are ALSO
+  # ABSENT from the attached manifest's own symbol table
+  # (`findSymbol(...).isNone`). `checkUntil`/`checkSince` (softlink/manifest)
+  # vacuous-pass on a symbol absent from the manifest (nothing recorded to
+  # check the declared bound against), and the attested branch below
+  # (`attestedStmts`) otherwise refuses ONLY off the manifest's own
+  # `fkMismatch` facts (`mismatchCNames`, built above from symbols PRESENT
+  # in the manifest) — so, before this fix, a bounded proc absent from the
+  # manifest got ZERO declared-bound enforcement even when the probe
+  # attested an in-corpus version at-or-above its declared bound. Bounded
+  # procs PRESENT in the manifest are the opposite case: `checkUntil`
+  # (directives.nim Check 6b) already validated THOSE against the corpus at
+  # compile time, so re-checking them here on the attested path would be
+  # pure redundancy — they stay exempt, unchanged from C4b/C4c (existing
+  # fixtures, e.g. `testlib_gated` at an attested in-window version,
+  # depend on this exemption).
+  #
+  # Computed only when a manifest is attached (`findSymbol` needs one); the
+  # `atNoManifest`/`atOutOfCorpus` sites below keep iterating the FULL
+  # `declaredBoundOptionalCandidates`/`declaredBoundRequiredCandidates`
+  # lists, unaffected by this addition.
+  var declaredBoundOptionalCandidatesAbsent: seq[SoftlinkProc]
+  var declaredBoundRequiredCandidatesAbsent: seq[SoftlinkProc]
+  if appliedManifest.attached:
+    for p in declaredBoundOptionalCandidates:
+      if findSymbol(appliedManifest.manifest, p.nameStr).isNone:
+        declaredBoundOptionalCandidatesAbsent.add(p)
+    for p in declaredBoundRequiredCandidates:
+      if findSymbol(appliedManifest.manifest, p.nameStr).isNone:
+        declaredBoundRequiredCandidatesAbsent.add(p)
+
   # RFC-0001 §C.3, slice C4b design guidance (extended by C4c to the
-  # required subset too): one drift-story seq per block —
+  # required subset too; RFC-0002 §4.4 slice C4b extends it again to
+  # declared-bound refusal): one drift-story seq per block —
   # `softlinkDriftStories<Base>: seq[tuple[symbol, story: string]]` —
   # populated at refusal time inside loadXxx below, scanned (linearly,
   # error-path only) by the wrapper's nil-pointer branch, and reset by
-  # unloadXxx. Zero footprint when nothing could ever be refused (both
-  # candidate lists empty): gated on the ACTUAL refusal-candidate lists,
+  # unloadXxx. Zero footprint when nothing could ever be refused (every
+  # candidate list empty): gated on the ACTUAL refusal-candidate lists,
   # not merely `appliedManifest.attached`, since a manifest with mismatch
   # facts but no probe, or `refuse = false`/`-d:softlinkNoDriftRefusal`,
   # generates no refusal code at all and would leave this var write-only.
   let driftStoriesName = ident("softlinkDriftStories" & baseName)
-  if driftCandidates.len > 0 or requiredDriftCandidates.len > 0:
+  if driftCandidates.len > 0 or requiredDriftCandidates.len > 0 or
+     declaredBoundOptionalCandidates.len > 0 or
+     declaredBoundRequiredCandidates.len > 0:
     result.add(newNimNode(nnkVarSection).add(
       newNimNode(nnkIdentDefs).add(
         driftStoriesName,
@@ -1307,8 +1516,316 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     var hasOptional = false
     for p in procs:
       if p.isOptional: hasOptional = true; break
+
+    # RFC-0002 §4.9, slice C4a: the ONE canonical declared-bounds
+    # embedding for C1 (classification) and C2 (report intervals). Replaces
+    # the old optional-only `sinceCNames`/`sinceVersions` build (formerly
+    # nested inside `if hasOptional:`, scoped to `p.isOptional and
+    # p.sinceVersion.len > 0`): three parallel macro-time `seq[string]`s —
+    # `boundCNames`/`boundSinceVersions`/`boundUntilVersions` — covering
+    # EVERY proc in this block carrying a `since` and/or `until` claim
+    # (required or optional), built UNCONDITIONALLY (not gated on
+    # `hasOptional`), so C1 and C2 both filter the SAME data instead of
+    # each growing its own copy of this collection loop.
+    #
+    # Code-review finding CR1-6: this is NOT also C4's collection loop.
+    # C4's own candidate lists (`declaredBoundOptionalCandidates`/
+    # `declaredBoundRequiredCandidates`, built earlier, above) are a
+    # SEPARATE scan over `procs` with the identical
+    # `p.sinceVersion.len > 0 or p.untilVersion.len > 0` predicate, and
+    # deliberately stay separate rather than being derived from (or
+    # merged with) this one: (1) gating differs — this loop is
+    # unconditional (`computeMissingPartition`'s absence classification is
+    # independent of drift-refusal policy), while C4's lists are built
+    # only `if hasProbe and driftRefusalEnabled`; a single merged loop
+    # would have to pick ONE of the two gatings, wrongly coupling C1/C2's
+    # unconditional classification data to C4's refusal-policy gate (or,
+    # the other way round, coupling C4's refusal candidates to C1/C2's
+    # unconditional one) — so the two scans stay separate instead; (2)
+    # shape differs — C4's refusal codegen
+    # (`declaredBoundRefusalStmts`) needs the full `SoftlinkProc` (`ptrName`,
+    # `isOptional`, etc.) to emit per-symbol runtime checks, not the flat
+    # `string` triples `computeMissingPartition` consumes via
+    # `newLit(seq[string])`. Deliberately kept as plain parallel arrays
+    # rather than a `seq[tuple]` — matches the shape `computeMissingPartition`
+    # below already consumes via `newLit(seq[string])`, and matches the ~6
+    # `assignCompatReportStmt`/`reportFields` call sites' own existing
+    # parallel-field style; the `seq[tuple]` refactor is a known,
+    # consciously deferred cleanup (§4.9), not an oversight. `""` in
+    # `boundSinceVersions`/`boundUntilVersions` means "this proc's OTHER
+    # bound only" (mirrors `SoftlinkProc.sinceVersion`/`.untilVersion`'s
+    # own "" == absent convention) — a proc with only `until` still gets a
+    # `boundCNames` row so a future `until`-only consumer has one to find.
+    # Including REQUIRED procs and until-only procs is behavior-preserving
+    # for THIS slice's sole consumer (`computeMissingPartition` below):
+    # its lookup only ever probes names already in `softlinkMissing`, which
+    # never contains a required symbol on a successful load (Phase 1 fails
+    # the whole load first) — the widened rows are simply never matched.
+    var boundCNames: seq[string] = @[]
+    var boundSinceVersions: seq[string] = @[]
+    var boundUntilVersions: seq[string] = @[]
+    for p in procs:
+      if p.sinceVersion.len > 0 or p.untilVersion.len > 0:
+        boundCNames.add(p.nameStr)
+        boundSinceVersions.add(p.sinceVersion)
+        boundUntilVersions.add(p.untilVersion)
+
+    # RFC-0001 §C.3, slice C4c: every proc's own pointer var in this block,
+    # for a required-refusal unwind's `resetPtrs` — a required refusal walks
+    # back the ENTIRE load (mirroring unloadX's own per-proc reset loop),
+    # not just the one drifted symbol's pointer. Built once, here, ahead of
+    # BOTH `declaredBoundRefusalStmts()` (below, C4c's non-attested unwind)
+    # and the attested `requiredDriftCandidates` loop (further below) — the
+    # two required-refusal shapes share this exact same array.
+    var allPtrNames: seq[NimNode] = @[]
+    for p in procs: allPtrNames.add(p.ptrName)
+
     var loadBody = newStmtList()
     let missingName = ident("softlinkMissing")
+
+    # RFC-0002 §4.4/§4.9, slice C4b/C4c (extended by CR1-1's attested-path
+    # fix): the ONE shared declared-bound-refusal codegen fragment, called
+    # from THREE sites below — the `atNoManifest` probe-succeeded arm, the
+    # `atAttested` branch, and the `atOutOfCorpus` branch (search
+    # `declaredBoundRefusalStmts(` to find all three) — a closure over
+    # `declaredBoundOptionalCandidates`/`declaredBoundRequiredCandidates`
+    # (both computed once, above, alongside `driftCandidates`/
+    # `requiredDriftCandidates`), `missingName`, `driftStoriesName`,
+    # `allPtrNames`, and `probedVersionName`, exactly like
+    # `unwindStmt`/`assignCompatReportStmt` close over their own outer
+    # locals. `atNoManifest` and `atAttested`/`atOutOfCorpus` are mutually
+    # exclusive at macro-expansion time (the `hasProbe`/
+    # `appliedManifest.attached` macro-time `if/elif/else` picks exactly
+    # one of those two shapes), but WITHIN the attached-manifest shape both
+    # `atAttested` and `atOutOfCorpus` call this proc — two calls in the
+    # SAME macro expansion, since the runtime `corpusIf`/`else` branching
+    # they emit into is not a macro-time choice. This is safe because each
+    # call mints its OWN `genSym`'d `partitionSym`/`notComparableSym`
+    # (internal to this proc — see the returned `reportFields` below) —
+    # multiple emissions per expansion never collide, whether that is the
+    # attached shape's two calls or any future site added here.
+    #
+    # Per §4.4's comparison rule: for each candidate's `until` (if any) and
+    # `since` (if any) independently, `versions.compareToBound(probed,
+    # bound)` — NOT raw `cmpVersion` (module doc: alpha-suffix pre-release
+    # ordering would invert the flagship distro-suffix case). A decisive
+    # `until` result (`isSome` and `>= 0`, i.e. at-or-above `until`) OR a
+    # decisive `since` result (`isSome` and `< 0`, i.e. below `since`)
+    # refuses the symbol — both bounds get the same rigor (§4.4 "both
+    # bounds, same check" symmetry). A `none` result from EITHER
+    # comparison never refuses on its own; it sets the shared
+    # `notComparableSym` flag instead (report-don't-block for that
+    # boundary tie/unparseable probe) — independent per bound, so one
+    # candidate's ambiguous `since` check doesn't suppress another
+    # candidate's decisive `until` refusal. This comparison logic
+    # (`buildBoundCheck` below) is shared verbatim between the required
+    # and optional loops — required/optional differ ONLY in the terminal
+    # action once a hit is decided, exactly mirroring how the attested
+    # `driftCandidates`/`requiredDriftCandidates` loops share the
+    # `firstMismatchInterval` shape but differ in what happens on a hit.
+    #
+    # An already-nil pointer (Phase 2's concern — genuinely absent at
+    # runtime) is skipped by construction (`if not isNil(p.ptrName)`),
+    # exactly like the attested `driftCandidates` loop above — no
+    # double-count with `computeMissingPartition`'s own `mrAnomalous`/
+    # `mrExpected` classification of that same absence. (For a REQUIRED
+    # candidate this guard is always-true by construction — Phase 1
+    # guarantees every required symbol resolved before this point ever
+    # runs, the same reasoning the attested `requiredDriftCandidates` loop
+    # already documents — so it is kept only for uniformity with the
+    # shared helper, not because it can fire.)
+    #
+    # OPTIONAL refusal action mirrors the attested loop's shape (re-nil the
+    # pointer, add to `missing`, stash a drift story so the wrapper raises
+    # it instead of the generic "not loaded" message, keep classifying the
+    # rest of the block). REQUIRED refusal (C4c) instead unwinds the WHOLE
+    # load via `unwindStmt`'s third shape (mirror of `requiredDriftCandidates`,
+    # `resetPtrs = allPtrNames`, `resetProbeState = true`) — symmetry with
+    # the attested required/optional split. Both source their
+    # `VersionInterval` from the proc's own DECLARED `since`/`until` (§4.9's
+    # declared-bound evidence-interval leg — there is no manifest-confirmed
+    # `firstMismatchInterval` at either of these two sites) and use
+    # distinct wording ("declared valid only at", not "per compat manifest") —
+    # §4.4's consumer-disambiguation guarantee: `report.attestation`
+    # (`atOutOfCorpus`/`atNoManifest` vs `atAttested`) crossed with the
+    # `mrDriftRefused` entry already tells the two stories apart; the
+    # wording difference is a second, belt-and-suspenders cue.
+    #
+    # `attestationIdent` is the call site's own `Attestation` value
+    # (`atOutOfCorpus`/`atNoManifest`) — needed here (unlike the optional-
+    # only shape) because a REQUIRED hit builds and returns its OWN
+    # `CompatReport` via `unwindStmt`, bypassing the caller's own
+    # `assignCompatReportStmt` entirely. `priorMissingField` is the
+    # caller's already-computed C3 `missingReasons` NimNode (the
+    # `atOutOfCorpus` site's `missingPartitionFields[0][1]` when
+    # `hasOptional`, mirroring the attested required loop's own
+    # `reqMissingSym` merge) to fold into a required hit's report, or
+    # `nil` when there is none to fold in (always `nil` at `atNoManifest`
+    # — §4.4: "there is no facts-driven partition to compute" there).
+    #
+    # Code-review finding R2-C: this fragment owns BOTH halves of the
+    # report-merge seam, not just the refusal statements. `priorMissingField`
+    # is folded with this call's own `partitionSym` ONCE, here (`&` when
+    # non-nil, `partitionSym` alone otherwise), and the result is returned
+    # pre-packaged as `reportFields = @[("missingReasons", <merged>),
+    # ("probeNotComparable", notComparableSym)]` — the exact two fields
+    # every one of the three call sites needs for its OWN success-path
+    # `assignCompatReportStmt`. Each site now just splices `reportFields`
+    # in (`.add` at the `atNoManifest` site, which grows an existing field
+    # seq; a plain `=` at the other two, which fully replace theirs) instead
+    # of re-deriving the same fold-then-append shape three times.
+    #
+    # `requiredCandidates`/`optionalCandidates` (code-review finding CR1-1):
+    # the two candidate lists to iterate, taken as explicit params rather
+    # than closing over `declaredBoundRequiredCandidates`/
+    # `declaredBoundOptionalCandidates` directly — the `atNoManifest`/
+    # `atOutOfCorpus` call sites below pass those FULL lists (unchanged
+    # behavior), while the new attested-path call site passes their
+    # manifest-absent SUBSETS (`declaredBoundRequiredCandidatesAbsent`/
+    # `declaredBoundOptionalCandidatesAbsent`, computed above) — the one
+    # shared fragment now serves three call sites with three different
+    # candidate scopes.
+    proc declaredBoundRefusalStmts(attestationIdent: NimNode,
+        priorMissingField: NimNode,
+        requiredCandidates, optionalCandidates: seq[SoftlinkProc]
+        ): tuple[stmts: NimNode, reportFields: seq[(string, NimNode)]] =
+      let partitionSym = genSym(nskVar, "declaredBoundRefused")
+      let notComparableSym = genSym(nskVar, "declaredBoundNotComparable")
+      var stmts = newStmtList()
+      stmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
+        partitionSym,
+        newNimNode(nnkBracketExpr).add(ident("seq"), bindSym("MissingReasonEntry")),
+        newEmptyNode())))
+      stmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
+        notComparableSym, ident("bool"), newEmptyNode())))
+      # Takes `sinceStr`/`untilStr` as plain VALUE params (never captures
+      # the `for p in ...` loop variable below) — `p` is a `lent
+      # SoftlinkProc` (the default `seq` `items` iterator), and Nim
+      # forbids capturing a `lent` value into a closure (memory-safety
+      # error, hit empirically during this slice's own TDD cycle: "'p' is
+      # of type <lent SoftlinkProc> which cannot be captured"). Copying
+      # the two string fields out at each call site sidesteps the whole
+      # class of error.
+      proc declaredIvNode(sinceStr, untilStr: string): NimNode =
+        newNimNode(nnkObjConstr).add(
+          bindSym("VersionInterval"),
+          newNimNode(nnkExprColonExpr).add(ident("lo"), newStrLitNode(sinceStr)),
+          newNimNode(nnkExprColonExpr).add(ident("hi"), newStrLitNode(untilStr)))
+
+      # Shared comparison/decision AST, used by BOTH loops below — same
+      # value-param convention as `declaredIvNode` above, same reason.
+      #
+      # Code-review finding CR1-4: the refuse/not-comparable decision
+      # itself no longer lives here as hand-assembled NimNode trees — it's
+      # `versions.evaluateBoundRefusal` (a plain, directly unit-tested
+      # proc, house style per `directives.nim`'s doc comment: every
+      # sibling decision — `checkUntil`, `classifyAbsence`, `synthesizeGate`,
+      # `compareToBound` — is a pure proc merely SEQUENCED by macro code).
+      # This proc now only binds the runtime call and destructures its
+      # result into the two module-level flag vars (`refuseSym`, shared
+      # `notComparableSym`) the rest of the codegen below already expects.
+      proc buildBoundCheck(sinceStr, untilStr: string): tuple[checkStmts, refuseSym: NimNode] =
+        let refuseSym = genSym(nskVar, "declaredBoundRefuse")
+        let evalSym = genSym(nskLet, "declaredBoundEval")
+        var checkStmts = newStmtList()
+        checkStmts.add(newLetStmt(evalSym, newCall(bindSym("evaluateBoundRefusal"),
+          probedVersionName, newStrLitNode(sinceStr), newStrLitNode(untilStr))))
+        checkStmts.add(newVarStmt(refuseSym, newDotExpr(evalSym, ident("refuse"))))
+        checkStmts.add(newIfStmt((
+          newDotExpr(evalSym, ident("notComparable")),
+          newStmtList(newAssignment(notComparableSym, newLit(true))))))
+        (checkStmts, refuseSym)
+
+      proc declaredStoryExpr(nameStr, sinceStr, untilStr: string): NimNode =
+        newNimNode(nnkInfix).add(ident("&"),
+          newNimNode(nnkInfix).add(ident("&"),
+            newStrLitNode(nameStr & ": signature drift, declared valid only at "),
+            newCall(bindSym("formatInterval"), declaredIvNode(sinceStr, untilStr))),
+          newStrLitNode("; refusing unsafe dispatch"))
+
+      # RFC-0002 §4.4, slice C4c: REQUIRED candidates checked FIRST —
+      # mirrors the attested loop's own required-then-optional ordering
+      # and "first hit wins" (a hit `return`s via `unwindStmt`, so any
+      # later check in program order simply never runs).
+      for p in requiredCandidates:
+        let symNameLit = newStrLitNode(p.nameStr)
+        let (checkStmts, refuseSym) = buildBoundCheck(p.sinceVersion, p.untilVersion)
+        let versionSnapshotSym = genSym(nskLet, "declBoundReqVersion")
+        let reqMissingSym = genSym(nskVar, "declBoundReqMissing")
+        var hitStmts = newStmtList()
+        # Snapshot BEFORE unwindStmt's resetProbeState=true clears
+        # `probedVersionName` — same ordering requirement `unwindStmt`'s
+        # own doc comment and the attested required loop already document.
+        hitStmts.add(newLetStmt(versionSnapshotSym, probedVersionName))
+        hitStmts.add(newCall(newDotExpr(driftStoriesName, ident("add")),
+          newNimNode(nnkTupleConstr).add(
+            newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+            newNimNode(nnkExprColonExpr).add(ident("story"),
+              declaredStoryExpr(p.nameStr, p.sinceVersion, p.untilVersion)))))
+        hitStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
+          reqMissingSym,
+          newNimNode(nnkBracketExpr).add(ident("seq"), bindSym("MissingReasonEntry")),
+          newEmptyNode())))
+        if not priorMissingField.isNil:
+          hitStmts.add(newAssignment(reqMissingSym, priorMissingField))
+        hitStmts.add(newCall(newDotExpr(reqMissingSym, ident("add")),
+          newNimNode(nnkTupleConstr).add(
+            newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+            newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")),
+            newNimNode(nnkExprColonExpr).add(ident("interval"),
+              declaredIvNode(p.sinceVersion, p.untilVersion)))))
+        hitStmts.add(unwindStmt(
+          unloadHandle = true,
+          resultKind = ident("lrSymbolNotFound"),
+          resultFields = @[("symbol", symNameLit)],
+          reportFields = @[
+            ("runtimeVersion", versionSnapshotSym),
+            ("attestation", attestationIdent),
+            ("missingReasons", reqMissingSym)],
+          resetPtrs = allPtrNames,
+          resetProbeState = true))
+        checkStmts.add(newIfStmt((refuseSym, hitStmts)))
+        stmts.add(newIfStmt((
+          prefix(newCall(ident("isNil"), p.ptrName), "not"),
+          checkStmts)))
+
+      # OPTIONAL candidates: re-nil the pointer and keep classifying
+      # (unchanged shape from C4b).
+      for p in optionalCandidates:
+        let symNameLit = newStrLitNode(p.nameStr)
+        let (checkStmts, refuseSym) = buildBoundCheck(p.sinceVersion, p.untilVersion)
+
+        var refuseStmts = newStmtList()
+        refuseStmts.add(newAssignment(p.ptrName, newNilLit()))
+        refuseStmts.add(newCall(newDotExpr(missingName, ident("add")), symNameLit))
+        refuseStmts.add(newCall(newDotExpr(driftStoriesName, ident("add")),
+          newNimNode(nnkTupleConstr).add(
+            newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+            newNimNode(nnkExprColonExpr).add(ident("story"),
+              declaredStoryExpr(p.nameStr, p.sinceVersion, p.untilVersion)))))
+        refuseStmts.add(newCall(newDotExpr(partitionSym, ident("add")),
+          newNimNode(nnkTupleConstr).add(
+            newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
+            newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")),
+            newNimNode(nnkExprColonExpr).add(ident("interval"),
+              declaredIvNode(p.sinceVersion, p.untilVersion)))))
+        checkStmts.add(newIfStmt((refuseSym, refuseStmts)))
+
+        stmts.add(newIfStmt((
+          prefix(newCall(ident("isNil"), p.ptrName), "not"),
+          checkStmts)))
+
+      # Code-review finding R2-C: fold `priorMissingField` (the caller's
+      # already-computed C3/attested-drift partition, or `nil` when there
+      # is none) with THIS call's own `partitionSym` exactly once, here,
+      # and hand back the two report fields every call site needs —
+      # rather than each of the three call sites re-deriving this same
+      # fold-then-append shape itself.
+      let missingNode =
+        if priorMissingField.isNil: partitionSym
+        else: newNimNode(nnkInfix).add(ident("&"), priorMissingField, partitionSym)
+      (stmts, @[("missingReasons", missingNode),
+                ("probeNotComparable", notComparableSym)])
 
     # RFC-0001 §9/§C.1: reentrancy guard — must run BEFORE the idempotent
     # handle-check below. By the time a versionProbe body could call
@@ -1344,7 +1861,9 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # from the CURRENT attempt. Guarded on the same condition as the var's
     # own declaration above — a no-op statement would otherwise reference a
     # var that was never declared when neither candidate list is populated.
-    if driftCandidates.len > 0 or requiredDriftCandidates.len > 0:
+    if driftCandidates.len > 0 or requiredDriftCandidates.len > 0 or
+       declaredBoundOptionalCandidates.len > 0 or
+       declaredBoundRequiredCandidates.len > 0:
       loadBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
 
     # handle = loadLibPattern(pattern)
@@ -1517,16 +2036,41 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     elif not appliedManifest.attached:
       # Probed, no manifest to check against: failed -> atProbeFailed;
       # succeeded -> atNoManifest + the probed version.
+      #
+      # RFC-0002 §4.4/§4.9, slice C4b: this `atNoManifest` success arm is
+      # one of the two sites §4.4 names for the manifest-less declared-
+      # bound refusal check ("the atNoManifest path's else arm") — the
+      # SAME `declaredBoundRefusalStmts()` fragment the `atOutOfCorpus`
+      # branch below calls. `missingReasons` here is populated ONLY with
+      # this fragment's own refusal entries (§4.4: "there is no facts-
+      # driven partition to compute" in a manifest-less block) — no
+      # `computeMissingPartition` call exists at this site at all. Omitted
+      # entirely (both fields default: `missingReasons: @[]`,
+      # `probeNotComparable: false`) when this block has no optional
+      # bounded procs (or refusal is disabled/no probe) — same "absent,
+      # not merely empty" degradation as `driftCandidates` elsewhere.
       var reportIf = newNimNode(nnkIfStmt)
       reportIf.add(newNimNode(nnkElifBranch).add(
         probeFailedName,
         newStmtList(assignCompatReportStmt(@[("attestation", ident("atProbeFailed"))]))
       ))
-      reportIf.add(newNimNode(nnkElse).add(newStmtList(
-        assignCompatReportStmt(@[
-          ("runtimeVersion", probedVersionName),
-          ("attestation", ident("atNoManifest"))])
-      )))
+      var noManifestSuccessStmts = newStmtList()
+      var noManifestFields: seq[(string, NimNode)] = @[
+        ("runtimeVersion", probedVersionName),
+        ("attestation", ident("atNoManifest"))]
+      if declaredBoundOptionalCandidates.len > 0 or declaredBoundRequiredCandidates.len > 0:
+        # §4.4: no facts-driven partition exists in a manifest-less block —
+        # a required hit's own report (built inside `unwindStmt`) carries
+        # ONLY its own refusal entry, hence `nil` here (see the proc's own
+        # doc comment for the `atOutOfCorpus` counterpart, which DOES have
+        # one to fold in).
+        let (refusalStmts, reportFields) =
+          declaredBoundRefusalStmts(ident("atNoManifest"), nil,
+            declaredBoundRequiredCandidates, declaredBoundOptionalCandidates)
+        noManifestSuccessStmts.add(refusalStmts)
+        noManifestFields.add(reportFields)
+      noManifestSuccessStmts.add(assignCompatReportStmt(noManifestFields))
+      reportIf.add(newNimNode(nnkElse).add(noManifestSuccessStmts))
       loadBody.add(reportIf)
     else:
       # Probed AND a manifest is attached: failed -> atProbeFailed;
@@ -1538,12 +2082,9 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # handoff for the full rationale).
       let corpusLit = newLit(appliedManifest.manifest.corpus)
 
-      # RFC-0001 §C.3, slice C4c: every proc's own pointer var in this
-      # block, for the required-refusal unwind's `resetPtrs` — a required
-      # refusal walks back the ENTIRE load (mirroring unloadX's own
-      # per-proc reset loop), not just the one drifted symbol's pointer.
-      var allPtrNames: seq[NimNode] = @[]
-      for p in procs: allPtrNames.add(p.ptrName)
+      # `allPtrNames` (the required-refusal unwind's `resetPtrs`) is built
+      # once, above, ahead of `declaredBoundRefusalStmts()` — this branch
+      # and that fragment share the same array.
 
       # RFC-0001 §9/§C.2, slice C3: the absence partition (`mrExpected`/
       # `mrAnomalous`), computed AT MOST once per successful, manifest-
@@ -1562,19 +2103,25 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       var missingPartitionFields: seq[(string, NimNode)] = @[]
       var missingPartitionLet = newEmptyNode()
       if hasOptional:
-        var sinceCNames: seq[string] = @[]
-        var sinceVersions: seq[string] = @[]
-        for p in procs:
-          if p.isOptional and p.sinceVersion.len > 0:
-            sinceCNames.add(p.nameStr)
-            sinceVersions.add(p.sinceVersion)
+        # RFC-0002 §4.9, slice C4a: sourced from the canonical
+        # `boundCNames`/`boundSinceVersions`/`boundUntilVersions` embedding
+        # built once, above, for the whole `block:` — no local rebuild.
+        # Passing the WIDENED arrays (now including required and
+        # until-only procs) is behavior-preserving here, see the
+        # embedding's own comment for why.
+        #
+        # RFC-0002 §4.3, slice C1: `boundUntilVersions` is now consumed
+        # too (was built but unused as of C4a) — `computeMissingPartition`
+        # threads it straight into `classifyAbsence`'s new `untilVersion`
+        # param, demoting an at-or-above-`until` absence to `acExpected`.
         let missingPartitionSym = genSym(nskLet, "missingPartition")
         missingPartitionLet = newLetStmt(missingPartitionSym, newCall(
           bindSym("computeMissingPartition"),
           ident("softlinkCompatFacts" & baseName),
           missingName,
-          newLit(sinceCNames),
-          newLit(sinceVersions),
+          newLit(boundCNames),
+          newLit(boundSinceVersions),
+          newLit(boundUntilVersions),
           probedVersionName
         ))
         missingPartitionFields.add(("missingReasons", missingPartitionSym))
@@ -1649,7 +2196,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         # computed above), plus this symbol's own `mrDriftRefused` entry.
         hitStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
           reqMissingSym,
-          seqOfTupleType([("symbol", "string"), ("reason", "MissingReason")]),
+          newNimNode(nnkBracketExpr).add(ident("seq"), bindSym("MissingReasonEntry")),
           newEmptyNode())))
         if hasOptional:
           # `missingPartitionFields[0][1]` is the `missingPartitionSym`
@@ -1660,10 +2207,18 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           # code's own `baseMissingNode = missingPartitionFields[0][1]`
           # does a little further below.
           hitStmts.add(newAssignment(reqMissingSym, missingPartitionFields[0][1]))
+        # RFC-0002 §4.9, slice C2: this is the ATTESTED-MISMATCH leg of the
+        # evidence-interval rule — `mismatchSym` (below) is this symbol's
+        # own `firstMismatchInterval` result, already known `isSome` (this
+        # statement only runs inside the `isSome(mismatchSym)` branch), so
+        # `.get` is safe and the interval is strictly the manifest's own,
+        # not the proc's declared `since`/`until`.
         hitStmts.add(newCall(newDotExpr(reqMissingSym, ident("add")),
           newNimNode(nnkTupleConstr).add(
             newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
-            newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")))))
+            newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")),
+            newNimNode(nnkExprColonExpr).add(ident("interval"),
+              newCall(bindSym("get"), mismatchSym)))))
         hitStmts.add(unwindStmt(
           unloadHandle = true,
           resultKind = ident("lrSymbolNotFound"),
@@ -1682,7 +2237,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         let driftPartitionSym = genSym(nskVar, "driftRefusedPartition")
         attestedStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
           driftPartitionSym,
-          seqOfTupleType([("symbol", "string"), ("reason", "MissingReason")]),
+          newNimNode(nnkBracketExpr).add(ident("seq"), bindSym("MissingReasonEntry")),
           newEmptyNode())))
         for p in driftCandidates:
           let symNameLit = newStrLitNode(p.nameStr)
@@ -1699,10 +2254,16 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
             newNimNode(nnkTupleConstr).add(
               newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
               newNimNode(nnkExprColonExpr).add(ident("story"), storyExpr))))
+          # RFC-0002 §4.9, slice C2: same attested-mismatch leg as the
+          # required-symbol loop above — `mismatchSym.get`, not the
+          # proc's declared bounds (this symbol may carry none at all,
+          # e.g. `testlib_gated`, which has no `since`/`until` pragma).
           refuseStmts.add(newCall(newDotExpr(driftPartitionSym, ident("add")),
             newNimNode(nnkTupleConstr).add(
               newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
-              newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")))))
+              newNimNode(nnkExprColonExpr).add(ident("reason"), ident("mrDriftRefused")),
+              newNimNode(nnkExprColonExpr).add(ident("interval"),
+                newCall(bindSym("get"), mismatchSym)))))
           let candBlock = newStmtList(
             newLetStmt(mismatchSym, newCall(bindSym("firstMismatchInterval"),
               ident("softlinkCompatFacts" & baseName), symNameLit, probedVersionName)),
@@ -1718,6 +2279,37 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         let baseMissingNode = missingPartitionFields[0][1]
         attestedMissingFields = @[("missingReasons",
           newNimNode(nnkInfix).add(ident("&"), baseMissingNode, driftPartitionSym))]
+
+      # RFC-0002 §4.4, code-review finding CR1-1 (Critical): the ATTESTED
+      # path's own declared-bound refusal, restricted to bounded procs
+      # ABSENT from the attached manifest (`declaredBoundRequiredCandidatesAbsent`/
+      # `declaredBoundOptionalCandidatesAbsent`, computed once above,
+      # alongside the full lists). `checkUntil`/`checkSince` vacuously pass
+      # on a manifest-absent symbol (nothing recorded to check the
+      # declaration against), so — unlike a manifest-PRESENT bounded proc,
+      # whose compile-time-validated declaration makes a runtime re-check
+      # here pure redundancy (unchanged, see the required/optional loops
+      # just above, both keyed on `mismatchCNames`/manifest facts only) — a
+      # manifest-absent bounded proc got ZERO enforcement on this path
+      # before this fix, even when the probe attests an in-corpus version
+      # at-or-above its declared bound. Emitted AFTER both mismatch-fact
+      # loops above (required-drift, then optional-drift): a symbol can
+      # only ever be a candidate for ONE of the three mechanisms (mismatch-
+      # fact loops only ever see manifest-PRESENT symbols; this fragment
+      # only ever sees manifest-ABSENT ones), so the ordering doesn't change
+      # any existing symbol's outcome — it is purely additive, and (for the
+      # required flavor) "first hit wins" still holds trivially since no
+      # symbol can hit both mechanisms.
+      if declaredBoundRequiredCandidatesAbsent.len > 0 or
+         declaredBoundOptionalCandidatesAbsent.len > 0:
+        let priorMissingFieldAttested =
+          if attestedMissingFields.len > 0: attestedMissingFields[0][1] else: nil
+        let (absentRefusalStmts, reportFields) =
+          declaredBoundRefusalStmts(ident("atAttested"), priorMissingFieldAttested,
+            declaredBoundRequiredCandidatesAbsent, declaredBoundOptionalCandidatesAbsent)
+        attestedStmts.add(absentRefusalStmts)
+        attestedMissingFields = reportFields
+
       attestedStmts.add(assignCompatReportStmt(@[
         ("runtimeVersion", probedVersionName),
         ("attestation", ident("atAttested"))] & attestedMissingFields))
@@ -1727,11 +2319,38 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newNimNode(nnkInfix).add(ident("in"), probedVersionName, corpusLit),
         attestedStmts
       ))
-      corpusIf.add(newNimNode(nnkElse).add(newStmtList(
-        assignCompatReportStmt(@[
-          ("runtimeVersion", probedVersionName),
-          ("attestation", ident("atOutOfCorpus"))] & missingPartitionFields)
-      )))
+      # RFC-0002 §4.4/§4.9, slice C4b/C4c: this `atOutOfCorpus` else-branch
+      # is the other site §4.4 names for the declared-bound refusal check —
+      # the SAME `declaredBoundRefusalStmts()` fragment the `atNoManifest`
+      # arm above calls. `missingPartitionFields` (the C3 absence
+      # partition, computed once above via `missingPartitionLet`, BEFORE
+      # `corpusIf` — see `successStmts` below) is read here FIRST, then
+      # this fragment's own `mrDriftRefused` entries are appended — the
+      # "no double-count" emission-order §4.4 specifies. Whenever
+      # `declaredBoundOptionalCandidates` is nonempty, `hasOptional` is
+      # necessarily true too (its members are all optional), so
+      # `missingPartitionFields` is guaranteed to hold exactly the one
+      # `("missingReasons", <sym>)` entry `computeMissingPartition` built —
+      # same precondition the `atAttested` branch's own `driftCandidates`
+      # merge (`baseMissingNode`, above) already relies on. UNLIKE the
+      # optional-only C4b guard, `declaredBoundRequiredCandidates` is NOT
+      # gated on `p.isOptional`, so a block with only required bounded
+      # procs (no optional ones at all) can reach here with `hasOptional`
+      # false and an empty `missingPartitionFields` — guarded explicitly
+      # below rather than assumed.
+      var outOfCorpusStmts = newStmtList()
+      var outOfCorpusFields = missingPartitionFields
+      if declaredBoundOptionalCandidates.len > 0 or declaredBoundRequiredCandidates.len > 0:
+        let priorMissingField = if hasOptional: missingPartitionFields[0][1] else: nil
+        let (refusalStmts, reportFields) =
+          declaredBoundRefusalStmts(ident("atOutOfCorpus"), priorMissingField,
+            declaredBoundRequiredCandidates, declaredBoundOptionalCandidates)
+        outOfCorpusStmts.add(refusalStmts)
+        outOfCorpusFields = reportFields
+      outOfCorpusStmts.add(assignCompatReportStmt(@[
+        ("runtimeVersion", probedVersionName),
+        ("attestation", ident("atOutOfCorpus"))] & outOfCorpusFields))
+      corpusIf.add(newNimNode(nnkElse).add(outOfCorpusStmts))
       var reportIf = newNimNode(nnkIfStmt)
       reportIf.add(newNimNode(nnkElifBranch).add(
         probeFailedName,
@@ -1859,7 +2478,9 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # must never serve a previous load's probe result.
       unloadBody.add(newAssignment(probedVersionName, newStrLitNode("")))
       unloadBody.add(newAssignment(probeFailedName, newLit(false)))
-    if driftCandidates.len > 0 or requiredDriftCandidates.len > 0:
+    if driftCandidates.len > 0 or requiredDriftCandidates.len > 0 or
+       declaredBoundOptionalCandidates.len > 0 or
+       declaredBoundRequiredCandidates.len > 0:
       # RFC-0001 §C.3, slice C4b/C4c: reset the drift-story seq alongside
       # every other piece of per-load state above — a reload must re-run
       # refusal fresh, never carry forward a previous load's stories.
@@ -1890,13 +2511,14 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     body = newStmtList(compatReportName),
   ))
 
-proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: CompatManifestDirective] =
+proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: CompatManifestDirective, versionMacros: VersionMacrosDirective] =
   ## Parse a block of proc declarations for verification. Each must carry a
   ## calling convention and a {.header.} pragma (same rules as `dynlib`,
   ## enforced by the shared `parseProcPragmas`), but `optional`/`noverify`
   ## are rejected — the block exists solely to verify.
   var seenNames: HashSet[string]
   var manifestDirective: CompatManifestDirective
+  var versionMacrosDirective: VersionMacrosDirective
   for stmt in body:
     if isCompatManifestCall(stmt):
       let d = parseCompatManifestDirective(stmt, "verifyProcs")
@@ -1914,8 +2536,19 @@ proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: Co
       error("versionProbe has no meaning in verifyProcs — it has no " &
             "runtime footprint (no loadX to run it inside); omit it", stmt)
       continue
+    # RFC-0002 §4.7/§5/§6, slice E1: `versionMacros` IS accepted in
+    # verifyProcs (unlike `versionProbe` above) — "gates are its live
+    # majority too" (§4.7). Same parse/dup-check as `dynlib`'s copy.
+    if isVersionMacrosCall(stmt):
+      let d = parseVersionMacrosDirective(stmt, "verifyProcs")
+      if versionMacrosDirective.present:
+        error(versionMacrosDupError("verifyProcs", versionMacrosDirective, d), stmt)
+      else:
+        versionMacrosDirective = d
+      continue
     if stmt.kind != nnkProcDef:
-      error("verifyProcs body must contain only proc declarations (or a compatManifest directive)", stmt)
+      error("verifyProcs body must contain only proc declarations (or a " &
+            "compatManifest or versionMacros directive)", stmt)
     let procName = stmt[0]
     let nameStr = $procName
     let formalParams = stmt[3]
@@ -1927,8 +2560,10 @@ proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: Co
     result.procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
       formalParams: formalParams, callConv: facts.callConv, headerFile: facts.headerFile,
       isOptional: false, verifyWhen: facts.verifyWhen, prototype: facts.prototype,
-      sinceVersion: facts.sinceVersion, hasReturn: hasReturn))
+      sinceVersion: facts.sinceVersion, untilVersion: facts.untilVersion,
+      hasReturn: hasReturn))
   result.directive = manifestDirective
+  result.versionMacros = versionMacrosDirective
 
 macro verifyProcs*(body: untyped): untyped =
   ## Emit ONLY compile-time C header signature verification for the given proc
@@ -1939,8 +2574,23 @@ macro verifyProcs*(body: untyped): untyped =
   ## `_Static_assert`-grade signature checking that `dynlib` performs for
   ## dynamic ones. This is identity-coherent with softlink: it *verifies* FFI
   ## signatures against headers; it does not perform static linking.
-  let (procs, manifestDirective) = collectVProcs(body)
+  var (procs, manifestDirective, versionMacrosDirective) = collectVProcs(body)
   let tag = if procs.len > 0: procs[0].nameStr else: "anon"
+  # RFC-0002 §5/§6, slice E2: gate synthesis — same ordering rule as
+  # `dynlib` above: MUST run before `checkUntilRequiresGate` just below.
+  synthesizeVersionGates(procs, versionMacrosDirective.present,
+                          versionMacrosDirective.macroNames, "verifyProcs")
+  # RFC-0002 §4.1/§5/§6, slice D1: `until` requires `verifyWhen` — same
+  # unconditional, post-body-scan check `dynlib` runs, called before
+  # `applyCompatManifest` for the same reason (see `checkUntilRequiresGate`'s
+  # doc comment): it does not depend on a `compatManifest` being attached.
+  # Runs AFTER synthesis just above, for the same reason as `dynlib`.
+  checkUntilRequiresGate(procs, "verifyProcs")
+  # Code-review finding CR1-12: same unused-directive hint `dynlib` emits
+  # above, same post-synthesis timing.
+  checkVersionMacrosConsumed(procs, versionMacrosDirective.present,
+                              versionMacrosDirective.macroNames, "verifyProcs",
+                              versionMacrosDirective.node)
   # RFC-0001 SS4 B.5a, slice B6a: the compile-time subset (no lib-identity
   # check -- verifyProcs has no library identity to check against).
   let appliedManifest = applyCompatManifest(ppmVerifyProcs, "", procs, manifestDirective)

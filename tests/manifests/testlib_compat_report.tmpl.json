@@ -11,7 +11,8 @@
     { "version": "1.0.0", "source": "git:example/testlib@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
     { "version": "2.0.0", "source": "git:example/testlib@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
     { "version": "3.0.0", "source": "git:example/testlib@cccccccccccccccccccccccccccccccccccccccc" },
-    { "version": "4.0.0", "source": "git:example/testlib@dddddddddddddddddddddddddddddddddddddddd" }
+    { "version": "4.0.0", "source": "git:example/testlib@dddddddddddddddddddddddddddddddddddddddd" },
+    { "version": "5.0.0", "source": "git:example/testlib@eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
   ],
   "symbols": {
     "testlib_add": {
@@ -30,6 +31,13 @@
     "testlib_gated": {
       "header": {
         "verified": [{ "hi": "4.0.0" }],
+        "mismatch": [{ "lo": "4.0.0" }]
+      }
+    },
+    "testlib_dropped": {
+      "header": {
+        "absent": [{ "hi": "2.0.0" }],
+        "verified": [{ "lo": "2.0.0", "hi": "4.0.0" }],
         "mismatch": [{ "lo": "4.0.0" }]
       }
     }
