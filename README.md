@@ -124,7 +124,7 @@ Every proc in a `dynlib` (or `verifyProcs`, see below) block picks a value on in
 1. **Declaration source** — `header` (verify against an installed header), `prototype` (verify against a vendored C declaration), or `noverify` (skip verification). At least one is required; `header` and `prototype` may coexist for cross-checking. `prototype` + `noverify` is rejected — both pick a source, and they contradict.
 2. **Verification gating** — `{.verifyWhen: "EXPR".}` or nothing, orthogonal to the source axis.
 3. **Runtime requirement** — `{.optional.}` or required (the default), orthogonal to both of the above.
-4. **Availability claim** — `{.since: "x.y.z".}` or nothing, orthogonal to all three above. Declares the version a symbol first appeared in; used only for absence classification against a harvested compat manifest (a contradicted claim is a compile-time error), never for verification itself. See [Verified version compat](#verified-version-compat) below.
+4. **Validity interval** — `{.since: "x.y.z".}`, `{.until: "x.y.z".}`, both, or neither, declaring the half-open version window `[since, until)` over which the symbol's declared signature is correct. Cross-checked against a harvested compat manifest (a contradicted claim is a compile-time error) and, at runtime, drives absence classification and drift refusal. The one place this axis isn't fully free-standing: `{.until.}` requires a compile-time gate on axis 2 — hand-written, or synthesized from a block-level `versionMacros(...)` directive, which is what keeps the two axes independently *declarable* even though `until` alone can't verify itself. See [Drifted signatures](#drifted-signatures-since-until-and-versionmacros) below.
 
 The rest of this section covers `verifyWhen`, `prototype`, and `noverify` in turn — the three ways to shape *how* (or whether) a symbol gets compile-time checked.
 
@@ -276,7 +276,7 @@ verifyProcs:
 
 This expands to nothing but the header-verification machinery described above — no `loadFoo`, no function-pointer vars, no wrapper procs, no `SoftlinkError`. Use it alongside ordinary `{.importc.}` declarations to get the same signature checking `dynlib` gives you, without opting into runtime-optional loading.
 
-`verifyProcs` shares its pragma parser with `dynlib`, so `header`, `prototype`, and `verifyWhen` all work exactly as described above — with two differences: `{.optional.}` and `{.noverify.}` are rejected. Both are meaningless here: the block exists solely to verify, so a proc that's "optional" or "unverified" has nothing for `verifyProcs` to do with it — just omit it from the block instead.
+`verifyProcs` shares its pragma parser with `dynlib`, so `header`, `prototype`, and `verifyWhen` all work exactly as described above — with two differences: `{.optional.}` and `{.noverify.}` are rejected. Both are meaningless here: the block exists solely to verify, so a proc that's "optional" or "unverified" has nothing for `verifyProcs` to do with it — just omit it from the block instead. `{.since.}`/`{.until.}` and `versionMacros(...)` (see [Drifted signatures](#drifted-signatures-since-until-and-versionmacros)) are accepted with their compile-time meaning only — gate + manifest cross-check; there is no loader here, so no runtime refusal.
 
 ## Struct Layout Verification (`dyntype`)
 
@@ -325,8 +325,8 @@ binding against a versioned corpus of upstream headers and records, per
 symbol per version, whether it was verified, absent, mismatched, or
 unclassifiable — then a `compatManifest` directive attaches the result to
 your `dynlib`/`verifyProcs` block for compile-time drift checks (a
-contradicted `{.since.}` claim is a hard error; a recorded `mismatch`
-warns; a bound symbol missing from the manifest hints).
+contradicted `{.since.}` or `{.until.}` claim is a hard error; a recorded
+`mismatch` warns; a bound symbol missing from the manifest hints).
 
 The one-screen happy path:
 
@@ -406,7 +406,11 @@ type
   CompatReport* = object
     runtimeVersion*: string   ## "" unless the probe succeeded
     attestation*: Attestation
-    missingReasons*: seq[tuple[symbol: string, reason: MissingReason]]
+    missingReasons*: seq[tuple[symbol: string, reason: MissingReason,
+                                interval: VersionInterval]]
+    probeNotComparable*: bool ## probe string exactly tied a declared bound
+                              ## with a pre-release suffix, or didn't parse —
+                              ## declared-bound refusal declined to decide
 ```
 
 `atNoProbe` and `atProbeNotRun` are easy to conflate but mean different
@@ -420,9 +424,13 @@ resolve, against the manifest's header facts:
 
 | `MissingReason` | Meaning |
 |---|---|
-| `mrExpected` | this runtime predates the symbol (manifest facts or `{.since.}`) |
+| `mrExpected` | this runtime is outside the symbol's known lifetime — it predates the symbol (manifest facts or `{.since.}`) or is at/above a declared `{.until.}` |
 | `mrAnomalous` | this version's headers declare it, yet it did not resolve |
-| `mrDriftRefused` | it resolved, but was refused for known signature drift |
+| `mrDriftRefused` | it resolved, but was refused for signature drift (manifest facts, or a declared `{.since.}`/`{.until.}` bound) |
+
+Each entry also carries the *evidence* `interval` behind the reason — the
+manifest's recorded interval where facts drove the entry, the declared
+`[since, until)` where a pragma did (rendered like `>=4.0.0, <4.16.0`).
 
 `unloadX()` resets the report to this block's own "probe hasn't run" state
 (`atProbeNotRun` if a `versionProbe` is declared, `atNoProbe` if not; `""`
@@ -446,11 +454,15 @@ inside a symbol's recorded `mismatch` interval, that symbol is **refused**
   `fooCompat()` carries the drift explanation. This preserves the
   existing invariant **`lrOk` ⟹ every required wrapper is safe to call**.
 
-Refusal only fires on a **known** mismatch: a probed version outside the
-manifest's corpus (`atOutOfCorpus`) loads normally, because refusing on a
-guess would be worse than not checking at all — a distro-patched version
-string could easily land inside a recorded interval it doesn't actually
-share the bug with.
+Manifest-fact refusal only fires on a **known** mismatch: for a symbol
+without declared bounds, a probed version outside the manifest's corpus
+(`atOutOfCorpus`) loads normally, because refusing on a guess would be
+worse than not checking at all — a distro-patched version string could
+easily land inside a recorded interval it doesn't actually share the bug
+with. A symbol carrying a declared `{.since.}`/`{.until.}` bound is the
+one exception: there the *author* has stated where the signature is
+invalid, and refusal follows the declaration even off-corpus — see
+[Drifted signatures](#drifted-signatures-since-until-and-versionmacros).
 
 #### Escape hatches, scoped to who holds them
 
@@ -475,7 +487,7 @@ not `xxxPtr()`.
 |---|---|---|
 | No | No | Pre-Stage-C behavior, unchanged |
 | No | Yes | Manifest is completely inert at runtime — no partition, no refusal |
-| Yes | No | `atNoManifest`; `runtimeVersion` populated, nothing to check it against |
+| Yes | No | `atNoManifest`; `runtimeVersion` populated, no facts to check it against — but declared `{.since.}`/`{.until.}` bounds still refuse ([Drifted signatures](#drifted-signatures-since-until-and-versionmacros)) |
 | Yes | Yes | Full attestation, absence partition, and drift refusal |
 
 #### Example
@@ -493,9 +505,229 @@ let r = loadMylib()
 if r.kind in {lrOk, lrOkPartial}:
   let c = mylibCompat()
   echo c.attestation, " @ ", c.runtimeVersion
-  for (symbol, reason) in c.missingReasons:
-    echo symbol, ": ", reason
+  for (symbol, reason, interval) in c.missingReasons:
+    echo symbol, ": ", reason, " (", interval, ")"
 ```
+
+## Drifted signatures: `since`, `until`, and `versionMacros`
+
+Everything so far handles a symbol that's *added* (`prototype`, `verifyWhen`)
+or *removed* (`optional`) across library versions. A third kind of drift is
+nastier: a symbol that exists at **every** version under the same name, but
+whose **signature changed** somewhere along the way — Z3's
+`Z3_fpa_get_numeral_sign` took `int *sgn` through 4.15 and `bool *sgn` from
+4.16. A binding declaring the old shape resolves fine at 4.16 via `dlsym`,
+then dispatches the wrong ABI: silent memory corruption, the exact bug class
+softlink exists to prevent. This section is the first-class path for it.
+
+### The validity interval
+
+Declare the window over which your Nim signature is correct:
+
+- `{.since: "x.y.z".}` — inclusive lower bound (already covered above).
+- `{.until: "x.y.z".}` — **exclusive** upper bound: the first version at
+  which the declared signature is *no longer* correct.
+
+Together they form the half-open interval `[since, until)`, matching the
+compat manifest's own interval convention. `until: "4.16.0"` means 4.15.x is
+in range and 4.16.0 itself is out. Either bound may appear alone —
+`until`-only ("valid since forever, drifts later") is the common real-world
+shape. Every diagnostic renders the interval in one-sided-comparison form
+(`>=4.0.0, <4.16.0`), so the half-open reading is reinforced at each point
+of use.
+
+Shape rules, all compile-time errors when violated: the bound must parse as
+a version; `since >= until` is an empty interval; and `until` requires the
+proc to be corpus-trackable — a `header`, not `noverify`, not a header-less
+`prototype` (`prototype` + `header` cross-check mode is fine). An `until` on
+a symbol the harvester can't observe would be an unfalsifiable claim.
+
+### The worked example: `versionMacros` + `until`
+
+Declare the library's version-macro spelling once per block, then just state
+the bound — softlink synthesizes the compile-time verify gate from it:
+
+```nim
+import softlink
+
+dynlib "z3":
+  versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION", "Z3_PATCH_VERSION")
+
+  # int* out-param through 4.15; bool* from 4.16 — declare the historical
+  # shape, bounded. No hand-written gate anywhere.
+  proc Z3_fpa_get_numeral_sign(c: Z3_context, t: Z3_ast, sgn: ptr cint): cint
+    {.cdecl, optional, header: "z3.h", until: "4.16.0".}
+```
+
+This compiles against **whatever header is installed**: on a 4.15 header the
+declared `int*` signature is verified in full; on a 4.16+ header the check
+is skipped (verifying the old shape there would be asserting a falsehood).
+With a `versionProbe` on the block, the symbol is refused at runtime
+wherever the loaded version is at or above `4.16.0` — see
+[runtime behavior](#runtime-behavior-declared-bound-refusal) below.
+
+`versionMacros` takes the library's version macros as separate string
+arguments, **most significant first**. The macros must be defined by a
+header some proc in the block already includes — if they aren't, the verify
+translation unit fails loudly with a softlink `#error` naming the macro,
+instead of silently misverifying (in C, an undefined identifier inside `#if`
+evaluates to `0` with no warning; softlink emits a per-macro
+`#ifndef`/`#error` guard so a synthesized gate can never fall into that
+hole). At most one `versionMacros` per block, any position; accepted in both
+`dynlib` and `verifyProcs`.
+
+### What synthesis emits
+
+From `until: "4.16.0"` and the macro list above, softlink generates the
+`{.verifyWhen.}` predicate
+
+```c
+(Z3_MAJOR_VERSION < 4) || (Z3_MAJOR_VERSION == 4 && Z3_MINOR_VERSION < 16)
+```
+
+— the full nested lexicographic comparison, with trailing zero components
+stripped (which is why `Z3_PATCH_VERSION` doesn't appear here; a
+non-trailing zero is never dropped — `since: "4.0.5"` keeps all three
+components, because eliding the middle `0` would compare the wrong macros).
+A `since` bound synthesizes the mirrored `>=` form; both bounds AND-combine.
+Trailing zero components are stripped from the bound before synthesis
+(`"4.16.0"` ≡ `"4.16"`; `"2.0.0"` against a single macro strips to `"2"`
+and is accepted) — bounds shorter than the macro list need no padding,
+since the predicate only ever compares a macro-list prefix. A bound with
+*more* EFFECTIVE components (after that stripping) than the macro list, or
+with an alphabetic run (`"4.16.0rc1"`), is a compile-time error — there is
+no C macro for the extra precision to compare against, and silent
+truncation would be wrong at exactly the boundary that matters.
+
+The result is assigned to the proc's `verifyWhen` before verification runs,
+so the rest of the machinery — the `#if` wrapping, `prototype`-declaration
+gating, all three compiler tiers — behaves exactly as if you had written the
+gate by hand. Only procs carrying `until` and no explicit `verifyWhen` are
+synthesized: `since`-only procs keep their (ungated) shipped behavior, and
+an explicit `{.verifyWhen.}` on the proc always overrides synthesis verbatim.
+
+### The hand-written escape hatch
+
+An explicit `{.verifyWhen.}` next to `until` is the override, appropriate in
+exactly two situations:
+
+**Feature macros.** When the drift tracks a feature flag rather than the
+version number (`#ifdef FOO_NEW_API`-style), no version arithmetic applies —
+write the predicate yourself.
+
+**Packed single-macro libraries** — mbedtls, sqlite. These encode the whole
+version in one integer macro, which is *monotonic across major versions by
+construction*, so the correct hand gate is a single comparison with no
+rollover failure mode:
+
+```nim
+dynlib "libmbedtls.so(.16|.14|)":
+  # Old-shape API, drifted at mbedtls 3.6.0. One packed macro, one
+  # comparison — rollover-safe without synthesis.
+  proc mbedtls_ssl_old_api(ssl: ptr SslContext): cint
+    {.cdecl, optional, header: "mbedtls/ssl.h", until: "3.6.0",
+      verifyWhen: "MBEDTLS_VERSION_NUMBER < 0x03060000".}
+```
+
+(sqlite is the same pattern: `SQLITE_VERSION_NUMBER < 3045000`.) These
+libraries stay on hand gates *by design* — the entire bug class synthesis
+exists to eliminate cannot occur for a packed macro.
+
+That bug class is real for **split** macros, though. The naive hand gate for
+the Z3 example is `Z3_MINOR_VERSION < 16` — which flips true again when Z3
+5.0 resets the minor version, silently re-enabling verification against a
+header whose ABI moved for unrelated reasons. The correct hand gate is the
+compound predicate shown in [What synthesis emits](#what-synthesis-emits),
+and softlink can require a gate to *exist* but cannot check a hand-written
+gate's *value* against `until` (the only compile-time version signal lives
+inside the emitted C, out of the macro's reach). For split-macro libraries,
+prefer `versionMacros` — the gate is correct by construction.
+
+Two hand-gate caveats synthesis would otherwise cover for you: an undefined
+macro inside `#if` silently evaluates to `0` (no `#ifndef` guards are
+emitted for hand gates — softlink can't parse identifiers out of an opaque C
+expression), and no threshold consistency with `until` is ever checked.
+
+### Runtime behavior: declared-bound refusal
+
+At runtime (probe required; manifest optional), a bounded symbol whose
+probed version falls **outside** `[since, until)` is refused — the same
+treatment as manifest-driven [drift refusal](#drift-refusal) above:
+
+- **Optional symbol:** re-nilled, `xxxAvailable()` false, reported as
+  `mrDriftRefused`; its wrapper raises the drift story
+  (`"Z3_fpa_get_numeral_sign: signature drift, declared valid only at
+  <4.16.0; refusing unsafe dispatch"`), not a generic "not loaded".
+- **Required symbol:** the whole load unwinds (`lrSymbolNotFound`), same as
+  attested drift — `lrOk` still means every required wrapper is safe.
+
+Where each mechanism applies:
+
+| probed version is... | what refuses |
+|---|---|
+| inside the manifest's corpus (`atAttested`), symbol present in the manifest | manifest `mismatch` facts, exactly as before — declared bounds add nothing here |
+| inside the manifest's corpus (`atAttested`), symbol **absent** from the manifest | the **declared bound** itself — `checkUntil` never validated this symbol (nothing in the manifest to check it against), so the row above's redundancy argument doesn't hold for it (code-review finding CR1-1) |
+| outside the corpus (`atOutOfCorpus`) | the **declared bound** itself |
+| probe ok, no manifest at all (`atNoManifest`) | the **declared bound** itself |
+
+The last three rows narrow the earlier "refusal only fires on a known
+mismatch" policy, deliberately: without them, `until: "4.16.0"` would
+protect you at 4.16.0 exactly (if harvested) and dispatch the wrong ABI at
+4.16.3 (a patch release the corpus never saw) — the failure asymmetry
+(visible, recoverable false refusal vs. silent memory corruption on false
+accept) decides it. The narrowing is scoped to symbols whose **author
+explicitly declared** a bound — and when a manifest is attached *and
+records that symbol*, the declaration has survived the harvester
+cross-check. A bounded symbol a manifest-carrying block forgot to
+re-harvest gets no such pass, at any attestation — softlink surfaces the
+gap itself: the not-in-manifest hint (a warning under
+`-d:softlinkStrictVerify`) names it. Unbounded symbols keep
+the report-don't-block policy everywhere. The same escape hatches apply:
+`compatManifest(..., refuse = false)` per block (when a manifest is
+attached), `-d:softlinkNoDriftRefusal` build-wide. A manifest-less block has
+no per-block hatch — the block author *is* the declarer there; the
+author-side escape is not declaring a bound.
+
+Reporting: `missingReasons` entries carry a typed
+`interval: VersionInterval` — the *evidence* interval for the refusal (the
+manifest's recorded mismatch interval on the attested path, which is more
+precise than your claim; the declared `[since, until)` everywhere else).
+One edge case declines to decide: a probed version that exactly ties a bound
+with a pre-release-style suffix (`"4.16.0-rc1"` vs `until: "4.16.0"`) or
+doesn't parse at all is not comparable under softlink's
+no-pre-release-semantics version order — the symbol loads normally and
+`CompatReport.probeNotComparable` is set `true` (report-don't-block for that
+one ambiguous case). A decisive numeric prefix still decides regardless of
+suffix: `"4.16.3-ubuntu3"` is ≥ `4.16.0` and refuses.
+
+With a manifest attached, `checkUntil` cross-checks the declared bound
+against the harvested facts at compile time (over-claims, drift-then-revert,
+and evidence-free bounds are hard errors — see
+[`tools/harvest/README.md`](tools/harvest/README.md#checkuntil-validating-a-declared-until-against-the-corpus)).
+Without a probe, bounds have no runtime effect at all — they are compile-time
+declaration plus cross-check only.
+
+### Caveats
+
+- **Prefer `{.optional.}` on bounded symbols.** A *required* drifted symbol
+  takes down the entire load above `until` — usually not what you want
+  unless the binding is meaningless without it. softlink emits a
+  compile-time hint for `until` on a required proc (a warning under
+  `-d:softlinkStrictVerify`).
+- **`verifyProcs` reduced meaning.** `until` and `versionMacros` are
+  accepted in `verifyProcs` blocks, where they mean compile-time gate +
+  manifest cross-check only — `verifyProcs` generates no loader, so there is
+  no runtime refusal to drive.
+- **Per-ABI drift points.** Bounds are declared once on the Nim proc but
+  manifests are per-ABI; a library whose drift point differs by platform
+  (distro-patched builds) will pass `checkUntil` on one platform and fail on
+  another — by design, the declaration is genuinely wrong somewhere. Use
+  conditional compilation / per-platform binding modules.
+- **No version signal, no `until`.** A library exposing no compile-time
+  version macro (and no feature macro) has nothing to gate on — and
+  `noverify` is deliberately not accepted as an alternative (`until` +
+  `noverify` is an error: untrackable claims can't be kept honest). Such
+  symbols stay on the status-quo paths.
 
 ## Comparison
 

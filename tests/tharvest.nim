@@ -10,6 +10,171 @@ import std/[unittest, os, osproc, tables, strutils, json, times]
 import ../tools/harvest/harvester
 import ../tools/harvest/harvest_cli
 import softlink/versions
+import softlink/manifest
+
+# ---------------------------------------------------------------------------
+# loadDump: parses one <Base>.probes.json (RFC-0001 SS4 B.1 schema; see
+# softlink.nimble's validateProbeJson for the schema this mirrors, and
+# src/softlink.nim's probeFactsJson for the emission side). RFC-0002 §6
+# slice A1b adds `until` — mirroring `since` exactly, a per-proc value
+# carried through ProbeFact but not yet consumed by any classification
+# logic.
+# ---------------------------------------------------------------------------
+suite "loadDump — probe-facts dump parsing (RFC-0001 SS4 B.1, RFC-0002 §6 slice A1b)":
+  test "since and until both roundtrip through ProbeFact":
+    let dir = getTempDir() / "sl_harvest_loaddump_test"
+    if dirExists(dir): removeDir(dir)
+    createDir(dir)
+    let dumpFile = dir / "Loaddumptest.probes.json"
+    writeFile(dumpFile, """{
+      "schemaVersion": 1,
+      "kind": "dynlib",
+      "modulePath": "tests/loaddumptest.nim",
+      "libPattern": "libloaddumptest.so",
+      "baseName": "Loaddumptest",
+      "procs": [
+        {
+          "nimName": "foo",
+          "cName": "foo",
+          "header": "foo.h",
+          "prototype": "",
+          "verifyWhen": "",
+          "optional": false,
+          "noverify": false,
+          "noverifyReason": "",
+          "since": "1.2.3",
+          "until": "4.5.6"
+        }
+      ]
+    }""")
+    let dump = loadDump(dumpFile)
+    removeDir(dir)
+    check dump.procs.len == 1
+    check dump.procs[0].since == "1.2.3"
+    check dump.procs[0].until == "4.5.6"
+
+  test "an absent until pragma dumps as \"\", same as since":
+    let dir = getTempDir() / "sl_harvest_loaddump_test_absent"
+    if dirExists(dir): removeDir(dir)
+    createDir(dir)
+    let dumpFile = dir / "Loaddumptest.probes.json"
+    writeFile(dumpFile, """{
+      "schemaVersion": 1,
+      "kind": "dynlib",
+      "modulePath": "tests/loaddumptest.nim",
+      "libPattern": "libloaddumptest.so",
+      "baseName": "Loaddumptest",
+      "procs": [
+        {
+          "nimName": "foo",
+          "cName": "foo",
+          "header": "foo.h",
+          "prototype": "",
+          "verifyWhen": "",
+          "optional": false,
+          "noverify": false,
+          "noverifyReason": "",
+          "since": "",
+          "until": ""
+        }
+      ]
+    }""")
+    let dump = loadDump(dumpFile)
+    removeDir(dir)
+    check dump.procs[0].since == ""
+    check dump.procs[0].until == ""
+
+  # CR1-11 (code review): a pre-RFC-0002 probes.json — one written by an
+  # older softlink that never emitted the `until` key at all (not even as
+  # "", the RFC-0001 reserved-empty convention `since` used) — used to blow
+  # up `loadDump` with a raw `json.KeyError` on `p["until"]` instead of a
+  # helpful `HarvestError` telling the user to re-run the probe dump.
+  test "a pre-RFC-0002 dump missing the 'until' key raises HarvestError, not KeyError":
+    let dir = getTempDir() / "sl_harvest_loaddump_test_preuntil"
+    if dirExists(dir): removeDir(dir)
+    createDir(dir)
+    let dumpFile = dir / "Loaddumptest.probes.json"
+    # Deliberately omits "until" (and, for good measure, mirrors a genuinely
+    # pre-RFC-0002 dump by leaving every other RFC-0001 key present) —
+    # exactly what an older softlink's `probeFactsJson` produced before
+    # RFC-0002 slice A1b added the `until` key.
+    writeFile(dumpFile, """{
+      "schemaVersion": 1,
+      "kind": "dynlib",
+      "modulePath": "tests/loaddumptest.nim",
+      "libPattern": "libloaddumptest.so",
+      "baseName": "Loaddumptest",
+      "procs": [
+        {
+          "nimName": "foo",
+          "cName": "foo",
+          "header": "foo.h",
+          "prototype": "",
+          "verifyWhen": "",
+          "optional": false,
+          "noverify": false,
+          "noverifyReason": "",
+          "since": ""
+        }
+      ]
+    }""")
+    var raised = false
+    var isHarvestError = false
+    var msg = ""
+    try:
+      discard loadDump(dumpFile)
+    except HarvestError as e:
+      raised = true
+      isHarvestError = true
+      msg = e.msg
+    except KeyError as e:
+      raised = true
+      isHarvestError = false
+      msg = e.msg
+    removeDir(dir)
+    check raised
+    check isHarvestError
+    check dumpFile in msg
+    check "schema" in msg or "re-run" in msg or "predates" in msg
+
+  test "a dump missing several RFC-0001/RFC-0002 proc keys raises HarvestError, not KeyError":
+    let dir = getTempDir() / "sl_harvest_loaddump_test_minimal"
+    if dirExists(dir): removeDir(dir)
+    createDir(dir)
+    let dumpFile = dir / "Loaddumptest.probes.json"
+    # An even older/hand-trimmed dump missing several keys at once
+    # (verifyWhen, noverifyReason, since, until) — proves loadDump's
+    # hardening isn't limited to the one `until` key RFC-0002 added.
+    writeFile(dumpFile, """{
+      "schemaVersion": 1,
+      "kind": "dynlib",
+      "modulePath": "tests/loaddumptest.nim",
+      "libPattern": "libloaddumptest.so",
+      "baseName": "Loaddumptest",
+      "procs": [
+        {
+          "nimName": "foo",
+          "cName": "foo",
+          "header": "foo.h",
+          "prototype": "",
+          "optional": false,
+          "noverify": false
+        }
+      ]
+    }""")
+    var raised = false
+    var isHarvestError = false
+    try:
+      discard loadDump(dumpFile)
+    except HarvestError:
+      raised = true
+      isHarvestError = true
+    except KeyError:
+      raised = true
+      isHarvestError = false
+    removeDir(dir)
+    check raised
+    check isHarvestError
 
 # ---------------------------------------------------------------------------
 # Pure classifier: every row of RFC-0001 SS4 B.2's classification table,
@@ -509,6 +674,108 @@ suite "harvest — full classification matrix against the B3a fixture corpus":
     let manifest = buildManifest(r, corpus, meta)
     let golden = parseJson(readFile("tests" / "corpus" / "expected.compat.json"))
     check golden == manifest
+
+  test "checkUntil against the REAL harvested manifest (RFC-0002 §6, slice C3a)":
+    ## Every `checkUntil` test in test_softlink.nim's own suite runs
+    ## against a hand-built `mkManifest` (synthetic `SymbolFacts`) — this
+    ## is the harvest END-TO-END proof the slice brief asks for: parse the
+    ## SAME manifest JSON `buildManifest` produces from a REAL harvest of
+    ## the B3a fixture corpus (golden-tested immediately above) back into
+    ## a `CompatManifest` via `parseManifest`, then drive `checkUntil`
+    ## against `corpuslib_changed` — the fixture's one genuine drift
+    ## (RFC-0001 slice B3a; tests/corpus/README.md): header-verified below
+    ## 2.0.0, mismatched AT 2.0.0 (return type changes `int`->`double`),
+    ## unknown at 3.0.0 (broken baseline).
+    let meta = HarvestMeta(toolchain: "gcc (pinned for golden test)",
+                            tier: "builtin-compat", abi: "linux-lp64",
+                            date: "2026-01-01")
+    let corpus = loadCorpusProvenance("tests" / "corpus")
+    let manifestJson = buildManifest(r, corpus, meta)
+    let m = parseManifest($manifestJson, "tests/corpus/expected.compat.json")
+
+    # checkSince trivially passes: corpuslib_changed carries no {.since.}
+    # ("" means unbounded) and the manifest has no `fkAbsent` fact for it
+    # at all, so there is nothing rule checkSince could contradict.
+    check not checkSince(m, "corpuslib_changed", "").contradicted
+
+    # until: "2.0.0" matches the real drift onset EXACTLY — the header is
+    # `fkVerified` for every corpus version strictly below 2.0.0 and the
+    # manifest shows no re-verification at or above it, so rule (a)
+    # (over-claim) and rule (c) (positive evidence, 1.0.0 is verified) both
+    # pass. Finding R2-A, however: this corpus's own 3.0.0 entry never
+    # classifies decisively (`tests/corpus`'s baseline deliberately FAILS
+    # there — "broken include", see this suite's own harvest-classification
+    # tests above — so EVERY symbol, not just this one, is `fkUnknown` at
+    # 3.0.0), and 3.0.0 is inside `until`'s declared-invalid region
+    # (at-or-above "2.0.0"). Rule (b) now requires a DECISIVE fact
+    # throughout that whole region, not just "no fkVerified" — an
+    # unclassified corpus version there is exactly the gap R2-A closes: a
+    # real probe landing on "3.0.0" would otherwise sail through the
+    # runtime attested-path exemption with no cross-check at all. This is
+    # the real-harvest end-to-end proof that the fix fires against genuine
+    # harvester output, not merely hand-built `mkManifest` data (contrast
+    # `test_softlink.nim`'s own synthetic R2-A cases).
+    let ucUnknownTail = checkUntil(m, "corpuslib_changed", "", "2.0.0")
+    check ucUnknownTail.contradicted
+    check "corpuslib_changed" in ucUnknownTail.message
+    check "3.0.0" in ucUnknownTail.message
+    check "no decisive classification" in ucUnknownTail.message
+
+    # until: "3.0.0" claims the signature is still valid through 2.0.0 —
+    # but the manifest shows it already `fkMismatch` AT 2.0.0, INSIDE the
+    # declared window. Rule (a) (over-claim) must catch this, naming the
+    # real drift version.
+    let uc = checkUntil(m, "corpuslib_changed", "", "3.0.0")
+    check uc.contradicted
+    check "corpuslib_changed" in uc.message
+    check "2.0.0" in uc.message
+
+  test "checkUntil vacuous-pass escape hatch: until beyond corpus max (RFC-0002 §4.2, Finding R2-A)":
+    ## Companion to the test immediately above, isolating the corpus-tip
+    ## effect on a single clean symbol instead of contrasting across two
+    ## symbols. `corpuslib_stable` never drifts anywhere in this fixture
+    ## corpus (verified at 1.0.0 and 2.0.0, unknown at 3.0.0 — same broken-
+    ## baseline story as `corpuslib_changed`'s 3.0.0, see the harvest suite
+    ## above) — so it isolates rule (b′) from rule (a)'s mismatch check:
+    ## any contradiction below is attributable to corpus-tip placement of
+    ## `until` alone, not a genuine drift. (An `until` of "2.0.0" would trip
+    ## rule (b) FIRST instead — the symbol is still `verified` AT 2.0.0, i.e.
+    ## at-or-above that bound — so "3.0.0", the corpus max itself, is the
+    ## one bound whose at-or-above region contains ONLY the unclassified
+    ## tip.)
+    let meta = HarvestMeta(toolchain: "gcc (pinned for golden test)",
+                            tier: "builtin-compat", abi: "linux-lp64",
+                            date: "2026-01-01")
+    let corpus = loadCorpusProvenance("tests" / "corpus")
+    let manifestJson = buildManifest(r, corpus, meta)
+    let m = parseManifest($manifestJson, "tests/corpus/expected.compat.json")
+
+    # until: "3.0.0" places ONLY the corpus's unclassified tip (3.0.0)
+    # at-or-above the declared bound — rule (b′) fires exactly as it does
+    # for `corpuslib_changed` above, even though `corpuslib_stable` never
+    # drifts: the corpus simply never decisively confirmed the declared-
+    # invalid region holds.
+    let ucWithinCorpus = checkUntil(m, "corpuslib_stable", "", "3.0.0")
+    check ucWithinCorpus.contradicted
+    check "corpuslib_stable" in ucWithinCorpus.message
+    check "3.0.0" in ucWithinCorpus.message
+    check "no decisive classification" in ucWithinCorpus.message
+
+    # until: "4.0.0" is strictly beyond the corpus's max harvested version
+    # (3.0.0) — the documented-by-design escape hatch (manifest.nim's
+    # rule (b) doc comment, README's "Troubleshooting" callout): rule (b)/
+    # (b′)'s at-or-above-`until` scan finds no corpus version to examine at
+    # all (m.corpus's max is 3.0.0 < 4.0.0), so it passes vacuously by
+    # construction rather than by any decisive fact. Rule (a) (no mismatch
+    # ever) and rule (c) (1.0.0/2.0.0 both verified, below 4.0.0) both pass
+    # too, so the declaration is accepted overall.
+    let ucBeyondCorpus = checkUntil(m, "corpuslib_stable", "", "4.0.0")
+    check not ucBeyondCorpus.contradicted
+
+    # Flip-check (not left in the suite): temporarily asserting
+    # `ucBeyondCorpus.contradicted` here and re-running the suite fails,
+    # confirming this assertion actually exercises live `checkUntil` logic
+    # rather than passing vacuously itself.
 
 suite "driftAlarm — integration against the real harvest (RFC-0001 SS4 B.4, slice B5)":
   ## Reuses the real `r` harvested in the suite above — no second harvest.

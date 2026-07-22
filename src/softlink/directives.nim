@@ -186,6 +186,82 @@ const versionProbeDupErrorMsg* =
   "contain at most one version probe."
 
 type
+  VersionMacrosDirective* = object
+    ## RFC-0002 §5/§6, slice E1: one parsed `versionMacros` body directive —
+    ## at most one per block, any position (mirrors `CompatManifestDirective`/
+    ## `VersionProbeDirective` above). `present == false` is the zero value
+    ## (no directive in this block). This slice only parses and stores the
+    ## macro name list; nothing downstream consumes it yet — Stage E2 wires
+    ## it into gate synthesis (§5 Layer 2).
+    present*: bool
+    macroNames*: seq[string]  ## most-significant-first, e.g.
+                               ## @["Z3_MAJOR_VERSION", "Z3_MINOR_VERSION"]
+    node*: NimNode             ## the directive call node, for diagnostic anchoring
+
+func isValidCIdentifier(s: string): bool =
+  ## A valid C identifier: `[A-Za-z_][A-Za-z0-9_]*`. Local to this module —
+  ## the only consumer is `parseVersionMacrosDirective` below (a
+  ## `versionMacros` argument names a C preprocessor macro, which must be a
+  ## legal C identifier for `#ifndef`/`#if` to reference it at all).
+  if s.len == 0: return false
+  if s[0] != '_' and not s[0].isAlphaAscii: return false
+  for i in 1 ..< s.len:
+    let c = s[i]
+    if c != '_' and not c.isAlphaAscii and not c.isDigit: return false
+  true
+
+func isVersionMacrosCall*(stmt: NimNode): bool =
+  ## True when `stmt` is a `versionMacros ...` directive statement —
+  ## `versionMacros("A", "B")` (`nnkCall`) or `versionMacros "A", "B"`
+  ## (`nnkCommand`) — checked structurally against the bare identifier
+  ## text, exactly like `isCompatManifestCall` above (the block's body is
+  ## `untyped`, so nothing has been resolved to an actual symbol yet).
+  stmt.kind in {nnkCall, nnkCommand} and stmt.len >= 1 and
+    stmt[0].kind == nnkIdent and $stmt[0] == "versionMacros"
+
+proc parseVersionMacrosDirective*(stmt: NimNode, macroName: string): VersionMacrosDirective =
+  ## RFC-0002 §5/§6, slice E1: parse one recognized `versionMacros`
+  ## directive statement's argument shape — one or more string-literal
+  ## arguments, each a valid C identifier, most-significant macro first
+  ## (e.g. `versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION")`). A
+  ## non-string-literal argument, an argument that isn't a valid C
+  ## identifier, or a call with zero arguments is a directive-specific
+  ## macro error here, never the generic body-shape error `dynlib`/
+  ## `verifyProcs` raise for an unrecognized statement.
+  result.present = true
+  result.node = stmt
+  var names: seq[string] = @[]
+  for i in 1 ..< stmt.len:
+    let arg = stmt[i]
+    if arg.kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+      error(macroName & ": versionMacros arguments must be string literals " &
+            "naming C preprocessor macros, e.g. " &
+            "versionMacros(\"FOO_MAJOR_VERSION\", \"FOO_MINOR_VERSION\")", arg)
+    else:
+      let name = arg.strVal
+      if not isValidCIdentifier(name):
+        error(macroName & ": versionMacros argument '" & name & "' is not " &
+              "a valid C identifier ([A-Za-z_][A-Za-z0-9_]*)", arg)
+      names.add(name)
+  if names.len == 0:
+    error(macroName & ": versionMacros requires at least one macro name " &
+          "(e.g. versionMacros(\"FOO_MAJOR_VERSION\"))", stmt)
+  result.macroNames = names
+
+proc versionMacrosDupError*(macroName: string, first, second: VersionMacrosDirective): string =
+  ## RFC-0002 §5/§6, slice E1: "at most one versionMacros per block, any
+  ## position." Voiced like `compatManifestDupError` above (`versionMacros`,
+  ## like `compatManifest` and unlike `versionProbe`, is accepted in BOTH
+  ## `dynlib` and `verifyProcs`, so the message needs a `macroName` — the
+  ## `versionProbeDupErrorMsg` const below can hardcode "dynlib" only
+  ## because `versionProbe` never reaches `verifyProcs`'s duplicate check).
+  "softlink: " & macroName & ": duplicate versionMacros directive in one " &
+  "block (" & first.macroNames.join(", ") & " and " &
+  second.macroNames.join(", ") & ") — merge them into a single " &
+  "versionMacros(...) directive; a dynlib/verifyProcs block may declare " &
+  "version macros at most once."
+
+type
   AppliedManifest* = object
     ## RFC-0001 §B.5/§9, slice B6b: `applyCompatManifest`'s return value.
     ## `attached` is the one bit `genVerifyBlock` has needed since B6a
@@ -306,6 +382,21 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
     if sc.contradicted:
       error(sc.message, p.name)
 
+  # Check 6b (RFC-0002 §4.2/§6, slice B2): until-contradiction — same call
+  # site, hard error, no escape hatch, mirroring Check 6 above exactly.
+  # `checkUntil` (softlink/manifest) runs its own three-rule spec (over-
+  # claim, over-caution/revert, positive-evidence) and computes the
+  # corrected bound in its message; this loop's only job is turning a
+  # `contradicted` result into a macro error anchored at the proc, same as
+  # Check 6. Order relative to Check 6 doesn't matter (RFC-0002 §4.2): a
+  # proc with both `since` and `until` gets both checked, independently,
+  # against the same manifest.
+  for p in procs:
+    if p.untilVersion.len == 0: continue
+    let uc = checkUntil(m, p.nameStr, p.sinceVersion, p.untilVersion)
+    if uc.contradicted:
+      error(uc.message, p.name)
+
   # Bound, harvester-trackable C names — `isCorpusTrackable` (softlink/
   # versions, code-review finding #21) is the SAME predicate `tools/harvest/
   # harvester.nim`'s `harvest` uses to decide what it records: excludes
@@ -325,12 +416,26 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
             " — see the drift alarm / softlink harvest for details",
             directive.node)
 
-  # Check 8: not-in-manifest hint.
+  # Check 8: not-in-manifest hint. RFC-0002 §4.4, code-review finding CR1-1:
+  # a bounded (`{.since/until.}`) proc entirely absent from the manifest gets
+  # NO compile-time `checkSince`/`checkUntil` validation at all (both
+  # vacuously pass on `findSymbol(...).isNone`) and, at runtime, relies
+  # solely on the attested-path declared-bound refusal this same finding adds
+  # (`softlink.nim`) — this hint is the one compile-time signal such a gap
+  # ever gets. Escalated to a Warning under `-d:softlinkStrictVerify`, same
+  # audit-mode convention as the `{.noverify.}` hint and the drifted-but-
+  # required hint (`softlink.nim`'s own two trust-point hints) — still a
+  # Hint, never a hard error, in default builds: the maintainer chose
+  # runtime enforcement over forcing a re-harvest.
   let missing = notInManifest(m, trackable)
   if missing.len > 0:
-    hint("softlink: " & macroName & ": " & $missing.len & " symbol" &
+    let notInManifestMsg = "softlink: " & macroName & ": " & $missing.len & " symbol" &
          (if missing.len != 1: "s" else: "") & " not in compat manifest " &
-         absPath & " — regenerate with softlink harvest", directive.node)
+         absPath & " — regenerate with softlink harvest"
+    when defined(softlinkStrictVerify):
+      warning(notInManifestMsg, directive.node)
+    else:
+      hint(notInManifestMsg, directive.node)
 
   # Check 9 (the degraded-tier warning) is emitted by `genVerifyBlock`
   # itself, into the graceful `#else` fallback branch — this proc's

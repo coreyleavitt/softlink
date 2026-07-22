@@ -4,8 +4,130 @@ All notable changes to softlink are documented here.
 
 ## [Unreleased]
 
+### Added
+
+**Drifted-signature support (RFC-0002).**
+- `{.until: "x.y.z".}` pragma: the mirror of `{.since.}` — declares the
+  version **above which** a symbol's bound C signature is no longer correct,
+  i.e. a signature valid for the half-open interval `[since, until)`.
+  `until`-only ("valid since forever, drifts later") is first-class; `since`
+  and `until` together bound a window. `since >= until` is a compile-time
+  error (empty interval). `until` requires the proc to be **corpus-trackable**
+  (a `header`, not `noverify`, not a header-less `prototype`) — a symbol with
+  no compile-time version signal cannot carry a falsifiable `until`, so
+  `until` + `noverify` and `until` + header-less `prototype` are compile-time
+  errors. `until` **requires** a `{.verifyWhen.}` gate (unconditional
+  — a bounded declaration verified against an ungated header would silently
+  assert the wrong signature once the header moves past the bound) —
+  hand-written on the proc, or synthesized via the `versionMacros(...)`
+  directive below; a bounded proc with neither is a clear macro error.
+  An `{.until.}` on a **required** (non-
+  `optional`) proc emits a compile-time hint — a drifted required symbol
+  refuses the *entire* load above `until`, which is usually not intended;
+  escalates to a warning under `-d:softlinkStrictVerify`. Supported in both
+  `dynlib` and `verifyProcs`.
+- `compatManifest` harvester cross-check (`checkUntil`) validates a declared
+  `until` against the harvested corpus: rejects a bound that over-claims
+  (corpus shows drift inside the declared-valid window, or a re-verified
+  signature at or above `until` — softlink cannot express drift-then-revert)
+  and rejects a bound with no positive evidence (no `fkVerified` fact below
+  it in the corpus). A bound beyond the corpus's max harvested version passes
+  vacuously (harmless — declared-bound refusal, below, does not depend on
+  corpus confirmation). **Security fix (Finding R2-A, High):** at or above a
+  declared `until`, an unclassified (`unknown`) corpus fact now ALSO rejects
+  the bound, with its own message — previously the check only looked for a
+  re-verified (`fkVerified`) fact there, so a corpus version the harvester
+  couldn't classify passed silently even though it gives no evidence the
+  declared-invalid window actually holds; the runtime attested-path exemption
+  for manifest-present bounded symbols relies on this check having decided
+  every in-window corpus version one way or the other. `checkSince` gets the
+  symmetric fix below `since`. Manifest schema is **unchanged, stays version
+  1** — `checkUntil`/`checkSince` consume the existing verified/absent/
+  mismatch/unknown facts, no new field.
+- `versionMacros("FOO_MAJOR_VERSION", ...)` block directive (`dynlib` and
+  `verifyProcs`; at most one per block, any position): declares the
+  library's version-macro spelling once, most significant first. softlink
+  then **synthesizes** the required `{.verifyWhen.}` gate for every
+  `until`-bounded proc directly from its declared bounds — the full nested
+  lexicographic comparison with trailing zero components stripped
+  (`until: "4.16.0"` over three macros becomes
+  `(A < 4) || (A == 4 && B < 16)`), so the gate's threshold is correct by
+  construction; a hand-written split-macro gate can silently go wrong at a
+  major-version rollover, and softlink cannot check a hand gate's value
+  against `until`. An explicit `{.verifyWhen.}` on the proc overrides
+  synthesis verbatim (feature-macro and packed-single-macro gating stay
+  hand-written by design). Synthesized gates additionally get per-macro
+  `#ifndef`/`#error` visibility guards in the verify TU (in `#if`, an
+  undefined macro silently evaluates to `0` — fail loud instead of
+  misverifying). Bounds with alphabetic runs, or with more EFFECTIVE
+  components (after trailing zeros are stripped) than the declared macro
+  list, are compile-time errors; shorter bounds need no padding, since the
+  predicate only ever compares a macro-list prefix.
+- Probe-dump JSON (`-d:softlinkDumpProbes`) gains a `"until"` key per proc,
+  alongside the existing `"since"` — descriptive metadata the harvester
+  carries but does not (yet) act on beyond the cross-check above.
+- **Declared-bound runtime refusal**: `loadFoo()` now refuses a symbol whose
+  probed runtime version falls outside its declared `[since, until)` at the
+  sites the manifest's own drift facts can't reach — an out-of-corpus probe
+  with a manifest attached, a probe with no manifest attached at all, and
+  (code-review finding CR1-1) an **attested, in-corpus probe for a bounded
+  symbol the attached manifest doesn't record at all** — `checkUntil`/
+  `checkSince` have nothing to cross-check for such a symbol, so it is not
+  covered by the "harvester already confirmed it" reasoning that otherwise
+  makes an attested-path re-check redundant. A bounded symbol the manifest
+  *does* record is unaffected: attested, in-corpus probes for it are keyed
+  on the manifest's own drift facts exactly as before. Optional symbols are
+  re-nilled with `mrDriftRefused`; required symbols unwind the whole load,
+  mirroring existing attested-drift behavior. `CompatReport` carries the
+  refusal, and the wrapper's drift-story error message names the declared
+  bound. The not-in-manifest hint (RFC-0001 Check 8) now escalates to a
+  warning under `-d:softlinkStrictVerify`, matching the codebase's other
+  trust-point hints. See **Changed** below for the policy implication.
+
 ### Changed
+
+- **Policy narrowing (RFC-0002 §4.4, "F1" — approved by maintainer
+  2026-07-18): a load that previously succeeded out-of-corpus for a symbol
+  carrying a declared `until`/`since` bound may now be refused.** RFC-0001
+  deliberately did not block on harvest facts alone for versions the
+  manifest can't decide; this narrows that policy only where the *binding's
+  author* has explicitly declared the signature invalid outside a range (and,
+  when a manifest is attached, the harvester has confirmed the declaration).
+  Symbols without `since`/`until` are completely unaffected. Two escape
+  hatches, same as existing drift refusal: build-wide
+  `-d:softlinkNoDriftRefusal`, or per-block `compatManifest(..., refuse =
+  false)` when a manifest is attached. A manifest-less block has no per-block
+  hatch — the author *is* the declarer there, so the author-side escape is
+  simply not declaring `until`.
+- **`CompatReport` shape changes — additive, but touches every field a
+  serializing consumer enumerates:**
+  - `missingReasons`'s element type grows a third field:
+    `seq[tuple[symbol: string, reason: MissingReason, interval:
+    VersionInterval]]` (previously `seq[tuple[symbol, reason: string]]` pre-
+    0.8.0, then `seq[tuple[symbol: string, reason: MissingReason]]` in
+    0.8.0). Any code pattern-matching or destructuring the tuple by position
+    or arity needs updating. This shape is now also available under the name
+    `MissingReasonEntry*` (`missingReasons*: seq[MissingReasonEntry]`) — a
+    named alias for the same structural tuple, added purely so the library's
+    own codegen has one declaration to reference; since Nim tuples are
+    structural, existing code written against the anonymous tuple keeps
+    compiling unchanged.
+  - New field `probeNotComparable*: bool` — `false` in every existing report
+    shape; `true` only when a probed version string exactly ties a declared
+    bound with a trailing pre-release-style suffix (e.g. `"4.16.0-rc1"` vs.
+    `until: "4.16.0"`) or is unparseable, in which case declared-bound
+    refusal declines to decide and the symbol loads normally
+    (report-don't-block).
 - The `versionProbe` drift-call compile error now explains that this check is deliberately **not** lifted by `refuse = false` / `-d:softlinkNoDriftRefusal`: those relax runtime refusal of drifted symbols in your own code, but the probe runs first — to determine the version the drift machinery is keyed on — so a probe resting on a symbol of uncertain signature could misreport that version before any refusal policy applies. Its soundness stays unconditional; the message now says so and points you at reading the version through a drift-free symbol (code review #10).
+
+### Notes
+
+- **Migration**: existing bindings that hand-roll drift detection with a bare
+  `header` + `verifyWhen` (no `since`/`until`) keep working unchanged —
+  nothing above alters their behavior. Adopting `since`/`until` is optional;
+  it is recommended once a `compatManifest` is attached to the block, since
+  that's what turns on the harvester cross-check and gets you declared-bound
+  refusal essentially for free.
 
 ## [0.8.0] - 2026-07-17
 

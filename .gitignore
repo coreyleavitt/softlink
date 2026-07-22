@@ -16,6 +16,15 @@ tests/tcompat_drift_refuse_false
 # RFC-0001 §9/§C.2, slice C5: tests/tcompat_degradation.nim's own runtime
 # binary (built by `runDegradationChecks` in the nimble test task).
 tests/tcompat_degradation
+# RFC-0002 §6, slice C3a: tests/tverify_gated_drift.nim's own compiled
+# binary (built by `runGatedDriftChecks` in the nimble test task — rmFile'd
+# after each run, but the fixture is compiled with real `nim c`, not
+# --compileOnly, so it exists on disk between the two invocations).
+tests/tverify_gated_drift
+# RFC-0002 §5/§6, slice E2: tests/tverify_synthesized_gate.nim's own
+# compiled binary — same rationale as tests/tverify_gated_drift above
+# (built by `runVersionMacrosGateChecks` in the nimble test task).
+tests/tverify_synthesized_gate
 # RFC-0001 code-review Lows (#24/R2-5): the tcov_* coverage fixtures are run
 # with `nim c -r` (unconditional block in the `test` task), leaving compiled
 # binaries next to their sources.

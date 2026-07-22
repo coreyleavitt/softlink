@@ -51,4 +51,15 @@ type
     verifyWhen*: string  ## C preprocessor expr gating verification; "" = always
     prototype*: string   ## raw {.prototype: "...".} string; "" if absent
     sinceVersion*: string  ## RFC-0001 §B.5/§C.2: {.since: "x.y.z".} claim; "" if absent
+    untilVersion*: string  ## RFC-0002 §4.1/§6, slice A1: {.until: "x.y.z".} claim; "" if absent
+    synthesizedGateMacros*: seq[string]  ## RFC-0002 §5/§6, slice E2: the
+      ## `versionMacros` PREFIX actually referenced by a SYNTHESIZED
+      ## `verifyWhen` (post trailing-zero-strip; see `softlink/gates.
+      ## GateResult.usedMacros`) — empty unless `softlink/pragmas.
+      ## synthesizeVersionGates` synthesized this proc's gate. An explicit,
+      ## hand-written `{.verifyWhen.}` NEVER populates this (the documented
+      ## override — §5: "forgoes by-construction consistency... and the
+      ## visibility guards"), so `softlink/verify.genVerifyBlock` uses this
+      ## field, not `verifyWhen.len > 0`, to decide which procs get the
+      ## `#ifndef`/`#error` macro-visibility guards.
     hasReturn*: bool

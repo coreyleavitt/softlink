@@ -45,7 +45,7 @@ suite "classifyAbsence -- multi-symbol no-double-count (finding #24b)":
     let missing = @["sym_mismatch_a", "sym_mismatch_b", "sym_expected"]
     var partition: seq[tuple[symbol: string, class: AbsenceClass]] = @[]
     for sym in missing:
-      let cls = classifyAbsence(symbols, sym, "4.0.0", "")
+      let cls = classifyAbsence(symbols, sym, "4.0.0", "", "")
       if cls != acNone:
         partition.add (symbol: sym, class: cls)
 
@@ -76,10 +76,54 @@ suite "classifyAbsence -- multi-symbol no-double-count (finding #24b)":
     let missing = @["sym_x", "sym_y", "sym_z"]
     var partition: seq[tuple[symbol: string, class: AbsenceClass]] = @[]
     for sym in missing:
-      let cls = classifyAbsence(symbols, sym, "2.5.0", "")
+      let cls = classifyAbsence(symbols, sym, "2.5.0", "", "")
       if cls != acNone:
         partition.add (symbol: sym, class: cls)
 
     check partition.len == 3
     check partition.allIt(it.class == acAnomalous)
     check partition.mapIt(it.symbol).toHashSet.len == 3
+
+# Code review CR1-8, cell 2: `classifyAbsence`'s RFC-0002 §4.3 `until`-
+# demotion axis (the `untilVersion` parameter) never got its OWN
+# multi-symbol independence pin — `tcov_classify_absence_multi_pair`'s
+# existing suite above (finding #24b) covers multi-symbol independence for
+# the ORIGINAL RFC-0001 header-facts axis, but every one of its calls
+# passes `untilVersion = ""`. `classifyAbsence`'s until-branch runs FIRST,
+# before the header-facts loop even starts (src/softlink/manifest.nim),
+# so two symbols that are simultaneously absent, sharing the same
+# `symbols` slice and the same probed version, but carrying DIFFERENT
+# declared `until` values, must classify independently on this axis too —
+# nothing should leak from one symbol's `untilVersion` argument into the
+# other's.
+suite "classifyAbsence -- multi-symbol until-axis independence (review CR1-8, cell 2)":
+  test "two simultaneously-absent symbols with different declared until values classify independently at the same probed version":
+    # sym_until_low carries no header facts at all -- proving its
+    # classification comes SOLELY from the until-demotion branch (there is
+    # nothing else here that could produce acExpected).
+    let symLow = SymbolFacts(cname: "sym_until_low")
+    # sym_until_high DOES carry a `verified` header fact covering the
+    # probed version -- the header-facts branch this symbol's OWN call
+    # falls through to once its (higher) until fails to demote it.
+    var symHigh = SymbolFacts(cname: "sym_until_high")
+    symHigh.header[fkVerified] = @[VersionInterval(lo: "4.0.0", hi: "")]
+    let symbols = @[symLow, symHigh]
+    let probed = "4.0.0"
+
+    # sym_until_low: probed ("4.0.0") is AT-OR-ABOVE its own declared
+    # until ("3.0.0") -> demoted to acExpected via the until branch, before
+    # the header-facts loop runs at all for this call.
+    let clsLow = classifyAbsence(symbols, "sym_until_low", probed, "", "3.0.0")
+    check clsLow == acExpected
+
+    # sym_until_high: the SAME `symbols` slice, the SAME probed version,
+    # but its own until ("5.0.0") is still AHEAD of "4.0.0" -> the until
+    # branch does NOT fire for this call; it falls through to the
+    # header-facts loop, whose `verified` interval covers "4.0.0" ->
+    # acAnomalous. A genuinely different answer than sym_until_low's own,
+    # from the same shared `symbols` argument -- proving the demotion is
+    # keyed off THIS CALL's own `untilVersion` argument, not anything
+    # shared or global, and that one symbol's demotion doesn't leak into
+    # (suppress or force) the other's classification.
+    let clsHigh = classifyAbsence(symbols, "sym_until_high", probed, "", "5.0.0")
+    check clsHigh == acAnomalous

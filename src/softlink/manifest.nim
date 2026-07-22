@@ -374,8 +374,21 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
   ## - contradicted if any corpus version `v < since` is classified
   ##   `verified` or `mismatch` (the header declares it EARLIER than
   ##   claimed, so the lower bound itself is false);
-  ## - `unknown` contributes nothing either way (honest ignorance, mirrors
-  ##   C3's runtime partition rule).
+  ## - contradicted if any corpus version `v < since` is classified
+  ##   `unknown` (Finding R2-A, the `checkUntil` rule (b′) hole's symmetric
+  ##   twin below `since`; see tools/harvest/README.md's rule (b′)): the
+  ##   expected, agreeing fact below `since` is `absent` (the symbol
+  ##   genuinely didn't exist yet) — an `unknown` fact
+  ##   there is not decisive evidence of that, only the harvester's own
+  ##   "couldn't classify". Left unchecked, an attested probe landing
+  ##   exactly on that corpus version would pass through the runtime
+  ##   attested-path exemption (which trusts this proc having validated the
+  ##   whole declared-invalid-below-`since` region), risking a drifted,
+  ##   name-stable lookalike dispatching silently.
+  ## - `unknown` AT or ABOVE `since` (inside the claimed-valid region)
+  ##   still contributes nothing (honest ignorance, mirrors C3's runtime
+  ##   partition rule) — only the region below `since`, where the fact
+  ##   space is supposed to be closed by `absent`, gets the new rule.
   ## No check is possible for a symbol entirely absent from the manifest —
   ## `contradicted` stays false (it counts toward the not-in-manifest hint
   ## instead, `notInManifest` below, computed independently).
@@ -400,9 +413,23 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
         badVersion = v
         reason = "mismatch"
         break
+      if anyContains(sf.header[fkUnknown], v):
+        badVersion = v
+        reason = "unknown"
+        break
 
   if badVersion.len == 0:
     return SinceCheck(contradicted: false)
+
+  if reason == "unknown":
+    return SinceCheck(contradicted: true,
+      message: "softlink: {.since: \"" & since & "\".} on '" & cname &
+        "' contradicts the compat manifest: the corpus has no decisive " &
+        "classification for '" & cname & "' at " & badVersion & ", below " &
+        "the declared bound — an 'unknown' harvest fact there cannot " &
+        "confirm the symbol is actually absent, so the bound cannot be " &
+        "trusted at attested versions; re-harvest " & badVersion & ", drop " &
+        "it from the corpus, or adjust the bound.")
 
   let earliest = earliestDeclaredVersion(m, sf)
   let boundMsg =
@@ -419,6 +446,174 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
   SinceCheck(contradicted: true,
     message: "softlink: {.since: \"" & since & "\".} on '" & cname & "' " &
       detail & " (" & boundMsg & ")")
+
+func firstDriftedVersion(m: CompatManifest, sf: SymbolFacts): string =
+  ## RFC-0002 §4.2's corrected-bound helper for `checkUntil` — the
+  ## backward-scanning analogue of `earliestDeclaredVersion` above: walks
+  ## `m.corpus` (`cmpVersion`-sorted) from its LAST version toward its
+  ## first, extending a candidate through every trailing `fkMismatch`
+  ## corpus version and stopping at the first one that isn't. The result
+  ## is the earliest version of the contiguous drift run that reaches the
+  ## end of the corpus — i.e. the version at which the symbol's signature
+  ## actually started drifting, suitable as a corrected `until` (`until`
+  ## is exclusive, so setting it here excludes every drifted version).
+  ## `""` if the corpus's own last version isn't itself mismatched (no
+  ## trailing drift run to report — the caller falls back to an "extend
+  ## the corpus" message).
+  var candidate = ""
+  for i in countdown(m.corpus.high, 0):
+    let v = m.corpus[i]
+    if anyContains(sf.header[fkMismatch], v):
+      candidate = v
+    else:
+      break
+  candidate
+
+type
+  UntilCheck* = object
+    ## Mirrors `SinceCheck`'s shape exactly, but `checkUntil` below is
+    ## NOT a mechanical mirror of `checkSince` — RFC-0002 §4.2 spells out
+    ## three independent rules with a different safety story than
+    ## `checkSince`'s single over-claim check.
+    contradicted*: bool
+    message*: string
+
+proc checkUntil*(m: CompatManifest, cname, since, until: string): UntilCheck =
+  ## RFC-0002 §4.2: `{.until: until.}` (optionally paired with `{.since:
+  ## since.}`) claims `cname`'s currently-declared signature is valid over
+  ## `[since, until)` — or `(-∞, until)` when `since` is absent (§4.1:
+  ## until-only, "present since forever, drifts later", is first-class).
+  ## Checked against the manifest's header facts over its own corpus, in
+  ## order, first violation wins:
+  ##
+  ## (a) Over-claim (the dangerous direction). Any corpus version inside
+  ##     the window classified `fkMismatch` is a hard error always — the
+  ##     author claims the declared signature holds there, but the corpus
+  ##     shows it already drifted. A corpus version inside the window
+  ##     classified `fkAbsent` is a hard error ONLY when `since` is
+  ##     present: with no `since`, absence below `until` is `since`'s own
+  ##     business (a symbol introduced late must not spuriously flag every
+  ##     version that predates its introduction).
+  ## (b) Over-caution + revert detection. At or above `until` (the window
+  ##     is half-open: a fact AT `until` is already "above"), the corpus
+  ##     must show no `fkVerified` fact — a re-verified signature at or
+  ##     above the declared bound contradicts softlink's single-interval
+  ##     model, which cannot express drift-then-revert. Passes vacuously
+  ##     if the corpus never reaches `until` (declared bound beyond corpus
+  ##     max) — harmless by construction, see §4.2.
+  ##     Finding R2-A (rule (b′) in tools/harvest/README.md): the same
+  ##     at-or-above-`until` scan ALSO contradicts on an `fkUnknown` fact —
+  ##     a version the harvester couldn't classify is not decisive evidence
+  ##     the declared signature is actually
+  ##     invalid there, so it cannot discharge (b)'s job of confirming the
+  ##     bound. Without this, an attested probe landing on that exact
+  ##     corpus version passes through the runtime attested-path exemption
+  ##     (which trusts this proc having validated the whole declared-
+  ##     invalid window), and a drifted pointer would dispatch silently.
+  ##     `fkMismatch`/`fkAbsent` at or above `until` are NOT contradictions
+  ##     here — both are exactly the outcomes (b) expects (drifted, or
+  ##     dropped per §4.3's demotion); only the non-classification case is
+  ##     new.
+  ## (c) Positive evidence. The window must contain at least one corpus
+  ##     version classified `fkVerified`, or the declaration is
+  ##     unfalsifiable-in-practice (an entirely-`fkAbsent` symbol could
+  ##     otherwise carry an arbitrary `until` and pass (a) and (b)
+  ##     trivially).
+  ##
+  ## No check is possible for a symbol entirely absent from the manifest
+  ## (mirrors `checkSince`) — `contradicted` stays false; that case counts
+  ## toward the not-in-manifest hint instead.
+  let symOpt = findSymbol(m, cname)
+  if symOpt.isNone: return UntilCheck(contradicted: false)
+  let sf = symOpt.get
+  let hasSince = since.len > 0
+
+  # Rule (a) — over-claim inside the declared window.
+  var badVersion = ""
+  var reason = ""
+  for v in m.corpus:
+    if cmpVersion(v, until) >= 0: continue
+    if hasSince and cmpVersion(v, since) < 0: continue
+    if anyContains(sf.header[fkMismatch], v):
+      badVersion = v
+      reason = "mismatch"
+      break
+    if hasSince and anyContains(sf.header[fkAbsent], v):
+      badVersion = v
+      reason = "absent"
+      break
+
+  if badVersion.len > 0:
+    let detail =
+      if reason == "absent":
+        "claims '" & cname & "' is valid through " & until &
+        ", but the compat manifest's header facts show it ABSENT at " &
+        badVersion & " — inside the declared window"
+      else:
+        "claims '" & cname & "' is valid through " & until &
+        ", but the compat manifest's header facts already show it " &
+        "drifted (mismatch) at " & badVersion & " — inside the declared window"
+    let boundMsg =
+      block:
+        let corrected = firstDriftedVersion(m, sf)
+        if corrected.len > 0: "the corrected upper bound is until: \"" & corrected & "\""
+        else: "no harvested corpus version confirms '" & cname & "' below " & until
+    return UntilCheck(contradicted: true,
+      message: "softlink: {.until: \"" & until & "\".} on '" & cname & "' " &
+        detail & " (" & boundMsg & ")")
+
+  # Rule (b) — over-caution + revert detection. Grep-pinned wording (RFC-
+  # 0002 §4.2, drafted for B2's fixture): keep this text verbatim.
+  for v in m.corpus:
+    if cmpVersion(v, until) < 0: continue
+    if anyContains(sf.header[fkVerified], v):
+      return UntilCheck(contradicted: true,
+        message: "softlink: {.until: \"" & until & "\".} on '" & cname &
+          "' contradicts the compat manifest: the corpus re-verifies the " &
+          "declared signature at " & v & ", at or above the declared bound " &
+          "— softlink's single-interval model cannot express drift-then-" &
+          "revert (RFC-0002 §3); drop 'until' for this symbol to fall back " &
+          "to unbounded verification.")
+    # Finding R2-A (rule (b′) in tools/harvest/README.md): an `fkUnknown`
+    # fact at or above `until` is exactly as dangerous as a re-verified
+    # one for the attested-path exemption's premise — neither is decisive
+    # evidence the declared-invalid window actually holds.
+    # `fkMismatch`/`fkAbsent` here are the EXPECTED
+    # outcomes (agree with the bound) and must not trip this; only
+    # `fkUnknown` — the harvester's own "couldn't classify" — does.
+    # NOTE: a version that is neither `fkVerified` (checked above) nor
+    # `fkUnknown` (checked below) falls through this loop as fine — an
+    # implicit "must be `fkMismatch` or `fkAbsent`, never an unrecorded
+    # gap" that only holds because directives.nim's Check 5
+    # (validateDisjointExhaustive) hard-errors upstream on any
+    # symbol/version coverage gap or overlap.
+    if anyContains(sf.header[fkUnknown], v):
+      return UntilCheck(contradicted: true,
+        message: "softlink: {.until: \"" & until & "\".} on '" & cname &
+          "' contradicts the compat manifest: the corpus has no decisive " &
+          "classification for '" & cname & "' at " & v & ", at or above " &
+          "the declared bound — an 'unknown' harvest fact there cannot " &
+          "confirm the signature is actually invalid, so the bound cannot " &
+          "be trusted at attested versions; re-harvest " & v & ", drop it " &
+          "from the corpus, or adjust the bound.")
+
+  # Rule (c) — positive evidence.
+  var hasEvidence = false
+  for v in m.corpus:
+    if cmpVersion(v, until) >= 0: continue
+    if hasSince and cmpVersion(v, since) < 0: continue
+    if anyContains(sf.header[fkVerified], v):
+      hasEvidence = true
+      break
+
+  if not hasEvidence:
+    return UntilCheck(contradicted: true,
+      message: "softlink: {.until: \"" & until & "\".} on '" & cname &
+        "' contradicts the compat manifest: no corpus version below " &
+        until & " confirms the declared signature — extend the corpus " &
+        "below 'until', or drop the bound.")
+
+  UntilCheck(contradicted: false)
 
 type
   AbsenceClass* = enum
@@ -443,7 +638,7 @@ type
                  ## resolve at load time.
 
 func classifyAbsence*(symbols: seq[SymbolFacts], cname, probedVersion,
-                       sinceVersion: string): AbsenceClass =
+                       sinceVersion, untilVersion: string): AbsenceClass =
   ## RFC-0001 §C.2/§C.3, slice C3: given one symbol that failed to resolve
   ## at runtime (an entry already in `LoadResult.missing` — this function
   ## is never called for a resolved symbol), classify why against this
@@ -452,6 +647,11 @@ func classifyAbsence*(symbols: seq[SymbolFacts], cname, probedVersion,
   ## `probedVersion`, folding in a `{.since.}` claim (`sinceVersion`, `""`
   ## if the proc carries none) per RFC-0001 §C.2's "manifest/since" wording
   ## on `mrExpected`.
+  ##
+  ## RFC-0002 §4.3, slice C1 extends this with `untilVersion` (`""` if the
+  ## proc carries no declared `until`, mirroring `sinceVersion`'s own
+  ## convention) — see the demotion branch below, which runs BEFORE the
+  ## header-facts loop.
   ##
   ## Precedence and judgment calls (flagged in the C3 handoff; RFC-0001
   ## §B.3/§C.2 text quoted where it applies):
@@ -479,6 +679,30 @@ func classifyAbsence*(symbols: seq[SymbolFacts], cname, probedVersion,
   ##   empty"); `symbols == @[]` here would be indistinguishable from "an
   ##   attached manifest that happens to track nothing", which is why that
   ##   gating lives in the caller, not here.
+  ## - **RFC-0002 §4.3 — declared `until` demotes an at-or-above absence to
+  ##   `acExpected`, BEFORE the anomalous-mismatch rule above gets a chance
+  ##   to fire.** This looks like it contradicts the "hiding a genuine
+  ##   header/`.so` divergence" reasoning that keeps `mismatch` folded into
+  ##   `acAnomalous` (bullet above) — it doesn't, because the two cases
+  ##   differ in exactly the fact that reasoning turns on: an UNDECLARED
+  ##   mismatch is a divergence the caller has no way to know about ahead
+  ##   of time (hidden); an author-declared, `checkUntil`-validated `until`
+  ##   is the attestation that RFC-0001's rule lacked — the divergence is
+  ##   declared, corpus-confirmed, and reported with its own interval (C2).
+  ##   Demoting it is surfacing an ALREADY-KNOWN fact, not hiding a new
+  ##   one. Undeclared mismatches (no `until`, or a probed version still
+  ##   below it) keep the anomalous classification, completely unchanged.
+  # RFC-0002 §4.3: compared via `cmpVersion` (same comparator `sinceVersion`
+  # already uses two paragraphs down), NOT `versions.compareToBound` — that
+  # comparator's `none`/"not comparable" outcome exists for §4.4's runtime
+  # REFUSAL check specifically (an unparseable or boundary-tie probe must
+  # decline to *block* a load); `cmpVersion` never declines, it is a total
+  # order over every string (unparseable inputs sort as the empty
+  # sequence, module doc comment above) — classification has no
+  # "not-block" escape hatch to preserve, so there is no not-comparable
+  # case for this function to be silent about.
+  if untilVersion.len > 0 and cmpVersion(probedVersion, untilVersion) >= 0:
+    return acExpected
   for sf in symbols:
     if sf.cname == cname:
       if anyContains(sf.header[fkVerified], probedVersion) or

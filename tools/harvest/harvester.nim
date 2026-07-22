@@ -44,7 +44,7 @@ type
     ## Field shape mirrors `probeFactsJson` in src/softlink.nim exactly
     ## (both sides of this schema must never drift independently).
     nimName*, cName*: string
-    header*, prototype*, verifyWhen*, noverifyReason*, since*: string
+    header*, prototype*, verifyWhen*, noverifyReason*, since*, until*: string
     optional*, noverify*: bool
 
   ProbeDump* = object
@@ -308,6 +308,27 @@ proc bisectPlan*(symbols: seq[string],
 # B.1 dump parsing
 # ---------------------------------------------------------------------------
 
+proc reqField(j: JsonNode, key, dumpFile: string): JsonNode =
+  ## Look up `key` on `j`, raising a `HarvestError` (never a raw, unhelpful
+  ## `json.KeyError`) when it's absent. Code-review finding CR1-11: `loadDump`
+  ## used to index every field it expects directly (`j["until"]` etc.) — a
+  ## probes.json written by an older softlink, from before a schema-adding
+  ## RFC (e.g. RFC-0002 slice A1b's `until` key) landed, is missing fields a
+  ## CURRENT `loadDump` expects, and the fix for that ("re-run the probe
+  ## dump against the current softlink") is a much better diagnostic than a
+  ## bare `key not found: until`. Used for every field this proc reads, top-
+  ## level and per-proc alike, so the hardening is uniform rather than
+  ## limited to the one key the RFC that motivated it happened to add.
+  if not j.hasKey(key):
+    raise newException(HarvestError,
+      "softlink harvest: probe-facts dump " & dumpFile & " is missing the " &
+      "'" & key & "' field — this dump predates the current probes.json " &
+      "schema (it was most likely written by an older softlink, before a " &
+      "schema-adding change). Re-run the -d:softlinkDumpProbes=<dir> " &
+      "compile that produced this dump to regenerate it against the " &
+      "current schema.")
+  j[key]
+
 proc loadDump*(dumpFile: string): ProbeDump =
   ## Parse one `<Base>.probes.json` file (RFC-0001 SS4 B.1 schema; see
   ## `validateProbeJson` in softlink.nimble for the schema this mirrors).
@@ -315,11 +336,11 @@ proc loadDump*(dumpFile: string): ProbeDump =
     raise newException(HarvestError,
       "softlink harvest: probe-facts dump not found: " & dumpFile)
   let j = parseJson(readFile(dumpFile))
-  result.schemaVersion = j["schemaVersion"].getInt
-  result.kind = j["kind"].getStr
-  result.modulePath = j["modulePath"].getStr
-  result.libPattern = j["libPattern"].getStr
-  result.baseName = j["baseName"].getStr
+  result.schemaVersion = reqField(j, "schemaVersion", dumpFile).getInt
+  result.kind = reqField(j, "kind", dumpFile).getStr
+  result.modulePath = reqField(j, "modulePath", dumpFile).getStr
+  result.libPattern = reqField(j, "libPattern", dumpFile).getStr
+  result.baseName = reqField(j, "baseName", dumpFile).getStr
   # #22 (defense in depth): `baseName` gets spliced into the output compat-
   # manifest's PATH (`isMainModule`'s `manifestPath`, below) — a legitimate
   # dump's `baseName` is always `dynlib`'s own `libNameToIdent` output
@@ -337,17 +358,18 @@ proc loadDump*(dumpFile: string): ProbeDump =
       "produces), got something containing a path separator, '..', or " &
       "another non-identifier character; refusing to use it to build a " &
       "filesystem path")
-  for p in j["procs"]:
+  for p in reqField(j, "procs", dumpFile):
     result.procs.add ProbeFact(
-      nimName: p["nimName"].getStr,
-      cName: p["cName"].getStr,
-      header: p["header"].getStr,
-      prototype: p["prototype"].getStr,
-      verifyWhen: p["verifyWhen"].getStr,
-      optional: p["optional"].getBool,
-      noverify: p["noverify"].getBool,
-      noverifyReason: p["noverifyReason"].getStr,
-      since: p["since"].getStr,
+      nimName: reqField(p, "nimName", dumpFile).getStr,
+      cName: reqField(p, "cName", dumpFile).getStr,
+      header: reqField(p, "header", dumpFile).getStr,
+      prototype: reqField(p, "prototype", dumpFile).getStr,
+      verifyWhen: reqField(p, "verifyWhen", dumpFile).getStr,
+      optional: reqField(p, "optional", dumpFile).getBool,
+      noverify: reqField(p, "noverify", dumpFile).getBool,
+      noverifyReason: reqField(p, "noverifyReason", dumpFile).getStr,
+      since: reqField(p, "since", dumpFile).getStr,
+      until: reqField(p, "until", dumpFile).getStr,
     )
 
 # ---------------------------------------------------------------------------

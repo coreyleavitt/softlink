@@ -31,6 +31,7 @@ you need more depth than "how do I use this."
   - [The one-screen happy path](#the-one-screen-happy-path)
 - [The B.6 CI template](#the-b6-ci-template)
 - [Consumer side: `compatManifest`](#consumer-side-compatmanifest)
+  - [`checkUntil`: validating a declared `until` against the corpus](#checkuntil-validating-a-declared-until-against-the-corpus)
 
 ## Producer side: `softlink_harvest`
 
@@ -374,9 +375,23 @@ With a manifest attached, at compile time:
 
 - **`{.since: "x.y.z".}` contradiction is a hard error, no escape hatch.**
   If a proc claims `{.since: "1.2.0".}` but the manifest's own facts say
-  otherwise, compilation fails with a message that includes the corrected
-  bound — this is a factual claim in source, and the fix is a one-line
-  annotation edit.
+  otherwise, compilation fails. For a decisive contradiction — the header
+  is `absent`, `verified`, or `mismatch` on the wrong side of the claimed
+  bound — the message includes the corrected bound: this is a factual
+  claim in source, and the fix is a one-line annotation edit. There is one
+  exception: an `unknown` fact below the claimed bound (the harvester
+  never decisively classified that version, so it can't confirm the
+  symbol was actually absent there — the symmetric twin, below `since`, of
+  `checkUntil` rule (b′), the decisiveness sub-case described below, at or
+  above `until`) is *also* a hard error, but has no meaningful corrected
+  bound to report — an unclassified version
+  proves nothing about where the real bound should be. Its message instead
+  names the unclassified version and says to re-harvest it, drop it from
+  the corpus, or adjust the bound.
+- **`{.until: "x.y.z".}` cross-check (`checkUntil`) is likewise a hard
+  error, no escape hatch** — but it is *not* a mechanical mirror of the
+  `since` check; it enforces three distinct rules, spelled out
+  [below](#checkuntil-validating-a-declared-until-against-the-corpus).
 - **Schema/lib/ABI checks.** An unsupported (newer) manifest schema is a
   compile error naming the softlink version required. A manifest whose
   `lib` doesn't match this block's own library name is an error (wrong-
@@ -402,6 +417,77 @@ With a manifest attached, at compile time:
   embedded as `softlinkCompatFacts<Base>: seq[SymbolFacts]` (the same
   pinned `softlink/versions` types the harvester uses), for future
   load-time use.
+
+### `checkUntil`: validating a declared `until` against the corpus
+
+`{.until: "x.y.z".}` (RFC-0002) claims a symbol's declared signature is
+valid over the half-open window `[since, until)` — or `(-∞, until)` when no
+`since` is declared. With a manifest attached, `checkUntil` holds that claim
+against the harvested facts. Three rules plus a decisiveness sub-case,
+checked in order, first violation is a compile error:
+
+- **(a) Over-claim — the dangerous direction.** Any corpus version *inside*
+  the declared-valid window with a `mismatch` fact is a hard error: you
+  present the window as verified-correct, but the corpus shows the
+  signature already drifted there. When `since` is also declared, an
+  `absent` fact inside the window errors too. When `since` is *absent*,
+  only `mismatch` counts — absence below an undeclared introduction point
+  is `since`'s business, and a symbol introduced late in the corpus with
+  only an `until` must not spuriously flag the versions predating it. The
+  error message includes the corrected bound when the corpus can supply
+  one: it scans backward through the trailing run of `mismatch` versions
+  and reports `the corrected upper bound is until: "<first drifted
+  version>"` (exclusive bound, so setting it there excludes every drifted
+  version).
+- **(b) Revert detection.** At or above `until` (the window is half-open —
+  a fact *at* `until` is already outside it), the corpus must show **no
+  `verified` fact**: a re-verified signature above the bound means the
+  symbol drifted and then *reverted*, which the single-interval
+  `[since, until)` model cannot express — the error says to drop `until`
+  for that symbol and fall back to unbounded verification. If the corpus
+  never reaches `until` at all (bound beyond the corpus's max harvested
+  version), this rule passes **vacuously** — harmless by construction: an
+  attested probe is by definition ≤ corpus max < `until`, and the region
+  at or above `until` is covered by declared-bound refusal at runtime,
+  which doesn't lean on corpus confirmation.
+- **(b′) Non-decisive fact, at or above `until`.** A corpus version at or
+  above `until` recorded as `unknown` (the harvester couldn't classify it)
+  is *also* a hard error, for the same reason as (b): it is neither
+  confirmation the signature drifted (`mismatch`) nor that the symbol was
+  dropped (`absent`, expected per the `until` demotion) nor a contradiction
+  (`verified`) — it is simply undecided, which means the corpus never
+  actually confirmed the declared-invalid window holds at that version. A
+  runtime probe that happens to land exactly there gets none of the
+  runtime-side protection this bound is supposed to buy: the error names
+  the unclassified version and says to re-harvest it, drop it from the
+  corpus, or adjust the bound.
+- **(c) Positive evidence.** At least one corpus version strictly below
+  `until` (inside the window when `since` is present) must carry a
+  `verified` fact. Without one the declaration is
+  unfalsifiable-in-practice — a symbol `absent` across the entire corpus
+  could carry an arbitrary `until` and pass (a) and (b) trivially. The
+  error names the fix: extend the corpus below `until`, or drop the bound.
+
+**Troubleshooting: a wave of unrelated `until` failures.** If a harvest
+baseline build fails at the corpus's *newest* version, every symbol comes
+back `unknown` there (the harvester couldn't classify anything against a
+baseline that doesn't compile) — and rule (b′) then hard-errors on *every*
+`until`-bearing proc whose bound sits at or below that version, all citing
+"no decisive classification" at the same version. It looks like an
+unrelated wave of breakage but traces to one bad harvest point. Fix it one
+of three ways: re-harvest that version (repair the baseline build), drop
+that version from the corpus, or — legitimate when the tip is genuinely
+unclassifiable — declare `until` strictly beyond the corpus max, which
+passes rule (b)/(b′) vacuously by construction (the region is then covered
+by declared-bound refusal at runtime, not corpus confirmation).
+
+Corpus granularity is tolerated the same way the `since` check tolerates
+it: a corpus that jumps 4.15.0 → 4.17.0 with `until: "4.16.0"` declared in
+the gap passes — the rules compare by version order, not exact membership.
+A symbol entirely absent from the manifest is not checked at all (it counts
+toward the not-in-manifest hint instead). No new manifest field is involved:
+`checkUntil` consumes the same `verified`/`absent`/`mismatch` facts the
+schema above already records, and the schema stays at version 1.
 
 Everything above is compile-time-only: attaching a manifest, by itself,
 changes what the compiler checks and warns about, not what `loadFoo()`

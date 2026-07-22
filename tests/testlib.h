@@ -12,8 +12,15 @@
 #endif
 
 /* Version macro for {.verifyWhen.} tests — real bindings gate on macros
- * like MBEDTLS_VERSION_NUMBER; TESTLIB_VERSION plays that role here. */
+ * like MBEDTLS_VERSION_NUMBER; TESTLIB_VERSION plays that role here.
+ * RFC-0002 §6 slice C3a: `#ifndef`-guarded so a second compile invocation
+ * can override it (`--passC:-DTESTLIB_VERSION=2`) to present a genuinely
+ * different header to the same verify TU — a plain `#define` would make a
+ * command-line `-D` a "redefined macro" warning/error instead of a clean
+ * override. */
+#ifndef TESTLIB_VERSION
 #define TESTLIB_VERSION 1
+#endif
 
 /* RFC-0001 §3 A.1 slice A2: real C headers meant for C++ inclusion guard
  * their declarations in `extern "C"` — softlink's own verify TU already
@@ -50,9 +57,42 @@ TESTLIB_API int testlib_versioned(void);
 /* Optional symbol — in header but NOT in .so/.dll (simulates newer API version) */
 TESTLIB_API int testlib_future(void);
 
+/* RFC-0002 §4.3/§6, slice C1: an {.optional, since, until.} symbol that is
+ * ALSO genuinely never implemented in the .so — the "absent from the .so
+ * at-or-above a declared until" case C1's classification change targets.
+ * Declared here (never defined in testlib.c) purely so header verification
+ * has something to check against, exactly like testlib_future above. */
+TESTLIB_API int testlib_dropped(void);
+
 /* Symbol for {.verifyWhen.} true-condition tests: declared here (so the
  * gated _Static_assert has something to verify) and present in the .so. */
 TESTLIB_API int testlib_gated(void);
+
+/* RFC-0002 §6, slice C3a: testlib_drifted — a GENUINELY drifted signature
+ * across TESTLIB_VERSION (contrast testlib_gated_v2 in testlib.c, whose
+ * higher-version declaration is simply ABSENT). Mirrors the RFC's own
+ * motivating case exactly: Z3_fpa_get_numeral_sign's `int *sgn` -> `bool
+ * *sgn` out-param drift is a POINTER type change, not a scalar one — an
+ * earlier draft of this fixture used a scalar `int`/`double` param drift
+ * and found (empirically) that softlink's call-based verification cannot
+ * catch it: C silently applies the usual arithmetic conversion to a
+ * scalar argument at a call site (no error, no warning even without `-w`
+ * suppressing it), so a wrong SCALAR param type is invisible to the
+ * assert chain (see `genVerifyBlock`'s own doc comment on "const-tolerant
+ * param checking"). An incompatible POINTER argument, by contrast, is a
+ * hard `-Wincompatible-pointer-types` error on this toolchain (verified
+ * by hand) even under `-w` — so the drift here is `int *` -> `double *`,
+ * softlink has no {.importc.} rename axis, so two Nim bindings of one
+ * drifted C symbol must be distinguishable Nim overloads by parameter
+ * type (return-type-only overloading is ambiguous in Nim). Declared here
+ * only (never defined in testlib.c) — this fixture is compile-only
+ * verification, like testlib_dropped/testlib_future above; nothing ever
+ * dlsym's it. */
+#if TESTLIB_VERSION >= 2
+TESTLIB_API int testlib_drifted(double *sgn);
+#else
+TESTLIB_API int testlib_drifted(int *sgn);
+#endif
 
 /* Symbol for lrLibNotFound testing — declared in header, bound to a non-existent library */
 TESTLIB_API int testlib_notreal(void);
