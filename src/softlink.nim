@@ -1215,7 +1215,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # attached, ABI-ignored or not) can gate the degraded-tier warning.
   let appliedManifest = applyCompatManifest(ppmDynlib, baseNameLower, procs, manifestDirective)
 
-  for verifyNode in genVerifyBlock(procs, baseName, appliedManifest.attached):
+  for verifyNode in genVerifyBlock(procs, baseName, appliedManifest.attached,
+                                    versionMacrosDirective.headerName):
     result.add(verifyNode)
 
   # RFC-0001 §B.5/§9, slice B6b: embed the manifest's per-symbol interval
@@ -2595,7 +2596,8 @@ macro verifyProcs*(body: untyped): untyped =
   # check -- verifyProcs has no library identity to check against).
   let appliedManifest = applyCompatManifest(ppmVerifyProcs, "", procs, manifestDirective)
   result = newStmtList()
-  for n in genVerifyBlock(procs, tag, appliedManifest.attached):
+  for n in genVerifyBlock(procs, tag, appliedManifest.attached,
+                           versionMacrosDirective.headerName):
     result.add(n)
   # RFC-0001 §B.5a, slice B6b: NO const embedding for verifyProcs — "no
   # library identity, no loadX, no pointers, no wrappers... no const

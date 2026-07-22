@@ -182,10 +182,26 @@ proc parseProbeOnlyList(raw: string, posNode: NimNode): seq[string] =
   parts
 
 proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
-                     hasManifestAttached: bool = false): seq[NimNode] =
+                     hasManifestAttached: bool = false,
+                     versionMacrosHeader: string = ""): seq[NimNode] =
   ## Generate the compile-time C header signature verification nodes
   ## (include section + a file-local _Static_assert proc). Shared by
   ## `dynlib` and `verifyProcs`.
+  ##
+  ## `versionMacrosHeader` (RFC-0002 §5/§6 Z3 extension): the block's
+  ## `versionMacros(...)` directive's `header = "..."` value, if any ("" —
+  ## the zero value — means absent, matching `VersionMacrosDirective.
+  ## headerName`'s own convention). `versionMacros`'s synthesized gate
+  ## assumes one of THIS block's procs' `{.header.}`s transitively
+  ## #includes whatever header defines the named macro(s) — true for
+  ## mbedtls-style umbrella headers, false for Z3 (`z3.h` doesn't include
+  ## `z3_version.h`). When non-empty, this header joins the block's own
+  ## `#include` list below, UNCONDITIONALLY on presence — not gated on
+  ## whether any proc's synthesized gate actually ended up consuming the
+  ## directive (`checkVersionMacrosConsumed`'s unused-directive hint is a
+  ## separate, orthogonal signal; coupling the two would make one silently
+  ## depend on the other for no benefit — the extra #include is harmless
+  ## even when unused).
   ##
   ## `hasManifestAttached` (RFC-0001 §B.5 check 9, slice B6a): true iff
   ## `applyCompatManifest` attached a (non-ABI-ignored) compat manifest to
@@ -345,6 +361,18 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
       if p.headerFile != "" and p.headerFile notin headers:
         headers.incl(p.headerFile)
         includeCode.add(toIncludeDirective(p.headerFile))
+
+    # RFC-0002 §5/§6 Z3 extension: `versionMacros(..., header = "...")`'s
+    # named header, if any — joins the SAME `headers` set the loop just
+    # above builds, so it gets the identical dedup treatment as any proc's
+    # `{.header.}` (no double #include if it happens to equal one already
+    # in the set; this loop has never invented dedup beyond that, so
+    # neither does this). Added here, BEFORE the prototype-decl and
+    # macro-visibility-guard emission below, so the macro(s) the guard
+    # checks are guaranteed in scope by the time it runs.
+    if versionMacrosHeader.len > 0 and versionMacrosHeader notin headers:
+      headers.incl(versionMacrosHeader)
+      includeCode.add(toIncludeDirective(versionMacrosHeader))
 
     # Vendored-prototype extern declarations (RFC-0001 §3 A.1), emitted
     # after all of this block's #includes so any named types the prototype

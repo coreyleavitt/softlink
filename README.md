@@ -551,7 +551,8 @@ the bound — softlink synthesizes the compile-time verify gate from it:
 import softlink
 
 dynlib "z3":
-  versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION", "Z3_PATCH_VERSION")
+  versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION", "Z3_PATCH_VERSION",
+                header = "z3_version.h")
 
   # int* out-param through 4.15; bool* from 4.16 — declare the historical
   # shape, bounded. No hand-written gate anywhere.
@@ -567,14 +568,35 @@ wherever the loaded version is at or above `4.16.0` — see
 [runtime behavior](#runtime-behavior-declared-bound-refusal) below.
 
 `versionMacros` takes the library's version macros as separate string
-arguments, **most significant first**. The macros must be defined by a
-header some proc in the block already includes — if they aren't, the verify
-translation unit fails loudly with a softlink `#error` naming the macro,
-instead of silently misverifying (in C, an undefined identifier inside `#if`
-evaluates to `0` with no warning; softlink emits a per-macro
-`#ifndef`/`#error` guard so a synthesized gate can never fall into that
-hole). At most one `versionMacros` per block, any position; accepted in both
-`dynlib` and `verifyProcs`.
+arguments, **most significant first**. The macros must be *in scope* by the
+time the synthesized gate evaluates — defined by a header some proc in the
+block already includes, or by the header named in `versionMacros`'s own
+optional `header = "..."` argument (same quoted/angle-bracket convention as
+`{.header.}`: `header = "z3_version.h"` emits `#include "z3_version.h"`,
+`header = "<z3_version.h>"` emits `#include <z3_version.h>`). If neither
+holds, the verify translation unit fails loudly with a softlink `#error`
+naming the macro, instead of silently misverifying (in C, an undefined
+identifier inside `#if` evaluates to `0` with no warning; softlink emits a
+per-macro `#ifndef`/`#error` guard so a synthesized gate can never fall into
+that hole). At most one `versionMacros` per block, any position; accepted in
+both `dynlib` and `verifyProcs`.
+
+**When you need `header = ...`.** Some libraries split their version macros
+into a header their main header doesn't itself include — Z3 is exactly this
+case: `z3.h` never includes `z3_version.h`, so `Z3_MAJOR_VERSION` et al. are
+never in scope by the time the synthesized gate runs, and the
+`#ifndef`/`#error` guard above fires with no fix available from inside the
+`{.until.}`-carrying proc's own `{.header.}`. `header = "z3_version.h"` adds
+that header to the block's own `#include` list — no hand-rolled bridge
+header, no extra `-I` flag. You do *not* need it for an umbrella header that
+pulls its own version macro in transitively — mbedtls's
+`MBEDTLS_VERSION_NUMBER`, for instance, is defined by `mbedtls/version.h`,
+which `mbedtls/ssl.h` already includes, so any proc's ordinary `{.header:
+"mbedtls/ssl.h".}` already puts the macro in scope. When in doubt, omit
+`header = ...` first: if the macro really is already in scope, the
+`#ifndef`/`#error` guard above stays silent and nothing else needs to
+change; if it isn't, the guard's own error message names exactly which
+macro is missing, and that name is what to point `header = ...` at.
 
 ### What synthesis emits
 

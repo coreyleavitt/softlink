@@ -196,6 +196,26 @@ type
     present*: bool
     macroNames*: seq[string]  ## most-significant-first, e.g.
                                ## @["Z3_MAJOR_VERSION", "Z3_MINOR_VERSION"]
+    headerName*: string  ## RFC-0002 §5/§6 Z3 extension: the optional
+      ## `header = "..."` named argument's value, in the SAME quoted/
+      ## angle-bracket convention as a proc's own `{.header.}`
+      ## (`softlink/verify.toIncludeDirective`); "" (the zero value) means
+      ## absent — every downstream emission check tests this directly
+      ## rather than a separate presence flag, mirroring `noVerifyReason`'s
+      ## own "" = absent convention on `SoftlinkProc`. Exists because
+      ## `versionMacros`'s synthesized `#if`/`#ifndef` gate assumes ONE of
+      ## this block's procs' `{.header.}`s transitively #includes whatever
+      ## header actually DEFINES the named macro(s) — true for mbedtls-
+      ## style umbrella headers, but false for Z3: `z3.h` does not include
+      ## `z3_version.h`, so `Z3_MAJOR_VERSION`/`Z3_MINOR_VERSION` are never
+      ## in scope by the time the synthesized gate evaluates, and the
+      ## `#ifndef`/`#error` visibility guard (`emitVersionMacroGuards`)
+      ## fires with no in-directive fix. `header = "z3_version.h"` names
+      ## the header that actually defines them; `genVerifyBlock` adds it to
+      ## the block's own `#include` list (see its doc comment) so the
+      ## macros are in scope before the synthesized `#if` (and the guard)
+      ## ever run — without requiring a hand-rolled bridge header or an
+      ## extra `-I` flag from the binding author.
     node*: NimNode             ## the directive call node, for diagnostic anchoring
 
 func isValidCIdentifier(s: string): bool =
@@ -220,20 +240,55 @@ func isVersionMacrosCall*(stmt: NimNode): bool =
     stmt[0].kind == nnkIdent and $stmt[0] == "versionMacros"
 
 proc parseVersionMacrosDirective*(stmt: NimNode, macroName: string): VersionMacrosDirective =
-  ## RFC-0002 §5/§6, slice E1: parse one recognized `versionMacros`
-  ## directive statement's argument shape — one or more string-literal
-  ## arguments, each a valid C identifier, most-significant macro first
-  ## (e.g. `versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION")`). A
-  ## non-string-literal argument, an argument that isn't a valid C
-  ## identifier, or a call with zero arguments is a directive-specific
-  ## macro error here, never the generic body-shape error `dynlib`/
-  ## `verifyProcs` raise for an unrecognized statement.
+  ## RFC-0002 §5/§6, slice E1 (extended for the Z3 `header =` case): parse
+  ## one recognized `versionMacros` directive statement's argument shape —
+  ## one or more positional string-literal arguments, each a valid C
+  ## identifier, most-significant macro first (e.g.
+  ## `versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION")`), plus an
+  ## OPTIONAL `header = "..."` named argument accepted at any position
+  ## among them (conventionally last) — see `VersionMacrosDirective.
+  ## headerName`'s doc comment for why it exists. A non-string-literal
+  ## positional argument, an argument that isn't a valid C identifier, a
+  ## call with zero macro names, an unsupported named argument (anything
+  ## but `header`), a non-string-literal or empty `header` value, or a
+  ## second `header = ...` in the same call is a directive-specific macro
+  ## error here, never the generic body-shape error `dynlib`/`verifyProcs`
+  ## raise for an unrecognized statement.
   result.present = true
   result.node = stmt
   var names: seq[string] = @[]
+  var headerSet = false
   for i in 1 ..< stmt.len:
     let arg = stmt[i]
-    if arg.kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+    if arg.kind == nnkExprEqExpr:
+      # A named argument (`name = value`) — `header` is the only one
+      # `versionMacros` supports (mirrors `compatManifest`'s `refuse =`
+      # handling above: a wrong name is an error naming the one supported
+      # key, not a silent no-op or a generic-shape complaint).
+      if arg.len == 2 and arg[0].kind == nnkIdent and $arg[0] == "header":
+        if headerSet:
+          error(macroName & ": versionMacros's 'header' argument was given " &
+                "more than once — specify it at most once per " &
+                "versionMacros(...) call", arg)
+        headerSet = true
+        if arg[1].kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+          error(macroName & ": versionMacros's 'header' argument must be a " &
+                "string literal naming a C header, e.g. header = " &
+                "\"z3_version.h\" (or header = \"<z3_version.h>\" for an " &
+                "angle-bracket #include)", arg[1])
+        elif arg[1].strVal.strip().len == 0:
+          error(macroName & ": versionMacros's 'header' argument must be " &
+                "non-empty", arg[1])
+        else:
+          result.headerName = arg[1].strVal
+      else:
+        let gotName = if arg.len >= 1 and arg[0].kind == nnkIdent: $arg[0]
+                      else: "?"
+        error(macroName & ": versionMacros's only supported named argument " &
+              "is 'header' (got '" & gotName & "') — e.g. " &
+              "versionMacros(\"FOO_MAJOR_VERSION\", header = " &
+              "\"foo_version.h\")", arg)
+    elif arg.kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
       error(macroName & ": versionMacros arguments must be string literals " &
             "naming C preprocessor macros, e.g. " &
             "versionMacros(\"FOO_MAJOR_VERSION\", \"FOO_MINOR_VERSION\")", arg)

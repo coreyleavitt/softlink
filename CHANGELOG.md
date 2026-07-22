@@ -2,6 +2,28 @@
 
 All notable changes to softlink are documented here.
 
+## [Unreleased]
+
+### Added
+
+- `versionMacros(...)` now accepts an optional `header = "..."` named
+  argument (e.g. `versionMacros("Z3_MAJOR_VERSION", "Z3_MINOR_VERSION",
+  header = "z3_version.h")`), same quoted/angle-bracket convention as a
+  proc's own `{.header.}`. `versionMacros`'s synthesized gate assumes some
+  proc's `{.header.}` transitively `#include`s whatever header actually
+  defines the named macros — true for mbedtls-style umbrella headers, but
+  false for Z3: `z3.h` does not include `z3_version.h`, so the synthesized
+  gate's `#ifndef`/`#error` visibility guard fired with no in-directive fix
+  (previously requiring a hand-rolled bridge header + an extra `-I` flag).
+  `header = "..."` names the header that actually defines the macros;
+  softlink adds it to the block's own verify-TU `#include` list, alongside
+  the block's procs' own headers, guaranteeing the macros are in scope
+  before the synthesized `#if` (and the `#ifndef`/`#error` guard) evaluate.
+  Rejects an unsupported named argument (only `header` is accepted), a
+  non-string-literal or empty `header` value, and a duplicate `header = ...`
+  within one call. Backward compatible: omitting `header = ...` reproduces
+  v0.9.0 behavior byte-for-byte.
+
 ## [0.9.0] - 2026-07-22
 
 ### Added

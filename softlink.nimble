@@ -1302,6 +1302,61 @@ task test, "Run tests":
       "this block's included headers")
     if dirExists(undefinedMacroCppDir): rmDir(undefinedMacroCppDir)
 
+    # RFC-0002 §5/§6 Z3 extension: `versionMacros(..., header = "...")` —
+    # the Z3 case itself. `tests/testlib_bare.h` (this fixture's proc
+    # header) deliberately does NOT define or include TESTLIB_VERSION,
+    # mirroring z3.h not including z3_version.h; `tests/
+    # testlib_gates_version.h` (the named header) defines it independently.
+    # Same dual-compile, distinct-nimcache-per-invocation proof as
+    # `tests/tverify_synthesized_gate.nim` above: the synthesized gate
+    # opens (TESTLIB_VERSION=1: the real `int *`-param declaration
+    # genuinely type-checks — hand-verified RED evidence: temporarily
+    # widening the fixture's param to `ptr cdouble` fails this exact
+    # invocation with a real "expected 'int *' but argument is of type
+    # 'double *'" gcc error) and closes (TESTLIB_VERSION=2: the declaration
+    # is absent, compiles clean) against real headers — but ONLY because
+    # `header = "tests/testlib_gates_version.h"` puts TESTLIB_VERSION in
+    # scope at all; see `tests/tfail_versionmacros_header_missing.nim`
+    # immediately below for the control proving that without it, the same
+    # shape fails the `#ifndef`/`#error` visibility guard instead.
+    const synthGateHeaderDir1 = "tests/nimcache_synth_gate_header_v1"
+    const synthGateHeaderDir2 = "tests/nimcache_synth_gate_header_v2"
+    const synthGateHeaderExe = "tests/tverify_synthesized_gate_header"
+    runDualNimcacheCompile(synthGateHeaderDir1, synthGateHeaderDir2,
+      " --path:src --passC:-I. ", "--passC:-DTESTLIB_VERSION=2 ",
+      "tests/tverify_synthesized_gate_header.nim", synthGateHeaderExe)
+
+    # The negative control: same proc/header shape, no `header =` at all —
+    # tests/testlib_bare.h alone never puts TESTLIB_VERSION in scope, so
+    # the `#ifndef`/`#error` guard must fire for real, exactly like
+    # `tests/tfail_versionmacros_undefined_macro.nim` above (real C
+    # `#error`, not a Nim macro-time error, hence no `--compileOnly`).
+    const headerMissingDir = "tests/nimcache_versionmacros_header_missing"
+    if dirExists(headerMissingDir): rmDir(headerMissingDir)
+    expectDiag("nim c --nimcache:" & headerMissingDir &
+      " --path:src --passC:-I. tests/tfail_versionmacros_header_missing.nim",
+      "versionMacros(header=) negative control: guard fires without it",
+      "versionMacros identifier 'TESTLIB_VERSION' is not defined by this " &
+      "block's included headers")
+    if dirExists(headerMissingDir): rmDir(headerMissingDir)
+
+    # The angle-bracket form: `header = "<...>"` must emit `#include <...>`,
+    # not `#include "..."` — proven by inspecting the generated C directly
+    # (`expectInGenC`, the same technique the {.prototype.} A2/A6/A8 checks
+    # below use), rather than a real compile: `--compileOnly` never invokes
+    # the C compiler, so the angle-bracket path need not actually resolve
+    # via `-I` for this assertion (the quoted-vs-angle #include TEXT is all
+    # that's under test here; real resolution is already exercised by every
+    # OTHER `-passC:-I.`-driven check in this file, which happens to use
+    # the quoted form throughout).
+    const headerAngleDir = "tests/nimcache_versionmacros_header_angle"
+    if dirExists(headerAngleDir): rmDir(headerAngleDir)
+    exec "nim c --compileOnly --nimcache:" & headerAngleDir &
+      " --path:src tests/tcheck_versionmacros_header_angle.nim"
+    expectInGenC(headerAngleDir, "#include <tests/testlib_gates_version.h>",
+      "versionMacros(header = \"<...>\") emits an angle-bracket #include")
+    rmDir(headerAngleDir)
+
   # RFC-0001 §B.5/§B.5a, slice B6a: the `compatManifest` body directive —
   # grammar, erroring stub, path resolution, and every compile-time
   # consumption check (schema, lib identity, ABI, disjoint/exhaustive,
@@ -1413,6 +1468,27 @@ task test, "Run tests":
 
     expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_duplicate.nim",
       ["duplicate versionMacros directive"])
+
+    # RFC-0002 §5/§6 Z3 extension: `versionMacros(..., header = "...")`'s
+    # optional named argument — parse-level rejections only (macro-time
+    # `error()`s, so `--compileOnly` is sufficient, same as the two checks
+    # directly above). The feature's actual EFFECT (the named header
+    # joining the verify TU's #include list, both quoted and angle-bracket)
+    # is proven by `runVersionMacrosGateChecks` below — a real C compile is
+    # needed there to observe the synthesized gate genuinely opening/
+    # closing against the now-visible macro, which `--compileOnly` alone
+    # cannot show.
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_header_unknown_arg.nim",
+      ["only supported named argument is 'header'"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_header_not_string.nim",
+      ["'header' argument must be a string literal"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_header_empty.nim",
+      ["'header' argument must be non-empty"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_header_duplicate.nim",
+      ["'header' argument was given more than once"])
 
     # RFC-0002 §5/§6, slice E2: gate-synthesis bound validation — both are
     # NIM macro-time errors (`error()`-raised inside `synthesizeVersionGates`
@@ -1980,6 +2056,19 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
     "--passC:/DTESTLIB_VERSION=2 ", "tests/tverify_synthesized_gate.nim",
     "tests/tverify_synthesized_gate.exe")
 
+  # RFC-0002 §5/§6 Z3 extension: the vcc-leg sibling of the dual-compile
+  # just above, for `versionMacros(..., header = "...")`'s own synthesized-
+  # gate fixture (`tests/tverify_synthesized_gate_header.nim`,
+  # `task test`'s own `runVersionMacrosGateChecks` exercises the C++/GCC
+  # tiers) — same MSVC-leg-only third-tier coverage rationale, same
+  # distinct-per-invocation --nimcache isolation, matching the E2 precedent
+  # immediately above exactly.
+  const vccSynthGateHeaderDir1 = "tests/nimcache_synth_gate_header_vcc_v1"
+  const vccSynthGateHeaderDir2 = "tests/nimcache_synth_gate_header_vcc_v2"
+  runDualNimcacheCompile(vccSynthGateHeaderDir1, vccSynthGateHeaderDir2, vccFlags,
+    "--passC:/DTESTLIB_VERSION=2 ", "tests/tverify_synthesized_gate_header.nim",
+    "tests/tverify_synthesized_gate_header.exe")
+
   # Code review CR1-8, cell 3: the vcc-leg sibling of `task test`'s own
   # `runVersionMacrosGateChecks` undefined-macro `#ifndef`/`#error` guard
   # check (GCC and, as of this same finding, C++ tiers) —
@@ -1992,3 +2081,10 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
   # above, this is pattern-only (exit-code only), no needle.
   expectCompileFailure("nim c" & vccFlags &
     "tests/tfail_versionmacros_undefined_macro.nim")
+
+  # RFC-0002 §5/§6 Z3 extension: the vcc-leg sibling of the same guard
+  # check, for the `header =` feature's own negative control
+  # (`tests/tfail_versionmacros_header_missing.nim`) — same pattern-only
+  # (exit-code-only) rationale as immediately above.
+  expectCompileFailure("nim c" & vccFlags &
+    "tests/tfail_versionmacros_header_missing.nim")
