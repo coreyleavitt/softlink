@@ -394,3 +394,27 @@ func isCorpusTrackable*(noVerify: bool, hasHeader: bool): bool =
   ## `softlink/manifest`'s `export versions`), so the predicate cannot drift
   ## apart independently ever again.
   not noVerify and hasHeader
+
+const softlinkVersion* = "0.10.0"
+  ## RFC-0003 SS2/SS7 slice C1: the CORE `softlink` package's own
+  ## version-of-record -- `HarvestMeta.harvesterVersion`'s (tools/harvest/
+  ## harvester.nim) source of truth, stamping which softlink release
+  ## performed a given harvest. Hand-bumped in lockstep with
+  ## softlink.nimble's own `version` field; `softlink.nimble`'s `task test`
+  ## runs a nimble-layer check (`checkVersionOfRecordPin`) comparing this
+  ## constant against nimble's own `version` global so the two can never
+  ## silently drift apart.
+  ##
+  ## Deliberately NOT the harvest CLI's own `NimblePkgVersion`:
+  ## `tools/harvest/softlink_harvest.nimble` is versioned independently
+  ## (0.1.x, `requires softlink >= 0.7.0` -- a floor, not a pin), so
+  ## `NimblePkgVersion` there would stamp the harvest CLI package's own
+  ## release lineage, not the core package's -- the wrong provenance for a
+  ## field whose whole point is "which softlink fixed Gap A/Gap B".
+  ##
+  ## Lives here, in `softlink/versions`, rather than a new module: this is
+  ## the one core-package module BOTH `tools/harvest/harvester.nim`
+  ## (`import softlink/versions`) and `softlink.nimble` itself
+  ## (`import "src/softlink/versions"`, this repo's nimble file header)
+  ## already import -- so the version-of-record const reaches both the
+  ## harvester and the nimble-layer pin check with no new import anywhere.

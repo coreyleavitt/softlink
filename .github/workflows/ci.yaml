@@ -110,6 +110,11 @@ jobs:
       # this step used to build by hand and additionally runs both backends
       # plus every negative-compile/hint check. Not run for MSVC (matrix.cc
       # == 'vcc'): the nimble task's windows branch is gcc-only (see above).
+      #
+      # RFC-0003 slice B2c: this is also how the macOS leg (matrix.cc ==
+      # 'clang') reaches the harvester check now -- softlink.nimble's `task
+      # test` macosx branch calls `runHarvesterCheck(clangLeg = true)`
+      # itself, so no separate step is needed here for that leg.
       - name: Run tests (nimble test)
         if: matrix.cc != 'vcc'
         shell: bash

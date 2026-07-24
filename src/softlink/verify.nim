@@ -22,6 +22,23 @@ func toIncludeDirective*(header: string): string =
   else:
     "#include \"" & header & "\"\n"
 
+func wrapGate(gate: string, body: string, label: string = "verifyWhen"): string =
+  ## RFC-0003 §4.1: collapses a hand-inlined `#if (gate) ... #endif`
+  ## open/close pair around `body` into a single call, so a partial future
+  ## edit can never desync an opener from its `#endif` — the shape
+  ## `emitPrototypeDecl` (just below) already used, correctly, before this
+  ## helper existed. `gate == ""` (no gate, e.g. ground truth defeated it
+  ## via `effectiveVerifyWhen`) returns `body` unchanged — byte-identical
+  ## to the ungated emission. `label` distinguishes the vendored-prototype
+  ## decl's own marker ("verifyWhen: prototype decl") from the generic
+  ## "verifyWhen" marker every other wrap site uses; the closing `#endif`
+  ## marker is always the plain "verifyWhen" text (matches the pre-existing
+  ## asymmetry `softlink.nimble`'s grep-pinned anchors already encode).
+  if gate.len == 0: body
+  else:
+    "#if (" & gate & ") /* softlink " & label & " */\n" & body &
+      "#endif /* softlink verifyWhen */\n"
+
 func emitPrototypeDecl(prototype: string, verifyWhen: string): string =
   ## Render RFC-0001 §3 A.1's vendored-prototype file-scope `extern`
   ## declaration for one proc's `{.prototype: "<C prototype>".}`. Emitted
@@ -42,13 +59,10 @@ func emitPrototypeDecl(prototype: string, verifyWhen: string): string =
   ## by the same `#if (EXPR)` as its assert (A.1: "composes... both the
   ## emitted declaration and its assert are gated by the #if") — needed
   ## when the vendored prototype references types absent from old headers.
-  var decl = "#if defined(__cplusplus)\nextern \"C\" {\n#endif\n" &
+  let decl = "#if defined(__cplusplus)\nextern \"C\" {\n#endif\n" &
     "extern " & prototype & ";\n" &
     "#if defined(__cplusplus)\n}\n#endif\n"
-  if verifyWhen.len > 0:
-    decl = "#if (" & verifyWhen & ") /* softlink verifyWhen: prototype decl */\n" &
-      decl & "#endif /* softlink verifyWhen */\n"
-  decl
+  wrapGate(verifyWhen, decl, "verifyWhen: prototype decl")
 
 func emitVersionMacroGuards(macros: openArray[string]): string =
   ## RFC-0002 §4.5/§5/§6, slice E2 — the ONE `verify.nim` touch §2 promises:
@@ -146,6 +160,40 @@ const softlinkProbeExistence {.booldefine.} = false
   ## meaningless (the fast path's bisection only ever runs multi-symbol
   ## compiles in verify mode).
 
+const softlinkProbeGroundTruth {.booldefine.} = false
+  ## RFC-0003 §4.1 — the ground-truth harvest semantic. Under
+  ## `-d:softlinkProbeGroundTruth`, probe-mode emission defeats EVERY
+  ## compatibility gate a proc's verification apparatus carries — hand-
+  ## written `{.verifyWhen.}` AND synthesized `{.since/until.}` gates alike
+  ## (§4.2: distinguishing a hand version-gate from a hand feature-gate is
+  ## not mechanically possible, and a feature-gated symbol's corpus story is
+  ## a baseline-configuration concern, not a pragma gap) — via ONE
+  ## derivation point, `effectiveVerifyWhen` below, not per-site checks.
+  ## `{.prototype.}` declarations are affected too: their own `{.verifyWhen.}`
+  ## wrap (`emitPrototypeDecl`) routes through the SAME derivation, and the
+  ## PROBED symbol's own vendored decl is additionally suppressed outright
+  ## in the verify sub-mode (§5.2 iv — see `isProbedTarget` below), because
+  ## ground truth means "checked against the header alone."
+  ##
+  ## This is harvest-only machinery, never a supported build flag: see the
+  ## misuse rule in `genVerifyBlock` below (requires
+  ## `-d:softlinkHarvestSession`, else a macro error) and the four-define
+  ## truth table above `genVerifyBlock`.
+
+const softlinkHarvestSession {.booldefine.} = false
+  ## RFC-0003 §4.1 — the misuse-guard's missing signal. The fast-path
+  ## whole-module compile sets `softlinkProbeGroundTruth` with NO
+  ## `softlinkProbeOnly` at all, which makes that legitimate configuration
+  ## macro-indistinguishable from a stray hand-set `-d:softlinkProbeGroundTruth`
+  ## — `softlinkProbeOnly`'s presence/absence can't be the discriminator.
+  ## softlink's own harvester sets `-d:softlinkHarvestSession` on EVERY
+  ## compile it issues (baseline, existence, verify, bisection group,
+  ## fast-path whole-module, calibration), so its presence is the reliable
+  ## "this compile came from softlink's own harvester" signal the misuse
+  ## rule needs. Alone (groundTruth false) this define is legal but INERT —
+  ## it changes no emission by itself; see the truth table above
+  ## `genVerifyBlock`.
+
 proc parseProbeOnlyList(raw: string, posNode: NimNode): seq[string] =
   ## RFC-0001 §4 B.2, slice B7: parses a non-empty, non-`"-"`
   ## `softlinkProbeOnly` value into its list of target C names. Callers
@@ -181,6 +229,70 @@ proc parseProbeOnlyList(raw: string, posNode: NimNode): seq[string] =
         "compile-time error rather than a silent partial match.", posNode)
   parts
 
+template effectiveVerifyWhen(p: SoftlinkProc): string =
+  ## RFC-0003 §4.1's single derivation point: every gate-wrap site below
+  ## reads a proc's EFFECTIVE `verifyWhen` through this template, never
+  ## `p.verifyWhen` directly — under ground truth, every gate (hand-written
+  ## AND synthesized alike) is defeated, uniformly, in one place. A future
+  ## gate-wrapped emission site inherits ground-truth-defeat for free by
+  ## using this template instead of inventing its own check.
+  (if softlinkProbeGroundTruth: "" else: p.verifyWhen)
+
+proc wrapGate(gate: string, bodyArr: NimNode): NimNode =
+  ## NimNode-array counterpart of the `wrapGate` above, for the existence-
+  ## probe and assert-chain wrap sites: their wrapped content interleaves
+  ## string literals with real AST nodes (dummy call-argument idents, type
+  ## nodes via `addTypeToEmit`) that can't be flattened into a single
+  ## string the way `emitPrototypeDecl`'s can. Takes the ALREADY-BUILT
+  ## `nnkBracket` array of tiered content (`bodyArr`, populated by ordinary
+  ## imperative code at the call site — deliberately NOT a closure: an
+  ## earlier draft captured the call site's per-proc locals
+  ## (`dummyVars`/`emitArray`) in a `proc()` callback, and Nim's closure
+  ## conversion hoists a captured `var` declared inside a `for` loop to a
+  ## single shared environment slot whose OWN declaration/reset only runs
+  ## once — the second and later loop iterations silently kept appending to
+  ## the FIRST iteration's sequence instead of starting fresh, corrupting
+  ## multi-proc blocks (hand-caught via `tests/tverify_gated_drift.nim`'s
+  ## second block, RED evidence: `testlib_drifted`'s assert called with
+  ## `testlib_add`'s two dummy vars ahead of its own). Splicing pre-built
+  ## NimNode arrays has no captured mutable state, so this class of bug is
+  ## structurally impossible here) and splices the gate's open/close marker
+  ## text around its children into a NEW array — reproducing the EXACT
+  ## open/close marker text these two sites already emitted before this
+  ## helper existed (no leading/trailing-newline change — see
+  ## `softlink.nimble`'s `poExistGatedGated` exact-substring pin, which
+  ## depends on the open marker NOT ending in its own newline: the wrapped
+  ## body supplies that separator itself). `gate == ""` returns `bodyArr`
+  ## itself, unchanged — byte-identical to the ungated emission. One call
+  ## now produces both the opener and its matching `#endif` — they can
+  ## never desync because there's only one call site to edit.
+  if gate.len == 0:
+    return bodyArr
+  result = newNimNode(nnkBracket)
+  result.add(newStrLitNode("\n#if (" & gate & ") /* softlink verifyWhen */"))
+  for child in bodyArr:
+    result.add(child)
+  result.add(newStrLitNode("#endif /* softlink verifyWhen */\n"))
+
+# RFC-0003 §4.1 — four probe-mode defines and their legal/illegal
+# combinations, reconstructable only from RFC-0001 §4 B.2 and RFC-0003 §4.1
+# prose without this table:
+#
+# | softlinkProbeOnly | ProbeExistence | ProbeGroundTruth | HarvestSession | legal? | what happens |
+# |---|---|---|---|---|---|
+# | unset/"" | false | false | false | yes | ordinary user compile — every probe-mode check below is unreachable/false |
+# | any | any | false | any | yes | RFC-0001 standard-path probing with gates evaluated normally (dev/test probing, or a pre-ground-truth-fix harvest compile) |
+# | any | any | true | false | **NO — macro error** | ground truth defeats every gate/prototype/guard to measure header truth; only softlink's own harvester may set it (misuse rule below) |
+# | unset/"" | false | true | true | yes | fast-path whole-module compile under ground truth (RFC-0003 §4.3) — no `softlinkProbeOnly` at all |
+# | <name(s)> | false/true | true | true | yes | standard-path probe(s)/bisection group under ground truth (RFC-0003 §4.2, §5.2 iv) |
+#
+# `softlinkHarvestSession` alone (`softlinkProbeGroundTruth` false) is a
+# legal but INERT state — it changes no emission by itself; it exists
+# purely as the misuse guard's signal for the illegal row above. The four
+# defines are NOT collapsible into one mode enum: `softlinkProbeGroundTruth`
+# must be settable on the fast path's define-free whole-module compile,
+# which carries no `softlinkProbeOnly` at all, so gate-defeat is a
+# genuinely independent bit from probeOnly/existence.
 proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
                      hasManifestAttached: bool = false,
                      versionMacrosHeader: string = ""): seq[NimNode] =
@@ -248,6 +360,26 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
       "symbol. Got softlinkProbeOnly=" & gotDesc & ". Pass the exact C " &
       "name of the symbol being probed, e.g. -d:softlinkProbeOnly=" &
       procs[0].nameStr & "."
+    error(msg, allProcs[0].name)
+
+  # RFC-0003 §4.1 misuse rule: `softlinkProbeGroundTruth` set without
+  # `softlinkHarvestSession` is a loud macro-expansion-time error, never a
+  # silent probe — the fast-path whole-module compile (ground truth set, no
+  # `softlinkProbeOnly` at all) would otherwise be macro-indistinguishable
+  # from a stray hand-set define, which is exactly why `softlinkHarvestSession`
+  # exists as this rule's own signal (see its doc comment above).
+  if softlinkProbeGroundTruth and not softlinkHarvestSession:
+    let msg = "softlink: -d:softlinkProbeGroundTruth requires " &
+      "-d:softlinkHarvestSession in block '" & tag & "' — this define " &
+      "exists only for softlink's own harvester: it defeats every " &
+      "since/until/verifyWhen gate and vendored {.prototype.} declaration " &
+      "in this block so the harvester can measure header ground truth, " &
+      "independent of the compatibility scaffolding ordinary compiles " &
+      "rely on. If you are running 'softlink harvest', this is a " &
+      "harvester bug, please file an issue. If you set " &
+      "-d:softlinkProbeGroundTruth by hand, remove it — it is not a " &
+      "supported build flag, and ordinary compiles need their gates " &
+      "evaluated to work across library versions."
     error(msg, allProcs[0].name)
 
   # RFC-0001 §4 B.2, slice B7: `probeOnlyList` is the parsed form of
@@ -342,6 +474,18 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     probeOnlyActive and softlinkProbeExistence and probeOnlyList.len == 1 and
       p.nameStr == probeOnlyList[0]
 
+  template isProbedTarget(p: SoftlinkProc): bool =
+    ## RFC-0003 §5.2(iv): true when this proc is (one of) the probed
+    ## symbol(s) THIS compile is targeting — i.e. its verification apparatus
+    ## is NOT suppressed. Equivalent to `probeOnlyActive and not
+    ## isSuppressed(p)`; factored out because ground truth's verify-sub-mode
+    ## prototype-decl suppression needs exactly this predicate (broader than
+    ## `isProbedExistence`, which additionally requires existence mode) —
+    ## under ground truth, a header+prototype proc's verify TU must check
+    ## the header ALONE, so the probed symbol's own vendored decl is
+    ## suppressed regardless of whether existence or verify mode is active.
+    probeOnlyActive and not isSuppressed(p)
+
   var nodes: seq[NimNode] = @[]
   # Compile-time header verification. Compares each symbol's type from
   # the C header against Nim's generated function pointer type.
@@ -352,7 +496,19 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
   # No linking required — pure compile-time check.
   block:
     var headers: HashSet[string]
-    var includeCode = ""
+    # RFC-0003 §7 A1: unique, tag-scoped start anchor for the NEW
+    # byte-identical golden-snapshot check (`tests/tgolden_verify_apparatus.nim`
+    # + `runGoldenVerifyApparatusCheck` in `softlink.nimble`) — a pure C
+    # comment, zero functional effect, present unconditionally (like every
+    # other line `includeCode` accumulates) so the check can extract exactly
+    # this block's emitted include-section scaffolding via a plain
+    # substring search over `slurpGenSources`'s output, with no dependence
+    # on Nim's own codegen layout. Placed as the ABSOLUTE FIRST thing added
+    # to `includeCode`, and the END anchor below as the ABSOLUTE LAST —
+    # nothing is ever inserted BETWEEN two previously-adjacent pieces of
+    # content, so no existing `expectAnchor`/`expectAdjacentPair` check
+    # elsewhere in this suite is affected.
+    var includeCode = "/* SOFTLINK_VERIFY_APPARATUS_INCLUDES_BEGIN:" & tag & " */\n"
     for p in procs:
       # `procs` now includes prototype-only entries (no {.header.}) per
       # RFC-0001 §3 A.1 slice A2 — the empty-headerFile guard here is load-
@@ -385,10 +541,18 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     # would fail the whole TU and poison the probe of the TARGET symbol. The
     # probed symbol's OWN decl is also omitted under existence mode — see
     # `isProbedExistence`'s doc comment for why that's load-bearing, not
-    # merely symmetric.
+    # merely symmetric. RFC-0003 §5.2(iv): under ground truth, the probed
+    # symbol's OWN decl is ALSO omitted in the (non-existence) verify
+    # sub-mode — a stale-but-benign vendored decl at a corpus version must
+    # never kill the TU for scaffolding-freshness reasons when §2's
+    # definition demands `fkVerified` from the header alone; opportunistic
+    # prototype↔header cross-checking remains a user-compile-only feature
+    # (no `softlinkProbeGroundTruth`, no suppression here).
     for p in procs:
-      if p.prototype.len > 0 and not isSuppressed(p) and not isProbedExistence(p):
-        includeCode.add(emitPrototypeDecl(p.prototype, p.verifyWhen))
+      if p.prototype.len > 0 and not isSuppressed(p) and
+         not isProbedExistence(p) and
+         not (softlinkProbeGroundTruth and isProbedTarget(p)):
+        includeCode.add(emitPrototypeDecl(p.prototype, effectiveVerifyWhen(p)))
 
     # RFC-0002 §4.5/§5/§6, slice E2: the macro-visibility guards for every
     # SYNTHESIZED gate in this block — deduplicated (several procs can
@@ -400,16 +564,34 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     # `#include`s themselves: the guard is a property of THIS compile's
     # header set, independent of which symbol probe mode happens to be
     # targeting this run.
-    block:
-      var seenMacros: HashSet[string]
-      var orderedMacros: seq[string]
-      for p in procs:
-        for m in p.synthesizedGateMacros:
-          if m notin seenMacros:
-            seenMacros.incl(m)
-            orderedMacros.add(m)
-      if orderedMacros.len > 0:
-        includeCode.add(emitVersionMacroGuards(orderedMacros))
+    #
+    # RFC-0003 §4.1: skipped ENTIRELY under ground truth — a probe TU
+    # evaluates no gate there (`effectiveVerifyWhen` always returns ""), so
+    # an undefined macro can't corrupt classification; user compiles (where
+    # the gate IS evaluated) keep the guard's full authoring/corpus-
+    # integrity role unchanged. A corpus version whose headers predate a
+    # `versionMacros(header=...)` include still fails the baseline probe
+    # (the #include itself is unconditional) — every symbol `fkUnknown` at
+    # that version, the correct pre-existing behavior, unaffected by this
+    # skip.
+    if not softlinkProbeGroundTruth:
+      block:
+        var seenMacros: HashSet[string]
+        var orderedMacros: seq[string]
+        for p in procs:
+          for m in p.synthesizedGateMacros:
+            if m notin seenMacros:
+              seenMacros.incl(m)
+              orderedMacros.add(m)
+        if orderedMacros.len > 0:
+          includeCode.add(emitVersionMacroGuards(orderedMacros))
+
+    # RFC-0003 §7 A1: matching end anchor — see the begin anchor's own doc
+    # comment above. Added LAST, after macro-visibility guards, before the
+    # type_traits trailer below (which is shared boilerplate, not part of
+    # THIS block's own scaffolding, so it's deliberately left outside the
+    # anchored span).
+    includeCode.add("/* SOFTLINK_VERIFY_APPARATUS_INCLUDES_END:" & tag & " */\n")
 
     # Emit #include directives + C++ type_traits if needed
     nodes.add(newNimNode(nnkPragma).add(
@@ -437,6 +619,19 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     # compilation time (during gcc -c), before LTO runs at link time —
     # the assertions cannot be eliminated by link-time optimization.
     var verifyBody = newStmtList()
+    # RFC-0003 §7 A1: unique, tag-scoped start anchor for the golden-snapshot
+    # check — see the matching includes-section anchor above for the full
+    # rationale. Added as the ABSOLUTE FIRST statement of the verify proc's
+    # body (before any per-proc content) and the END anchor below as the
+    # ABSOLUTE LAST (after the per-proc loop) — this is a proc-BODY emit
+    # statement, so it appears in-place in the generated C exactly where
+    # written, in statement order (the same guarantee the surrounding code's
+    # own "assertions appear after function pointer var declarations"
+    # comment already relies on).
+    verifyBody.add(newNimNode(nnkPragma).add(newNimNode(nnkExprColonExpr).add(
+      ident("emit"),
+      newStrLitNode("/* SOFTLINK_VERIFY_APPARATUS_BODY_BEGIN:" & tag & " */\n")
+    )))
     for p in procs:
       # RFC-0001 §4 B.2: a suppressed proc gets NO verification apparatus at
       # all this compile — not even the dummy param vars, which exist only
@@ -454,11 +649,8 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         # `sizeof(decltype(&sym))` (the C++ tier) fit exactly: they name the
         # symbol (so an undeclared symbol is a hard compile error) but
         # `sizeof` never evaluates its operand, so any real signature works.
-        var existArray = newNimNode(nnkBracket)
-        if p.verifyWhen.len > 0:
-          existArray.add(newStrLitNode(
-            "\n#if (" & p.verifyWhen & ") /* softlink verifyWhen */"))
-        existArray.add(newStrLitNode(
+        var existBody = newNimNode(nnkBracket)
+        existBody.add(newStrLitNode(
           "\n#if defined(__cplusplus)\n(void)sizeof(decltype(&" &
           p.nameStr & "));\n" &
           "#elif defined(__GNUC__)\n(void)sizeof(__typeof__(&" &
@@ -466,16 +658,19 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
           "#elif defined(_MSC_VER) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n" &
           "(void)sizeof(__typeof__(&" & p.nameStr & "));\n"))
         when defined(softlinkStrictVerify):
-          existArray.add(newStrLitNode(
+          existBody.add(newStrLitNode(
             "#else\n#error \"softlink: existence probe unavailable here " &
             "(need C++, GCC/Clang, or MSVC /std:clatest); remove " &
             "-d:softlinkStrictVerify to skip\"\n#endif\n"))
         else:
-          existArray.add(newStrLitNode(
+          existBody.add(newStrLitNode(
             "#else\n/* softlink: existence probe skipped — unsupported " &
             "compiler/mode */\n#endif\n"))
-        if p.verifyWhen.len > 0:
-          existArray.add(newStrLitNode("#endif /* softlink verifyWhen */\n"))
+        # RFC-0003 §4.1: `effectiveVerifyWhen`, not `p.verifyWhen` — ground
+        # truth defeats this gate too, so the existence reference becomes
+        # unconditional. `wrapGate` collapses the open/close pair into one
+        # call (see its own doc comment for why this matters).
+        let existArray = wrapGate(effectiveVerifyWhen(p), existBody)
         verifyBody.add(newNimNode(nnkPragma).add(
           newNimNode(nnkExprColonExpr).add(ident("emit"), existArray)
         ))
@@ -527,37 +722,8 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         else:
           emitArr.add(typeNode.copy())
 
-      var emitArray = newNimNode(nnkBracket)
+      var assertBody = newNimNode(nnkBracket)
 
-      # {.verifyWhen: "EXPR".}: gate this proc's entire verification (all
-      # three compiler tiers AND the strict-mode #error fallback) on a C
-      # preprocessor expression — verify on systems whose headers are new
-      # enough, compile cleanly on older ones. When the condition is false,
-      # skipping is legitimate, so strict mode must not fire either.
-      if p.verifyWhen.len > 0:
-        emitArray.add(newStrLitNode(
-          "\n#if (" & p.verifyWhen & ") /* softlink verifyWhen */"))
-
-      # --- C++ path: static_assert + strip_ptr_const + decltype ---
-      # strip_ptr_const removes const from pointed-to types in return values
-      emitArray.add(newStrLitNode(
-        "\n#if defined(__cplusplus)\nstatic_assert(\n  std::is_same<\n" &
-        "    typename softlink_strip_ptr_const<decltype("))
-      buildCallArgs(emitArray, p.nameStr, dummyVars)
-      emitArray.add(newStrLitNode(")>::type,\n    "))
-      if p.hasReturn:
-        addTypeToEmit(emitArray, p.formalParams[0])
-      else:
-        emitArray.add(newStrLitNode("void"))
-      emitArray.add(newStrLitNode(
-        ">::value,\n  \"" & errMsg & "\"\n);\n"))
-
-      # --- GCC/Clang path: __builtin_types_compatible_p + __typeof__ ---
-      # For pointer returns, dereference both sides so __builtin_types_compatible_p
-      # strips top-level const (e.g., const unsigned char* → const unsigned char,
-      # then ignoring qualifiers matches unsigned char). No linker dependency —
-      # __typeof__ is purely compile-time.
-      #
       # "Pointer return" here covers both `ptr T` (nnkPtrTy in Nim AST) and
       # Nim's pointer-typed aliases that aren't structurally nnkPtrTy but
       # emit as pointer types in C (`cstring` → `char*`, `cstringArray` →
@@ -571,22 +737,41 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
           p.formalParams[0].kind == nnkPtrTy or
           (p.formalParams[0].kind in {nnkIdent, nnkSym} and
            $p.formalParams[0] in ["cstring", "cstringArray", "pointer"]))
-      emitArray.add(newStrLitNode(
+
+      # strip_ptr_const removes const from pointed-to types in return values
+      assertBody.add(newStrLitNode(
+        "\n#if defined(__cplusplus)\nstatic_assert(\n  std::is_same<\n" &
+        "    typename softlink_strip_ptr_const<decltype("))
+      buildCallArgs(assertBody, p.nameStr, dummyVars)
+      assertBody.add(newStrLitNode(")>::type,\n    "))
+      if p.hasReturn:
+        addTypeToEmit(assertBody, p.formalParams[0])
+      else:
+        assertBody.add(newStrLitNode("void"))
+      assertBody.add(newStrLitNode(
+        ">::value,\n  \"" & errMsg & "\"\n);\n"))
+
+      # --- GCC/Clang path: __builtin_types_compatible_p + __typeof__ ---
+      # For pointer returns, dereference both sides so __builtin_types_compatible_p
+      # strips top-level const (e.g., const unsigned char* → const unsigned char,
+      # then ignoring qualifiers matches unsigned char). No linker dependency —
+      # __typeof__ is purely compile-time.
+      assertBody.add(newStrLitNode(
         "#elif defined(__GNUC__)\n_Static_assert(\n  __builtin_types_compatible_p(\n    __typeof__("))
       if retIsPointerLike:
-        emitArray.add(newStrLitNode("*"))
-      buildCallArgs(emitArray, p.nameStr, dummyVars)
-      emitArray.add(newStrLitNode("),\n    "))
+        assertBody.add(newStrLitNode("*"))
+      buildCallArgs(assertBody, p.nameStr, dummyVars)
+      assertBody.add(newStrLitNode("),\n    "))
       if p.hasReturn:
         if retIsPointerLike:
-          emitArray.add(newStrLitNode("__typeof__(*("))
-          addTypeToEmit(emitArray, p.formalParams[0])
-          emitArray.add(newStrLitNode(")0)"))
+          assertBody.add(newStrLitNode("__typeof__(*("))
+          addTypeToEmit(assertBody, p.formalParams[0])
+          assertBody.add(newStrLitNode(")0)"))
         else:
-          addTypeToEmit(emitArray, p.formalParams[0])
+          addTypeToEmit(assertBody, p.formalParams[0])
       else:
-        emitArray.add(newStrLitNode("void"))
-      emitArray.add(newStrLitNode(
+        assertBody.add(newStrLitNode("void"))
+      assertBody.add(newStrLitNode(
         "),\n  \"" & errMsg & "\"\n);\n"))
 
       # --- MSVC C path: _Generic + __typeof__ (C23 only) ---
@@ -600,7 +785,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
       # there and can't be silently skipped (see the fallback). For pointer
       # returns the same dereference trick as the GCC path strips pointee const;
       # `retIsPointerLike` classifies cstring/cstringArray/pointer with nnkPtrTy.
-      emitArray.add(newStrLitNode(
+      assertBody.add(newStrLitNode(
         "#elif defined(_MSC_VER) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n"))
       if retIsPointerLike:
         # Pointer return: dereference BOTH the return value and the declared
@@ -614,24 +799,24 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         # Before this, the branch compared `const char**` (from
         # `(__typeof__(f())*)0`) against `char**` and rejected every
         # `const char *`-returning proc — e.g. libz3's `Z3_string` (#11 on MSVC).
-        emitArray.add(newStrLitNode(
+        assertBody.add(newStrLitNode(
           "_Static_assert(\n  _Generic(*(__typeof__("))
-        buildCallArgs(emitArray, p.nameStr, dummyVars)
-        emitArray.add(newStrLitNode("))0,\n    __typeof__(*("))
-        addTypeToEmit(emitArray, p.formalParams[0])
-        emitArray.add(newStrLitNode(
+        buildCallArgs(assertBody, p.nameStr, dummyVars)
+        assertBody.add(newStrLitNode("))0,\n    __typeof__(*("))
+        addTypeToEmit(assertBody, p.formalParams[0])
+        assertBody.add(newStrLitNode(
           ")0): 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
       else:
         # Non-pointer: call + _Generic __typeof__ pointer trick
-        buildCallArgs(emitArray, p.nameStr, dummyVars)
-        emitArray.add(newStrLitNode(";\n_Static_assert(\n  _Generic((__typeof__("))
-        buildCallArgs(emitArray, p.nameStr, dummyVars)
-        emitArray.add(newStrLitNode(")*)0,\n    "))
+        buildCallArgs(assertBody, p.nameStr, dummyVars)
+        assertBody.add(newStrLitNode(";\n_Static_assert(\n  _Generic((__typeof__("))
+        buildCallArgs(assertBody, p.nameStr, dummyVars)
+        assertBody.add(newStrLitNode(")*)0,\n    "))
         if p.hasReturn:
-          addTypeToEmit(emitArray, p.formalParams[0])
+          addTypeToEmit(assertBody, p.formalParams[0])
         else:
-          emitArray.add(newStrLitNode("void"))
-        emitArray.add(newStrLitNode(
+          assertBody.add(newStrLitNode("void"))
+        assertBody.add(newStrLitNode(
           "*: 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
 
       # --- Fallback: graceful degradation ---
@@ -643,7 +828,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
       # silently-skipped check can't pass unnoticed; CI sets it (with the std flag
       # that opens the MSVC gate above) to guarantee the check is exercised.
       when defined(softlinkStrictVerify):
-        emitArray.add(newStrLitNode(
+        assertBody.add(newStrLitNode(
           "#else\n#error \"softlink: signature verification unavailable here " &
           "(need C++, GCC/Clang, or MSVC /std:clatest); remove -d:softlinkStrictVerify to skip\"\n#endif\n"))
       else:
@@ -660,10 +845,14 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
             "this compile's verification tier degraded to no-op — " &
             "manifest facts were NOT re-verified by this build\")\n")
         fallbackText.add("#endif\n")
-        emitArray.add(newStrLitNode(fallbackText))
+        assertBody.add(newStrLitNode(fallbackText))
 
-      if p.verifyWhen.len > 0:
-        emitArray.add(newStrLitNode("#endif /* softlink verifyWhen */\n"))
+      # RFC-0003 §4.1: `effectiveVerifyWhen`, not `p.verifyWhen` — ground
+      # truth defeats this gate too, so the entire assert chain (all three
+      # compiler tiers AND the strict-mode fallback) becomes unconditional.
+      # `wrapGate` collapses what used to be two separate hand-inlined
+      # `if p.verifyWhen.len > 0` open/close checks into one call.
+      let emitArray = wrapGate(effectiveVerifyWhen(p), assertBody)
 
       verifyBody.add(newNimNode(nnkPragma).add(
         newNimNode(nnkExprColonExpr).add(
@@ -671,6 +860,13 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
           emitArray
         )
       ))
+
+    # RFC-0003 §7 A1: matching end anchor for the verify-proc body span —
+    # see the begin anchor above.
+    verifyBody.add(newNimNode(nnkPragma).add(newNimNode(nnkExprColonExpr).add(
+      ident("emit"),
+      newStrLitNode("/* SOFTLINK_VERIFY_APPARATUS_BODY_END:" & tag & " */\n")
+    )))
 
     let verifyProcName = ident("softlinkVerify" & tag)
     var verifyProc = newProc(

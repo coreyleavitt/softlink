@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "lib": "testlib",
+  "harvest": {
+    "toolchain": "fixture",
+    "tier": "builtin-compat",
+    "abi": "${ABI}",
+    "date": "2026-01-01",
+    "harvesterVersion": "0.10.0"
+  },
+  "corpus": [
+    { "version": "1.0.0", "source": "git:example/testlib@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "version": "2.0.0", "source": "git:example/testlib@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    { "version": "3.0.0", "source": "git:example/testlib@cccccccccccccccccccccccccccccccccccccccc" }
+  ],
+  "symbols": {
+    "testlib_add": {
+      "header": {
+        "verified": [{ "hi": "2.0.0" }],
+        "unknown": [{ "lo": "2.0.0" }]
+      }
+    }
+  }
+}

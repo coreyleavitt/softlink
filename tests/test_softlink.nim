@@ -1411,8 +1411,14 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
     check m.abi == "linux-lp64"
     check m.corpus == @["1.0.0", "2.0.0", "3.0.0"]
     # Finding #19.7 added a 4th probed symbol (corpuslib_crosscheck,
-    # header+prototype cross-check mode) to tests/corpus/expected.compat.json.
-    check m.symbols.len == 4
+    # header+prototype cross-check mode); RFC-0003 slice A2 added three more
+    # hand-written-gate fixture symbols (corpuslib_gated_until/_since/
+    # _crosscheck); slice B2b added an 8th, corpuslib_param_drift (the
+    # Gap B parameter-drift end-to-end fixture); slice B2c added a 9th and
+    # 10th, corpuslib_const_return/corpuslib_const_param (the #11
+    # tolerance-regression-control pair, UNGATED and non-drifting) to
+    # tests/corpus/expected.compat.json.
+    check m.symbols.len == 10
     check schemaSupported(m)
     check libIdentityOk(m, "corpuslib")
     check not libIdentityOk(m, "otherlib")
@@ -1652,7 +1658,16 @@ suite "softlink/manifest — parse + validation predicates (RFC-0001 §B.3/§B.5
 # pure function.
 suite "softlink/manifest — checkUntil (RFC-0002 §4.2, slice B1)":
   proc mkManifest(corpus: seq[string], sf: SymbolFacts): CompatManifest =
+    # RFC-0003 §2/§7 slice C1: `harvesterVersion` set to an arbitrary
+    # non-empty placeholder here (its VALUE is never compared, only
+    # presence/absence, per the §2 "sole trigger" rule) so this suite's
+    # pre-existing exact-message assertions (e.g. "drafted wording verbatim"
+    # below) keep exercising the RULE text alone, unperturbed by the
+    # ground-truth breadcrumb — that breadcrumb's own absence-triggered
+    # behavior is pinned separately, on a manifest that deliberately leaves
+    # this field unset (see the "ground-truth breadcrumb" suite below).
     CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                    harvesterVersion: "0.10.0",
                     corpus: corpus, symbols: @[sf])
 
   test "checkUntil: mismatch inside the window — hard error (tracer bullet)":
@@ -1785,6 +1800,175 @@ suite "softlink/manifest — checkUntil (RFC-0002 §4.2, slice B1)":
     sf.header[fkMismatch].add VersionInterval(lo: "3.0.0", hi: "")
     let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
     check not checkUntil(m, "corpuslib_early_unknown", "", "3.0.0").contradicted
+
+# RFC-0003 §2/§7 slice C1: `parseManifest`'s new OPTIONAL `harvest.
+# harvesterVersion` field, and the `checkSince`/`checkUntil` ground-truth
+# breadcrumb its absence triggers. Pure-function level (no macro, no real
+# harvest) — the real-harvest end-to-end proof (a REAL committed-manifest
+# attach through `compatManifest`/`applyCompatManifest`, and a REAL harvest
+# of the corpus) lives in `tests/tharvest.nim` and the nimble task's
+# `tfail_manifest_until_unknown[_stamped].nim` pair.
+suite "softlink/manifest — harvesterVersion + ground-truth breadcrumb (RFC-0003 §2, slice C1)":
+  test "parseManifest: harvesterVersion present -> parsed verbatim":
+    let j = """{"schema": 1, "lib": "x", "harvest": {"abi": "linux-lp64",
+      "harvesterVersion": "0.10.0"}, "corpus": [], "symbols": {}}"""
+    let m = parseManifest(j, "bogus.json")
+    check m.harvesterVersion == "0.10.0"
+
+  test "parseManifest: harvesterVersion absent -> \"\" (forward-compat with " &
+       "every pre-C1 manifest)":
+    let j = """{"schema": 1, "lib": "x", "harvest": {"abi": "linux-lp64"},
+      "corpus": [], "symbols": {}}"""
+    let m = parseManifest(j, "bogus.json")
+    check m.harvesterVersion == ""
+
+  test "parseManifest: harvesterVersion present but non-string -> ManifestError " &
+       "(F2/F7's expectStr guard, extended to this field)":
+    let j = """{"schema": 1, "lib": "x", "harvest": {"abi": "linux-lp64",
+      "harvesterVersion": 10}, "corpus": [], "symbols": {}}"""
+    expect(ManifestError):
+      discard parseManifest(j, "bogus.json")
+
+  proc mkStaleManifest(corpus: seq[string], sf: SymbolFacts): CompatManifest =
+    ## `harvesterVersion` left at its zero value ("") -- exactly the
+    ## "predates this field" shape §2 names. (`unittest.suite` wraps each
+    ## suite's body in its own `block:`, so the checkUntil/checkSince
+    ## suites' own `mkManifest` helpers above are not in scope here --
+    ## this suite defines its own pair, `mkStaleManifest`/`mkFreshManifest`.)
+    CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                    corpus: corpus, symbols: @[sf])
+
+  proc mkFreshManifest(corpus: seq[string], sf: SymbolFacts): CompatManifest =
+    ## The "already has the stamp" mirror of `mkStaleManifest` above --
+    ## `harvesterVersion`'s VALUE is never compared, only its presence, so
+    ## any non-empty placeholder proves the "no breadcrumb when present"
+    ## direction.
+    CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                    harvesterVersion: "0.10.0",
+                    corpus: corpus, symbols: @[sf])
+
+  test "checkUntil: breadcrumb PREPENDED (not appended) when harvesterVersion " &
+       "is absent, on rule (b)'s revert-detection contradiction":
+    ## Re-derives the checkUntil suite's own "re-verified above until" drafted-
+    ## wording-verbatim scenario, but on a manifest with no `harvesterVersion`
+    ## at all. RFC-0003 §2 round 2: the caveat must be read BEFORE rule (b)'s
+    ## own imperative ("drop 'until' for this symbol") -- `startsWith` is a
+    ## direct, exact proof of "prepended", stronger than a mere substring
+    ## `in` check that could pass even if the text were appended instead.
+    var sf = SymbolFacts(cname: "Z3_fpa_get_numeral_sign")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "4.16.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "4.16.0", hi: "4.18.0")
+    sf.header[fkVerified].add VersionInterval(lo: "4.18.0", hi: "")
+    let m = mkStaleManifest(@["4.10.0", "4.16.0", "4.18.0"], sf)
+    let uc = checkUntil(m, "Z3_fpa_get_numeral_sign", "", "4.16.0")
+    check uc.contradicted
+    check uc.message.startsWith(groundTruthBreadcrumb)
+    # The rule's own pinned wording (test_softlink.nim's "drafted wording
+    # verbatim" test) still appears in full, unmodified, AFTER the breadcrumb.
+    check "drop 'until' for this symbol to fall back to unbounded " &
+      "verification." in uc.message
+
+  test "checkUntil: NO breadcrumb when harvesterVersion is present -- same " &
+       "contradiction, sole trigger is absence of the field":
+    var sf = SymbolFacts(cname: "Z3_fpa_get_numeral_sign")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "4.16.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "4.16.0", hi: "4.18.0")
+    sf.header[fkVerified].add VersionInterval(lo: "4.18.0", hi: "")
+    let m = mkFreshManifest(@["4.10.0", "4.16.0", "4.18.0"], sf)
+    let uc = checkUntil(m, "Z3_fpa_get_numeral_sign", "", "4.16.0")
+    check uc.contradicted
+    check "predates softlink's ground-truth harvest fix" notin uc.message
+
+  test "checkSince: breadcrumb PREPENDED when harvesterVersion is absent, " &
+       "on the fkUnknown-below-since contradiction (a DIFFERENT rule than " &
+       "checkUntil's above -- proves the trigger is field-absence, not a " &
+       "specific rule's text)":
+    var sf = SymbolFacts(cname: "corpuslib_maybe")
+    sf.header[fkUnknown].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkStaleManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let sc = checkSince(m, "corpuslib_maybe", "2.0.0")
+    check sc.contradicted
+    check sc.message.startsWith(groundTruthBreadcrumb)
+    check "re-harvest 1.0.0, drop it from the corpus, or adjust the bound." in sc.message
+
+  test "checkSince: NO breadcrumb when harvesterVersion is present -- same " &
+       "contradiction":
+    var sf = SymbolFacts(cname: "corpuslib_maybe")
+    sf.header[fkUnknown].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkFreshManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let sc = checkSince(m, "corpuslib_maybe", "2.0.0")
+    check sc.contradicted
+    check "predates softlink's ground-truth harvest fix" notin sc.message
+
+  # RFC-0003 stage-4 review, Finding M3: the breadcrumb wrap
+  # (`withGroundTruthBreadcrumb`) is applied at all SIX `checkSince`/
+  # `checkUntil` contradiction return sites in manifest.nim, but only two
+  # of those six (checkUntil rule (b), checkSince's fkUnknown-below-since
+  # rule, both above) had a test pinning the wrap specifically. The other
+  # four sites could have their wrap silently dropped and no test would
+  # notice. The four tests below close that gap — each re-derives an
+  # EXISTING non-breadcrumb test's exact scenario (named in each comment)
+  # on a stale (`mkStaleManifest`) manifest instead, and additionally
+  # asserts `.startsWith(groundTruthBreadcrumb)`.
+  test "checkSince: breadcrumb PREPENDED when harvesterVersion is absent, " &
+       "on the mismatch-below-since rule (M3 — re-derives \"checkSince: " &
+       "fkMismatch below since\" above)":
+    var sf = SymbolFacts(cname: "corpuslib_early")
+    sf.header[fkMismatch].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkStaleManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let sc = checkSince(m, "corpuslib_early", "2.0.0")
+    check sc.contradicted
+    check sc.message.startsWith(groundTruthBreadcrumb)
+    check "earlier than the claimed lower bound" in sc.message
+
+  test "checkUntil: breadcrumb PREPENDED when harvesterVersion is absent, " &
+       "on rule (a)'s over-claim (mismatch inside the window) (M3 — " &
+       "re-derives the checkUntil suite's \"mismatch inside the window\" " &
+       "tracer bullet)":
+    var sf = SymbolFacts(cname: "corpuslib_drifted")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkStaleManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_drifted", "1.0.0", "3.0.0")
+    check uc.contradicted
+    check uc.message.startsWith(groundTruthBreadcrumb)
+    check "inside the declared window" in uc.message
+
+  test "checkUntil: breadcrumb PREPENDED when harvesterVersion is absent, " &
+       "on rule (b')'s fkUnknown-at-or-above-until contradiction (M3 — " &
+       "re-derives \"checkUntil: fkUnknown at/above until\" above, Finding " &
+       "R2-A)":
+    var sf = SymbolFacts(cname: "corpuslib_hazy")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "2.0.0")
+    sf.header[fkUnknown].add VersionInterval(lo: "2.0.0", hi: "")
+    let m = mkStaleManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_hazy", "", "2.0.0")
+    check uc.contradicted
+    check uc.message.startsWith(groundTruthBreadcrumb)
+    check "no decisive classification" in uc.message
+
+  test "checkUntil: breadcrumb PREPENDED when harvesterVersion is absent, " &
+       "on rule (c)'s no-positive-evidence contradiction (M3 — re-derives " &
+       "\"checkUntil: all-absent symbol with until\" above)":
+    var sf = SymbolFacts(cname: "corpuslib_ghost")
+    sf.header[fkAbsent].add VersionInterval(lo: "", hi: "")
+    let m = mkStaleManifest(@["1.0.0", "2.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_ghost", "", "9.0.0")
+    check uc.contradicted
+    check uc.message.startsWith(groundTruthBreadcrumb)
+    check "extend the corpus" in uc.message
+
+  test "checkUntil: no contradiction -> empty message regardless of " &
+       "harvesterVersion (breadcrumb never fires on a non-contradiction)":
+    var sf = SymbolFacts(cname: "corpuslib_boring")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "")
+    let m = mkStaleManifest(@["1.0.0", "2.0.0"], sf)
+    let uc = checkUntil(m, "corpuslib_boring", "", "9.0.0")
+    check not uc.contradicted
+    check uc.message.len == 0
 
 # RFC-0002 §4.4/§6, slice C4a: `compareToBound` — the declared-bound
 # runtime comparison rule's pure comparator (numeric-prefix-only, tie/

@@ -12,6 +12,27 @@ import std/json
 import std/strutils
 import "src/softlink/versions"
 
+proc checkVersionOfRecordPin() =
+  ## RFC-0003 §2/§7 slice C1: `softlink/versions.softlinkVersion` is
+  ## `HarvestMeta.harvesterVersion`'s source of truth (tools/harvest/
+  ## harvester.nim's `defaultHarvestMeta`) -- deliberately hand-bumped
+  ## rather than derived from `NimblePkgVersion` (which would stamp the
+  ## harvest CLI's own independent 0.1.x lineage, not the core package's --
+  ## see that const's own doc comment). Hand-bumped values drift apart
+  ## silently unless something checks them: `version` below is nimble's own
+  ## top-level NimScript global (assigned at the top of THIS file, already
+  ## in scope everywhere below it in the same script); `softlinkVersion` is
+  ## already in scope via this file's own `import "src/softlink/versions"`
+  ## above -- no new import needed on either side of the comparison.
+  if version != softlinkVersion:
+    quit("softlink: RFC-0003 slice C1: softlink.nimble's version ('" &
+         version & "') and softlink/versions.softlinkVersion ('" &
+         softlinkVersion & "') have drifted apart -- bump both together " &
+         "(HarvestMeta.harvesterVersion is sourced from the versions.nim " &
+         "const specifically so it reflects the CORE package's own " &
+         "release, not the harvest CLI's independent 0.1.x lineage -- see " &
+         "RFC-0003 SS2)")
+
 proc validateProbeJson(path, expectKind, expectBaseName: string) =
   ## RFC-0001 §4 B.1 nimble-task check: schema validation for one
   ## `<Base>.probes.json` file written by `-d:softlinkDumpProbes=<dir>`.
@@ -226,8 +247,11 @@ proc expectManifestCompileOk(cmd: string, mustContain, mustNotContain: openArray
       quit("softlink: RFC-0001 slice B6a expected compile output to NOT " &
            "contain '" & s & "': " & cmd)
 
-proc expectManifestCompileFail(cmd: string, mustContain: openArray[string]) =
+proc expectManifestCompileFail(cmd: string, mustContain: openArray[string],
+                                mustNotContain: openArray[string] = []) =
   ## The failure-polarity mirror of `expectManifestCompileOk` above.
+  ## `mustNotContain` (RFC-0003 §2/§7 slice C1) defaults to empty so every
+  ## pre-existing call site is unaffected.
   let (output, code) = gorgeEx(cmd)
   if code == 0:
     echo output
@@ -236,6 +260,11 @@ proc expectManifestCompileFail(cmd: string, mustContain: openArray[string]) =
     if s notin output:
       echo output
       quit("softlink: RFC-0001 slice B6a expected compile output to " &
+           "contain '" & s & "': " & cmd)
+  for s in mustNotContain:
+    if s in output:
+      echo output
+      quit("softlink: RFC-0003 slice C1 expected compile output to NOT " &
            "contain '" & s & "': " & cmd)
 
 proc expectWrapperBeforeLoad(cmd: string) =
@@ -436,7 +465,131 @@ proc runCorpusChecks() =
   echo "softlink: RFC-0001 slice B3a: validated tests/corpus (" &
        $diskVersions.len & " versions, prepare-hook on 1)"
 
-proc runHarvesterCheck() =
+proc slurpGenSourcesFile(dir: string): string =
+  ## File-scope twin of `task test`'s own nested `slurpGenSources` (that one
+  ## is local to the task and unreachable from here) — identical shape:
+  ## concatenate every generated .c/.cpp file under `dir` via the shared
+  ## `walkGenSources` walk.
+  for f in walkGenSources(dir):
+    result.add(readFile(f))
+    result.add('\n')
+
+proc extractBetweenAnchors(dir, beginAnchor, endAnchor: string): string =
+  ## RFC-0003 §7 A1: the extraction half of the NEW byte-identical
+  ## generated-C golden-snapshot mechanism — nothing in this suite did
+  ## whole-file/whole-span comparison before this (every existing check
+  ## here, `expectAnchor`/`expectAdjacentPair`, is substring- or
+  ## adjacency-window-only). `beginAnchor`/`endAnchor` are the EXACT,
+  ## tag-scoped literal marker comments `genVerifyBlock` emits around its
+  ## include-section scaffolding and its verify-proc body (`src/softlink/
+  ## verify.nim`'s "SOFTLINK_VERIFY_APPARATUS_*" anchors) — both markers'
+  ## OWN text is excluded from the returned span; only what's BETWEEN them
+  ## is compared. `dir` must hold exactly one compile's generated sources
+  ## (this is only ever called against `tests/tgolden_verify_apparatus.nim`'s
+  ## own dedicated --nimcache dir, which contains exactly one dynlib block,
+  ## so the FIRST occurrence of each anchor is unambiguous).
+  let text = slurpGenSourcesFile(dir)
+  let bIdx = text.find(beginAnchor)
+  if bIdx < 0:
+    quit("softlink: RFC-0003 slice A1 golden check: begin anchor not " &
+         "found under " & dir & ": " & beginAnchor)
+  let contentStart = bIdx + beginAnchor.len
+  let eIdx = text.find(endAnchor, contentStart)
+  if eIdx < 0:
+    quit("softlink: RFC-0003 slice A1 golden check: end anchor not " &
+         "found (after its matching begin anchor) under " & dir & ": " & endAnchor)
+  text[contentStart ..< eIdx]
+
+proc runGoldenVerifyApparatusCheck() =
+  ## RFC-0003 §7 A1: the byte-identical half of the NEW golden-snapshot
+  ## infrastructure (the absence-under-ground-truth half lives in `task
+  ## test`'s own `runGroundTruthChecks`, right next to the
+  ## `runProbeOnlyChecks` fixtures it reuses). Compiles the dedicated,
+  ## minimal `tests/tgolden_verify_apparatus.nim` fixture (its own tiny
+  ## header, `tests/testlib_golden.h`, decoupled from `tests/testlib.h`'s
+  ## churn) with NO probe defines at all, extracts the two anchored spans
+  ## `genVerifyBlock` emits (the include-section scaffolding and the
+  ## verify-proc body — see `extractBetweenAnchors`), and compares each
+  ## byte-for-byte against a committed golden file.
+  ##
+  ## `--stacktrace:off --linetrace:off --excessiveStackTrace:off`: without
+  ## these, Nim interleaves `nimln_(<source line number>)` debug-instrumentation
+  ## calls into the verify proc's body — hand-verified present in a plain
+  ## `nim c --compileOnly` of this same fixture — which would make the
+  ## golden's body span drift every time an UNRELATED doc-comment edit in
+  ## `tests/tgolden_verify_apparatus.nim` shifts a line number, defeating
+  ## the entire point (a golden diff must mean the emitted C actually
+  ## changed, not that a comment moved). With them off, the body span
+  ## contains only `genVerifyBlock`'s own emitted text, confirmed by hand.
+  ##
+  ## Linux/gcc leg only, following `runHarvesterCheck`'s own precedent
+  ## immediately below (its doc comment's reasoning applies identically
+  ## here: this mechanism doesn't vary by OS, so doubling the cost on every
+  ## CI leg wasn't judged worth it).
+  ##
+  ## Mechanical regen path (Nim-version bumps are EXPECTED to eventually
+  ## shift Nim's own codegen shape, which must produce a loud diff here,
+  ## not silent drift — the fix is to re-run this exact command, inspect
+  ## the diff it makes to the golden files, and commit it deliberately):
+  ##
+  ##   SOFTLINK_REGEN_GOLDEN=1 nimble test
+  ##
+  ## (or, narrower: `SOFTLINK_REGEN_GOLDEN=1 nim c ... ` is not sufficient
+  ## by itself — this proc, not the compiler, does the regen — so the
+  ## `nimble test` invocation above, which reaches this proc on the
+  ## Linux/gcc leg, is the actual regen command. If run from a container as
+  ## root, `chown` the two golden files back to your own uid/gid afterward.)
+  const dir = "tests/nimcache_golden_verify_apparatus"
+  if dirExists(dir): rmDir(dir)
+  ## `deriveLibPattern("libsoftlinkgolden.so")`'s base name — see
+  ## `tests/tgolden_verify_apparatus.nim`'s own dynlib pattern string.
+  const tag = "Softlinkgolden"
+  const beginIncludes = "/* SOFTLINK_VERIFY_APPARATUS_INCLUDES_BEGIN:" & tag & " */\n"
+  const endIncludes = "/* SOFTLINK_VERIFY_APPARATUS_INCLUDES_END:" & tag & " */\n"
+  const beginBody = "/* SOFTLINK_VERIFY_APPARATUS_BODY_BEGIN:" & tag & " */\n"
+  const endBody = "/* SOFTLINK_VERIFY_APPARATUS_BODY_END:" & tag & " */\n"
+  const goldenIncludesPath = "tests/golden_verify_apparatus_includes.c"
+  const goldenBodyPath = "tests/golden_verify_apparatus_body.c"
+
+  exec "nim c --compileOnly --path:src --passC:-I. --stacktrace:off " &
+       "--linetrace:off --excessiveStackTrace:off --nimcache:" & dir &
+       " tests/tgolden_verify_apparatus.nim"
+
+  let gotIncludes = extractBetweenAnchors(dir, beginIncludes, endIncludes)
+  let gotBody = extractBetweenAnchors(dir, beginBody, endBody)
+  rmDir(dir)
+
+  if getEnv("SOFTLINK_REGEN_GOLDEN") == "1":
+    writeFile(goldenIncludesPath, gotIncludes)
+    writeFile(goldenBodyPath, gotBody)
+    echo "softlink: RFC-0003 slice A1: REGENERATED " & goldenIncludesPath &
+         " and " & goldenBodyPath & " — inspect the diff and commit deliberately"
+    return
+
+  if not fileExists(goldenIncludesPath) or not fileExists(goldenBodyPath):
+    quit("softlink: RFC-0003 slice A1 golden check: golden file(s) missing " &
+         "— run with SOFTLINK_REGEN_GOLDEN=1 to create them (see " &
+         "runGoldenVerifyApparatusCheck's own doc comment)")
+
+  let wantIncludes = readFile(goldenIncludesPath)
+  let wantBody = readFile(goldenBodyPath)
+  if gotIncludes != wantIncludes:
+    quit("softlink: RFC-0003 slice A1 golden check: " & goldenIncludesPath &
+         " MISMATCH — generated C's include-section scaffolding changed. " &
+         "If this is an intentional verify.nim change (or a Nim-version " &
+         "codegen shift), regenerate with SOFTLINK_REGEN_GOLDEN=1 nimble " &
+         "test and commit the diff deliberately.\n--- golden ---\n" &
+         wantIncludes & "\n--- got ---\n" & gotIncludes)
+  if gotBody != wantBody:
+    quit("softlink: RFC-0003 slice A1 golden check: " & goldenBodyPath &
+         " MISMATCH — generated C's verify-proc body changed. If this is " &
+         "an intentional verify.nim change (or a Nim-version codegen " &
+         "shift), regenerate with SOFTLINK_REGEN_GOLDEN=1 nimble test and " &
+         "commit the diff deliberately.\n--- golden ---\n" & wantBody &
+         "\n--- got ---\n" & gotBody)
+  echo "softlink: RFC-0003 slice A1: golden verify-apparatus snapshot matches"
+
+proc runHarvesterCheck(clangLeg = false) =
   ## RFC-0001 slice B3: the harvester classification loop, real end to end —
   ## `tests/tharvest.nim` (a compiled Nim program, NOT a NimScript check like
   ## every other `run*Checks` proc in this file) generates its own B.1
@@ -455,14 +608,35 @@ proc runHarvesterCheck() =
   ## Real cost, unlike this file's other (compile-only or single-compile)
   ## checks: each `harvest()`/`runCalibration()` call is a handful of REAL
   ## `nim c --noLinking` subprocess compiles (baseline once per corpus
-  ## version, existence+verify per probed symbol) — roughly 20 compiles for
-  ## this fixture, on the order of a minute of wall time. Linux/gcc only
-  ## (the slice's stated required minimum leg; RFC-0001 §9 B3's MSVC
-  ## coverage is the calibration-REFUSAL check in `task testMsvcExitCodes`
-  ## below, a much cheaper single-preflight run) — not wired into the
-  ## macOS/windows-mingw branches: doubling this cost on every CI leg for a
-  ## mechanism that doesn't vary by OS wasn't judged worth it; revisit if
-  ## Stage B ships a regression those legs would have caught.
+  ## version, existence+verify per probed symbol) — 45/48 compiles
+  ## (standard/fast path) for this fixture as of RFC-0003 slice B2c's two
+  ## added tolerance-control symbols (`tests/tharvest.nim`'s own
+  ## compile-count arithmetic pins the exact, derived-then-confirmed
+  ## totals), on the order of a minute of wall time.
+  ##
+  ## `clangLeg` (RFC-0003 slice B2c, round-2 blocking item): this proc used
+  ## to run on the Linux/gcc leg only, with a comment explicitly naming
+  ## "revisit if Stage B ships a regression those legs would have caught"
+  ## as the trigger for wiring it into macOS/clang too — Stage B (B2a's
+  ## `-Werror=incompatible-pointer-types` pin, B2b's Gap B end-to-end fix)
+  ## now HAS shipped exactly that kind of fix, and B2c adds the const-
+  ## tolerance regression controls (RFC-0003 §5.2 i: the pins must not
+  ## reverse GH #11's const-tolerance) that only mean something if they're
+  ## actually checked under a real clang compile, not just gcc. `clangLeg =
+  ## true` passes `-d:softlinkHarvestClangOpts` to `tests/tharvest.nim`,
+  ## which — per RFC-0003 §8 resolution 1's "caller-controlled opts, no
+  ## auto-detection" principle — is the ONE switch that makes `harvest()`/
+  ## `runCalibration()` build their `HarvestOptions` from
+  ## `clangHarvestOptions()` instead of `defaultHarvestOptions()` (see that
+  ## file's own doc comment on the define). No `--cc:clang` needed: Nim's
+  ## own default C compiler on macOS is already clang (Apple's `cc`), same
+  ## toolchain `task test`'s macosx branch already builds the fixture
+  ## libraries with. Windows/MSVC still gets NO harvest check here — MSVC
+  ## calibration-refusal coverage is `task testMsvcExitCodes`'s narrower,
+  ## much cheaper single-preflight run (RFC-0001 §9 B3; RFC-0003 slice B3's
+  ## territory, not this proc's) — doubling this proc's ~1-minute real-
+  ## compile cost onto the windows-mingw leg too was never in scope and
+  ## still isn't.
   ##
   ## RFC-0001 slice B8: `tests/tharvest_cli.nim` unit-tests
   ## `tools/harvest/harvest_cli.nim`'s `parseHarvestCli` — a PURE function
@@ -471,9 +645,13 @@ proc runHarvesterCheck() =
   ## Run right alongside it (same `runHarvesterCheck` proc) so both of this
   ## slice's suites are exercised by the one `task test` call site below.
   exec "nim c -r --path:src tests/tharvest_cli.nim"
-  exec "nim c -r --path:src tests/tharvest.nim"
+  let clangDefine = if clangLeg: " -d:softlinkHarvestClangOpts " else: " "
+  exec "nim c -r --path:src" & clangDefine & "tests/tharvest.nim"
 
 task test, "Run tests":
+  # RFC-0003 §2/§7 slice C1: cheap, first thing -- no point running an
+  # ~hour of compiles before catching a version-of-record drift.
+  checkVersionOfRecordPin()
   # testlib.c is compiled under several names to exercise deriveLibPattern:
   #   libtestlib.*  — explicit-pattern block (verbatim escape hatch)
   #   libmagic.*    — bare logical name "magic" resolves here
@@ -1194,6 +1372,90 @@ task test, "Run tests":
     for d in probeOnlyDirs:
       if dirExists(d): rmDir(d)
 
+  # RFC-0003 §4.1/§7 A1: `-d:softlinkProbeGroundTruth` (paired with
+  # `-d:softlinkHarvestSession`, else the misuse guard fires — see
+  # `gtNoSessionCheck` below) defeats every `{.verifyWhen.}` gate and
+  # vendored `{.prototype.}` declaration a probe compile carries, and skips
+  # the `versionMacros` visibility guard. Reuses the SAME
+  # `tests/tcheck_probe_only.nim`/`tests/tverify_synthesized_gate.nim`
+  # fixtures `runProbeOnlyChecks`/RFC-0002's own E2 checks already proved
+  # correct WITHOUT ground truth — recompiled here WITH it, so the only
+  # variable under test is ground truth's defeat/skip/suppression, not a
+  # new fixture shape.
+  const gtDirGate = "tests/nimcache_gt_gate"
+  const gtDirProto = "tests/nimcache_gt_proto"
+  const gtDirGuard = "tests/nimcache_gt_guard"
+  const gtDirFastPath = "tests/nimcache_gt_fastpath"
+  const gtDirInert = "tests/nimcache_gt_inert"
+  const gtDirs = [gtDirGate, gtDirProto, gtDirGuard, gtDirFastPath, gtDirInert]
+  const gtNoSessionCheck =
+    "nim c --path:src --passC:-I. -d:softlinkProbeGroundTruth " &
+    "tests/tfail_groundtruth_no_session.nim"
+  const gtNoSessionAnchor = "requires -d:softlinkHarvestSession"
+
+  proc runGroundTruthChecks() =
+    for d in gtDirs:
+      if dirExists(d): rmDir(d)
+    let cBase = "nim c --compileOnly --path:src --passC:-I. --nimcache:"
+    const gtDefines = " -d:softlinkProbeGroundTruth -d:softlinkHarvestSession "
+
+    # (1) A hand-written {.verifyWhen.} gate is DEFEATED: testlib_gated's
+    # own gate text is absent (the assert becomes unconditional) —
+    # `effectiveVerifyWhen` (RFC-0003 §4.1). `poAssertGated`/`testlib_gated`
+    # is genuinely correctly-typed against tests/testlib.h at
+    # TESTLIB_VERSION=1, so the now-unconditional assert still compiles.
+    exec cBase & gtDirGate & gtDefines &
+      "-d:softlinkProbeOnly=testlib_gated tests/tcheck_probe_only.nim"
+    expectAnchor(gtDirGate, poAssertGated,
+      "ground truth: testlib_gated assert present (now unconditional)", true)
+    expectAnchor(gtDirGate, "#if (TESTLIB_VERSION >= 1) /* softlink verifyWhen */",
+      "ground truth: testlib_gated's own verifyWhen gate text defeated", false)
+
+    # (2) RFC-0003 §5.2(iv): the probed symbol's OWN vendored
+    # {.prototype.} decl is suppressed in the VERIFY sub-mode under ground
+    # truth — extending the pre-existing existence-mode-only suppression
+    # (`isProbedExistence`) to `isProbedTarget`. testlib_add is
+    # header+prototype, no gate; `poProtoDeclAdd` was PRESENT under the
+    # IDENTICAL non-ground-truth M2 probe above (`runProbeOnlyChecks`) —
+    # now absent, while the assert (checked against the header alone)
+    # still fires.
+    exec cBase & gtDirProto & gtDefines &
+      "-d:softlinkProbeOnly=testlib_add tests/tcheck_probe_only.nim"
+    expectAnchor(gtDirProto, poAssertAdd, "ground truth: testlib_add assert present", true)
+    expectAnchor(gtDirProto, poProtoDeclAdd,
+      "ground truth: testlib_add's own vendored prototype decl suppressed in verify probe", false)
+
+    # (3) RFC-0002 §4.5's versionMacros visibility guard is skipped
+    # entirely under ground truth (a probe TU evaluates no gate, so an
+    # undefined macro can't corrupt classification there — RFC-0003 §4.1).
+    exec cBase & gtDirGuard & gtDefines & "tests/tverify_synthesized_gate.nim"
+    expectAnchor(gtDirGuard, "#ifndef TESTLIB_VERSION",
+      "ground truth: versionMacros visibility guard skipped", false)
+
+    # (4) Fast-path legality control: `softlinkProbeGroundTruth` +
+    # `softlinkHarvestSession` with NO `softlinkProbeOnly` at all (the
+    # whole-module compile RFC-0003 §4.3 describes) must compile clean,
+    # not trip the misuse guard — `softlinkProbeOnly`'s absence is NOT the
+    # misuse signal, `softlinkHarvestSession`'s absence is.
+    exec cBase & gtDirFastPath & gtDefines & "tests/tcheck_probe_only.nim"
+
+    # (5) `softlinkHarvestSession` ALONE (`softlinkProbeGroundTruth` false)
+    # is legal AND inert (doc comment on the const, RFC-0003 §4.1's truth
+    # table): testlib_gated's gate text must still be PRESENT — identical
+    # to the M0 control's byte shape — proving this define alone changes
+    # no emission.
+    exec cBase & gtDirInert &
+      " -d:softlinkHarvestSession -d:softlinkProbeOnly=testlib_gated tests/tcheck_probe_only.nim"
+    expectAnchor(gtDirInert, "#if (TESTLIB_VERSION >= 1) /* softlink verifyWhen */",
+      "softlinkHarvestSession alone: testlib_gated's gate text is untouched (inert)", true)
+
+    for d in gtDirs:
+      if dirExists(d): rmDir(d)
+
+    # RFC-0003 §4.1 misuse rule: `softlinkProbeGroundTruth` without
+    # `softlinkHarvestSession` is a loud macro error, never a silent probe.
+    expectDiag(gtNoSessionCheck, "groundTruth without harvestSession", gtNoSessionAnchor)
+
   # RFC-0002 §6, slice C3a: the dual-header compile test —
   # tests/tverify_gated_drift.nim compiled TWICE, once against each of
   # tests/testlib.h's two `#if TESTLIB_VERSION >= 2` branches for
@@ -1369,7 +1631,7 @@ task test, "Run tests":
   const manifestTmplBases = ["testlib", "testlib_schema2", "testlib_wronglib",
     "testlib_overlap", "testlib_gap", "testlib_since", "testlib_vp_subset",
     "testlib_vp_since", "testlib_abi_mismatch", "testlib_until",
-    "testlib_until_unknown"]
+    "testlib_until_unknown", "testlib_until_unknown_stamped"]
 
   proc runManifestChecks() =
     const mdir = "tests/manifests/"
@@ -1426,8 +1688,27 @@ task test, "Run tests":
     # contradicts on a non-decisive (`fkUnknown`) corpus fact, not just a
     # re-verified one — see `src/softlink/manifest.nim`'s `checkUntil` doc
     # comment and this fixture's own header comment.
+    #
+    # RFC-0003 §2/§7 slice C1: this fixture's manifest carries NO
+    # `harvesterVersion` (every tmpl.json committed before this field
+    # existed lacks it, by construction) — a REAL, pre-existing "stale
+    # manifest" shape, not a synthetic one built for this slice. Its
+    # contradiction path is therefore also this project's end-to-end,
+    # macro-expansion-level proof that the §2 breadcrumb actually reaches a
+    # real `error()` call (`softlink/directives.applyCompatManifest`'s
+    # Check 6b, which forwards `checkUntil`'s message VERBATIM — no
+    # directives.nim code change was needed for this to work). The
+    # `testlib_until_unknown_stamped` control immediately below proves the
+    # mirror: the IDENTICAL contradiction, with `harvesterVersion` present,
+    # carries NO breadcrumb — absence of the field is the sole trigger.
     expectManifestCompileFail(mcBase & "tests/tfail_manifest_until_unknown.nim",
-      ["no decisive classification"])
+      ["no decisive classification",
+       "NOTE: this manifest predates softlink's ground-truth harvest fix"])
+
+    expectManifestCompileFail(
+      mcBase & "tests/tfail_manifest_until_unknown_stamped.nim",
+      ["no decisive classification"],
+      ["predates softlink's ground-truth harvest fix"])
 
     expectManifestCompileFail(mcBase & "tests/tfail_since_unparseable.nim",
       ["does not parse as a version"])
@@ -1892,6 +2173,7 @@ task test, "Run tests":
     probeNoTargetAnchor)
 
   runProbeOnlyChecks()
+  runGroundTruthChecks()
   runGatedDriftChecks()
   runVersionMacrosGateChecks()
   runCorpusChecks()
@@ -1934,6 +2216,11 @@ task test, "Run tests":
     runCompatReportManifestChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runDriftRequiredChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runDegradationChecks("DYLD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
+    # RFC-0003 slice B2c (round-2 blocking item): the harvester check, real
+    # clang compiles, `clangHarvestOptions()` selected via `clangLeg = true`
+    # (see `runHarvesterCheck`'s own doc comment) — the macOS/clang leg
+    # this was previously never wired into.
+    runHarvesterCheck(clangLeg = true)
   else:
     exec "gcc -shared -fPIC -o tests/libtestlib.so tests/testlib.c"
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
@@ -1961,6 +2248,7 @@ task test, "Run tests":
     runDriftRequiredChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runDegradationChecks("LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I.")
     runHarvesterCheck()
+    runGoldenVerifyApparatusCheck()
 
 task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure checks":
   ## `task test`'s `when defined(windows):` branch always builds the
@@ -2024,6 +2312,21 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
   # the harvester's INTERNAL probe compiles (configured inside that test
   # file) target vcc; see its doc comment for the full rationale.
   exec "nim c -r --path:src tests/tharvest_msvc_calibration_refusal.nim"
+
+  # RFC-0003 §5.3/§7 slice B3: the `/std:clatest` VARIANT of the check
+  # immediately above — under the C23 gate the verification tier is LIVE
+  # (unlike the default-mode check above, where the whole tier is dead),
+  # but MSVC treats a pointer-parameter-only mismatch as warning C4133 by
+  # default and understands none of the GCC/Clang `-Werror=` diagnostics
+  # pins, so the fourth calibration symbol (`calib_param_drifted`, slice
+  # B3) still classifies `fkVerified` there and calibration still refuses —
+  # for a different reason than the sibling default-mode check. Together
+  # the two prove MSVC harvest refuses in EVERY flag configuration this
+  # project ships an opts literal for (RFC-0003 §5.3). Same exec mechanism
+  # as the line above; see `tests/tharvest_msvc_calibration_refusal_
+  # clatest.nim`'s own doc comment for the full rationale and why it is
+  # structurally identical to the proven sibling test.
+  exec "nim c -r --path:src tests/tharvest_msvc_calibration_refusal_clatest.nim"
 
   # RFC-0002 §6, slice C3a: the dual-header gated-drift fixture
   # (tests/tverify_gated_drift.nim), vcc-flavored — `task test`'s

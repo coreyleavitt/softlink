@@ -10,6 +10,7 @@
 ## drives `harvester.nim`'s real `harvest`/`driftAlarm`/`writeManifest`
 ## accordingly, translating outcomes into this module's exit codes.
 import std/[parseopt, strutils]
+import harvest_defaults
 import softlink/versions
 
 export versions
@@ -26,15 +27,19 @@ const
     ## Bad flags, missing dump/corpus, malformed manifest inputs — anything
     ## wrong BEFORE a real harvest could even be attempted.
 
-  defaultExtraFlags* = @["--passC:-Werror=implicit-function-declaration"]
-    ## Literal copy of `harvester.defaultHarvestOptions()`'s own default
-    ## (implicit-function-declaration-as-error — RFC-0001 SS4 B.2's guard
-    ## against silently misclassifying `absent` as `verified`). Copied
-    ## rather than referenced because `--extra-flag`/`--no-default-flags`
-    ## below need to independently APPEND to or REPLACE this exact set;
-    ## the two are asserted to match by `tests/tharvest_cli.nim`'s "defaults"
-    ## test rather than by a shared symbol, so a future edit to either
-    ## default is a visible, deliberate two-line change, not a silent split.
+  defaultExtraFlags* = harvest_defaults.defaultDiagnosticsPinFlags
+    ## The packaged CLI's own name for `harvest_defaults.
+    ## defaultDiagnosticsPinFlags` (implicit-function-declaration-as-error —
+    ## RFC-0001 SS4 B.2's guard against silently misclassifying `absent` as
+    ## `verified`; plus the RFC-0003 §5.2(i)/B2a pointer-parameter-drift pin
+    ## that makes parameter-only drift a hard, decisive verify failure).
+    ## `harvester.defaultHarvestOptions()` derives its own `extraFlags` from
+    ## the SAME shared const (see `harvest_defaults.nim`'s module doc
+    ## comment) — this used to be a hand-copied literal, kept in sync only
+    ## by a byte-identity test; now the two derive from one definition, so
+    ## drift between them is structurally impossible rather than test-
+    ## policed. `--extra-flag`/`--no-default-flags` below still
+    ## independently APPEND to or REPLACE this exact set at parse time.
 
   usageText* = """
 softlink_harvest -- RFC-0001 Stage B harvester CLI (compat-manifest generation)
@@ -64,12 +69,18 @@ Options:
                                resolves its own deps via its own nimble
                                project; add this only for extras).
   --extra-flag:<f>              Extra raw "nim c" flag for every probe
-                               compile. Repeatable; APPENDED to the default
-                               (-Werror=implicit-function-declaration)
-                               unless --no-default-flags is also given.
+                               compile. Repeatable; APPENDED to the
+                               defaults (-Werror=implicit-function-declaration,
+                               -Werror=incompatible-pointer-types) unless
+                               --no-default-flags is also given. The
+                               harvest-reserved defines (softlinkStrictVerify,
+                               softlinkProbeGroundTruth, softlinkHarvestSession,
+                               softlinkProbeOnly, softlinkProbeExistence)
+                               cannot be set this way -- refused with a hard
+                               error (exit 3).
   --no-default-flags            Do not apply the built-in default extra
-                               flag; only --extra-flag values (if any) are
-                               used.
+                               flags; only --extra-flag values (if any)
+                               are used.
   --include-prefix:<p>          Include-dir flag spelling for the target C
                                toolchain ("-I" for gcc/clang, "/I" for
                                MSVC). Default: -I

@@ -687,7 +687,7 @@ Where each mechanism applies:
 
 | probed version is... | what refuses |
 |---|---|
-| inside the manifest's corpus (`atAttested`), symbol present in the manifest | manifest `mismatch` facts, exactly as before — declared bounds add nothing here |
+| inside the manifest's corpus (`atAttested`), symbol present in the manifest | manifest `mismatch` facts — decisive for parameter-only drift too now that harvest facts are ground truth (RFC-0003: a drift like `Z3_fpa_get_numeral_sign`'s classifies `mismatch`, not the `unknown` an older harvester would have recorded) — declared bounds add nothing on top |
 | inside the manifest's corpus (`atAttested`), symbol **absent** from the manifest | the **declared bound** itself — `checkUntil` never validated this symbol (nothing in the manifest to check it against), so the row above's redundancy argument doesn't hold for it (code-review finding CR1-1) |
 | outside the corpus (`atOutOfCorpus`) | the **declared bound** itself |
 | probe ok, no manifest at all (`atNoManifest`) | the **declared bound** itself |
@@ -700,7 +700,11 @@ protect you at 4.16.0 exactly (if harvested) and dispatch the wrong ABI at
 accept) decides it. The narrowing is scoped to symbols whose **author
 explicitly declared** a bound — and when a manifest is attached *and
 records that symbol*, the declaration has survived the harvester
-cross-check. A bounded symbol a manifest-carrying block forgot to
+cross-check, decisively: since RFC-0003's ground-truth harvest fix, a
+parameter-only drift like this section's own `Z3_fpa_get_numeral_sign`
+example classifies `mismatch` at the bound rather than the pre-fix
+`unknown` that would have forced dropping the bound outright. A bounded
+symbol a manifest-carrying block forgot to
 re-harvest gets no such pass, at any attestation — softlink surfaces the
 gap itself: the not-in-manifest hint (a warning under
 `-d:softlinkStrictVerify`) names it. Unbounded symbols keep

@@ -40,6 +40,18 @@ type
     schema*: int
     lib*: string
     abi*: string
+    harvesterVersion*: string
+      ## RFC-0003 §2/§7 slice C1: the harvest's `harvest.harvesterVersion`
+      ## field (softlink/versions.softlinkVersion at harvest time), OPTIONAL
+      ## per §2/§8 resolution 2 -- "" (the zero value) means the manifest
+      ## PREDATES this field entirely (either a pre-fix harvest, or any
+      ## caller-built `HarvestMeta` that never set it — see
+      ## `tools/harvest/harvester.HarvestMeta.harvesterVersion`'s own doc
+      ## comment for why `buildManifest` omits the JSON key rather than
+      ## emitting an empty string). Absence of this field, and ONLY that,
+      ## is what triggers `groundTruthBreadcrumb` below on a `checkSince`/
+      ## `checkUntil` contradiction -- no version-threshold comparison
+      ## against its value is ever performed.
     corpus*: seq[string]      ## corpus version strings, cmpVersion-sorted
     symbols*: seq[SymbolFacts]
 
@@ -240,6 +252,13 @@ proc parseManifest*(jsonText, path: string): CompatManifest =
   let harvestNode = requireKey(j, "harvest", path, "manifest")
   result.abi = expectStr(requireKey(harvestNode, "abi", path, "manifest.harvest"),
     path, "harvest.abi")
+  # RFC-0003 §2/§7 slice C1: OPTIONAL -- forward-compat with every manifest
+  # committed before this field existed (§2: "old manifests (no field)
+  # parse fine; schema stays 1"). `hasKey` (not `requireKey`) is the whole
+  # point: a manifest lacking the key is structurally valid, not malformed.
+  if harvestNode.hasKey("harvesterVersion"):
+    result.harvesterVersion = expectStr(harvestNode["harvesterVersion"],
+      path, "harvest.harvesterVersion")
 
   let corpusNode = requireKey(j, "corpus", path, "manifest")
   if corpusNode.kind != JArray:
@@ -365,6 +384,33 @@ type
     contradicted*: bool
     message*: string
 
+const groundTruthBreadcrumb* =
+  "softlink: NOTE: this manifest predates softlink's ground-truth harvest " &
+  "fix — a masked drift can present as an apparent revert. Re-harvest " &
+  "before acting on the advice below.\n\n"
+  ## RFC-0003 §2 (round 2 resolution): PREPENDED -- never appended -- to a
+  ## `checkSince`/`checkUntil` contradiction message when the manifest
+  ## carries no `harvesterVersion` (`m.harvesterVersion.len == 0`). Every
+  ## contradiction message below *ends* in an imperative ("drop/adjust the
+  ## bound", "re-harvest ... or adjust the bound") this breadcrumb exists to
+  ## countermand -- a masked Gap A drift can present as a false
+  ## re-verification/absence exactly at a rule's decision point, so the
+  ## caveat must be read BEFORE the advice it suspends, not after it.
+  ##
+  ## The trigger is absence of the field, nothing more (§2/§8 resolution
+  ## 2): no pinned version-threshold comparison against `harvesterVersion`'s
+  ## VALUE is ever performed -- the field and the fix ship in the same
+  ## release, so no reachable manifest has the field yet predates the fix.
+
+func withGroundTruthBreadcrumb(m: CompatManifest, message: string): string =
+  ## Applies `groundTruthBreadcrumb` to an already-built contradiction
+  ## `message`, iff `m` lacks `harvesterVersion` -- the ONE gate, shared by
+  ## every `checkSince`/`checkUntil` contradiction return site below, so the
+  ## absence-only trigger can't drift between call sites the way five
+  ## hand-inlined checks could.
+  if m.harvesterVersion.len > 0: message
+  else: groundTruthBreadcrumb & message
+
 proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
   ## RFC-0001 §B.5/§C.2: `{.since: since.}` claims `cname` exists from
   ## `since` onward — "a lower bound only" (§C.2). Against the manifest's
@@ -423,13 +469,14 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
 
   if reason == "unknown":
     return SinceCheck(contradicted: true,
-      message: "softlink: {.since: \"" & since & "\".} on '" & cname &
+      message: withGroundTruthBreadcrumb(m,
+        "softlink: {.since: \"" & since & "\".} on '" & cname &
         "' contradicts the compat manifest: the corpus has no decisive " &
         "classification for '" & cname & "' at " & badVersion & ", below " &
         "the declared bound — an 'unknown' harvest fact there cannot " &
         "confirm the symbol is actually absent, so the bound cannot be " &
         "trusted at attested versions; re-harvest " & badVersion & ", drop " &
-        "it from the corpus, or adjust the bound.")
+        "it from the corpus, or adjust the bound."))
 
   let earliest = earliestDeclaredVersion(m, sf)
   let boundMsg =
@@ -444,8 +491,9 @@ proc checkSince*(m: CompatManifest, cname, since: string): SinceCheck =
       "manifest's header facts already show it " & reason & " at " &
       badVersion & " — earlier than the claimed lower bound"
   SinceCheck(contradicted: true,
-    message: "softlink: {.since: \"" & since & "\".} on '" & cname & "' " &
-      detail & " (" & boundMsg & ")")
+    message: withGroundTruthBreadcrumb(m,
+      "softlink: {.since: \"" & since & "\".} on '" & cname & "' " &
+      detail & " (" & boundMsg & ")"))
 
 func firstDriftedVersion(m: CompatManifest, sf: SymbolFacts): string =
   ## RFC-0002 §4.2's corrected-bound helper for `checkUntil` — the
@@ -559,21 +607,25 @@ proc checkUntil*(m: CompatManifest, cname, since, until: string): UntilCheck =
         if corrected.len > 0: "the corrected upper bound is until: \"" & corrected & "\""
         else: "no harvested corpus version confirms '" & cname & "' below " & until
     return UntilCheck(contradicted: true,
-      message: "softlink: {.until: \"" & until & "\".} on '" & cname & "' " &
-        detail & " (" & boundMsg & ")")
+      message: withGroundTruthBreadcrumb(m,
+        "softlink: {.until: \"" & until & "\".} on '" & cname & "' " &
+        detail & " (" & boundMsg & ")"))
 
   # Rule (b) — over-caution + revert detection. Grep-pinned wording (RFC-
-  # 0002 §4.2, drafted for B2's fixture): keep this text verbatim.
+  # 0002 §4.2, drafted for B2's fixture): keep this text verbatim (the
+  # `withGroundTruthBreadcrumb` wrap below only ever PREPENDS additional
+  # text ahead of it -- the pinned substring itself never changes).
   for v in m.corpus:
     if cmpVersion(v, until) < 0: continue
     if anyContains(sf.header[fkVerified], v):
       return UntilCheck(contradicted: true,
-        message: "softlink: {.until: \"" & until & "\".} on '" & cname &
+        message: withGroundTruthBreadcrumb(m,
+          "softlink: {.until: \"" & until & "\".} on '" & cname &
           "' contradicts the compat manifest: the corpus re-verifies the " &
           "declared signature at " & v & ", at or above the declared bound " &
           "— softlink's single-interval model cannot express drift-then-" &
           "revert (RFC-0002 §3); drop 'until' for this symbol to fall back " &
-          "to unbounded verification.")
+          "to unbounded verification."))
     # Finding R2-A (rule (b′) in tools/harvest/README.md): an `fkUnknown`
     # fact at or above `until` is exactly as dangerous as a re-verified
     # one for the attested-path exemption's premise — neither is decisive
@@ -589,13 +641,14 @@ proc checkUntil*(m: CompatManifest, cname, since, until: string): UntilCheck =
     # symbol/version coverage gap or overlap.
     if anyContains(sf.header[fkUnknown], v):
       return UntilCheck(contradicted: true,
-        message: "softlink: {.until: \"" & until & "\".} on '" & cname &
+        message: withGroundTruthBreadcrumb(m,
+          "softlink: {.until: \"" & until & "\".} on '" & cname &
           "' contradicts the compat manifest: the corpus has no decisive " &
           "classification for '" & cname & "' at " & v & ", at or above " &
           "the declared bound — an 'unknown' harvest fact there cannot " &
           "confirm the signature is actually invalid, so the bound cannot " &
           "be trusted at attested versions; re-harvest " & v & ", drop it " &
-          "from the corpus, or adjust the bound.")
+          "from the corpus, or adjust the bound."))
 
   # Rule (c) — positive evidence.
   var hasEvidence = false
@@ -608,10 +661,11 @@ proc checkUntil*(m: CompatManifest, cname, since, until: string): UntilCheck =
 
   if not hasEvidence:
     return UntilCheck(contradicted: true,
-      message: "softlink: {.until: \"" & until & "\".} on '" & cname &
+      message: withGroundTruthBreadcrumb(m,
+        "softlink: {.until: \"" & until & "\".} on '" & cname &
         "' contradicts the compat manifest: no corpus version below " &
         until & " confirms the declared signature — extend the corpus " &
-        "below 'until', or drop the bound.")
+        "below 'until', or drop the bound."))
 
   UntilCheck(contradicted: false)
 

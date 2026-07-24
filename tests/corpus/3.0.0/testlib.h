@@ -25,6 +25,8 @@
 extern "C" {
 #endif
 
+#define CORPUSLIB_VERSION 300
+
 int corpuslib_stable(int a, int b);
 
 double corpuslib_changed(int a, int b);
@@ -32,6 +34,18 @@ double corpuslib_changed(int a, int b);
 int corpuslib_added(int x);
 
 int corpuslib_crosscheck(int a, int b);
+
+double corpuslib_gated_until(int a, int b);
+
+int corpuslib_gated_since(int a);
+
+double corpuslib_gated_crosscheck(int a, int b);
+
+int corpuslib_param_drift(unsigned char *p);
+
+const char *corpuslib_const_return(void);
+
+int corpuslib_const_param(const char *s);
 
 #ifdef __cplusplus
 }

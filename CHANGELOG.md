@@ -2,6 +2,102 @@
 
 All notable changes to softlink are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+**Ground-truth harvest semantics (RFC-0003).** The harvester previously
+measured "does the binding compile at version v", not "is the declared C
+signature valid against v's headers" — two questions RFC-0002's gates
+deliberately decoupled, but only the second is what every manifest consumer
+(`checkSince`, `checkUntil`, `classifyAbsence`, runtime drift refusal)
+actually needs. Two independent gaps, both fixed:
+
+- **Gap A — gate-masking.** A probe translation unit carried the same
+  `#if (verifyWhen)` wraps as a user compile; at a version where the gate
+  evaluated false, the verification apparatus vanished under the
+  preprocessor, the probe compiled trivially, and the harvester recorded
+  `verified` at exactly the version the gate exists to protect against.
+  `--fast-path`'s whole-module stamp compounded this (one clean compile
+  stamped *every* symbol `verified`), and additionally masked removals
+  whose TU-presence a vendored `{.prototype.}` declaration propped up.
+  Fixed: harvest probe compiles now unconditionally defeat every
+  `since`/`until`/`verifyWhen` gate and every vendored prototype
+  declaration, on both the standard and fast paths (including
+  bisection-group compiles); a `header`+`prototype` proc is excluded from
+  the fast path's free "everyone verified" stamp, since a clean compile
+  carries no existence evidence for it.
+- **Gap B — parameter-only drift was unclassifiable.** The verify assert is
+  call-based and const-tolerant by design (#11), so it audits only the
+  return type; a parameter-only drift (e.g. `int*` -> `bool*`, same name
+  and return type) surfaced solely as the C compiler's own diagnostic — a
+  hard error on GCC 14+ (before softlink's own assert ever ran, so
+  classification fell through to `unknown`) or a mere warning on permissive
+  toolchains (assert passed, silently `verified`). Fixed: probe compiles
+  now pin `-Werror=incompatible-pointer-types`
+  (`-Werror=incompatible-function-pointer-types` added on the Clang CI
+  leg), and an isolated verify-probe failure with no other explanation now
+  classifies decisively as `mismatch` instead of falling through to
+  `unknown` — guarded by a retry-once (a transient failure must reproduce
+  deterministically before it's recorded) and a loud abort on recognized
+  infrastructure-failure output (an OOM-killed compiler or an ICE must
+  never become a poisoned fact).
+
+### Added
+
+- Calibration preflight gains a fourth known-answer symbol (parameter-only
+  pointer drift, expected `mismatch`) alongside the existing
+  verified/absent/mismatch trio, so a toolchain whose diagnostics pin is
+  absent, stripped, or ineffective now refuses to harvest at all
+  (`CalibrationRefusedError`, exit code 2) instead of silently reverting to
+  the pre-fix behavior. MSVC now refuses in every flag configuration this
+  project tests (previously only the default mode was known to refuse) —
+  `/we4133` is not accepted as a pin spelling, and calibration is what
+  catches the resulting gap rather than a manifest silently misclassifying.
+- `harvest.harvesterVersion` (manifest schema, optional field, schema
+  number unchanged at 1): the softlink package version that performed the
+  harvest, sourced from a new version-of-record const in `softlink/versions`
+  (not the harvest CLI's own independently-versioned nimble package).
+  `checkSince`/`checkUntil` prepend a short re-harvest note to a
+  contradiction message when the field is absent — a manifest committed
+  before this field existed embodies Gap A's/Gap B's corrupted facts and is
+  byte-indistinguishable from a fixed one, so the note is triggered by
+  absence of the field alone, never by a value comparison. A manifest
+  lacking the field otherwise attaches and behaves exactly as before.
+- Harvest README: a new "What a harvested fact means" section documenting
+  the ground-truth semantic, why gates/prototypes are defeated, the
+  feature-gate corpus-baseline note, the honest non-pointer-scalar-drift
+  residual gap, the hand-edit-the-manifest anti-pattern, and the MSVC
+  `/we4133` situation.
+
+### Changed
+
+- `checkUntil` rule (b′) — an `unknown` fact at or above a declared `until`
+  is itself a hard error — now fires less often: the case it exists to
+  catch, a real signature drift landing on `unknown` instead of `mismatch`,
+  is largely closed by the Gap B fix above, so that class of drift is now
+  caught decisively by rule (a)/(c) instead. `checkSince`'s symmetric
+  fkUnknown-decisiveness rule benefits identically.
+
+### Notes
+
+- **Migration — re-harvest before relying on the fix.** Re-run
+  `softlink_harvest` for any manifest whose binding has gated
+  (`since`/`until`/`verifyWhen`) or `prototype`+`header` symbols. An
+  un-re-harvested manifest continues to attach and behave exactly as
+  before — nothing breaks by deferring the re-harvest — but nothing gets
+  corrected either, and hand-editing the committed JSON instead of
+  re-harvesting is an anti-pattern (see the harvest README): it breaks
+  reproducibility against the next scheduled harvest.
+- **Re-harvesting may surface new drift refusals — this is correction, not
+  regression.** A symbol whose true drift was previously masked (`verified`
+  under Gap A) or unclassifiable (`unknown` under Gap B) may now record a
+  decisive `mismatch`/`absent` at a version your corpus already covers. A
+  build that previously compiled clean under `checkUntil`, or a runtime
+  load that previously dispatched a stale pointer without complaint, may
+  now refuse. That is the ground truth the harvester should have reported
+  all along, surfacing now rather than silently corrupting a manifest.
+
 ## [0.10.0] - 2026-07-22
 
 ### Added

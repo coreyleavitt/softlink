@@ -58,6 +58,42 @@ Key design decisions for `dyntype`:
 - **File-scope emit** required — wrapping in a `{.used.}` proc causes Nim's DCE to drop assertions entirely; `{.exportc.}` is used for `dynlib`'s function verification which needs proc scope for variable ordering
 - **sizeof-only** — catches the most dangerous bug class (allocation size mismatch). Field-level `offsetof` is a potential future enhancement.
 
+### Ground-truth harvest (RFC-0003)
+
+`tools/harvest/harvester.nim` + `src/softlink/verify.nim` define a
+harvested fact (`fkVerified`/`fkAbsent`/`fkMismatch`/`fkUnknown`) as ground
+truth about the installed header alone, independent of any
+`since`/`until`/`verifyWhen` gate or vendored `{.prototype.}` declaration
+the binding carries for its own user-compile/runtime-load purposes: harvest
+probe compiles unconditionally defeat all of that scaffolding
+(`softlinkProbeGroundTruth` + `softlinkHarvestSession` booldefines in
+`verify.nim`, legal only together; `effectiveVerifyWhen` is the single
+derivation point every gate-wrap site reads). This is not a flag/mode —
+there is no gate-respecting harvest semantic anywhere in the tree.
+Parameter-only drift (return type held fixed) now classifies decisively as
+`fkMismatch` instead of falling through to `fkUnknown`: probe compiles pin
+`-Werror=incompatible-pointer-types`
+(`-Werror=incompatible-function-pointer-types` added on the Clang CI leg),
+and `classify` treats an isolated verify-probe failure (existence green,
+verify red, no strict-unavailable needle) as decisive — guarded by a
+retry-once plus infra-marker loud abort so a transient toolchain failure
+(OOM, ICE) can never become a poisoned fact. Calibration's known-answer
+quad (`calib_verified`/`calib_absent`/`calib_mismatched`/
+`calib_param_drifted`) refuses the harvest (`CalibrationRefusedError`, exit
+2) if the parameter-drift pin lacks teeth on the caller's toolchain — MSVC
+refuses in every flag configuration this project tests; `/we4133` is not a
+supported pin spelling. `HarvestMeta.harvesterVersion` (sourced from a
+version-of-record const in `softlink/versions`, not the harvest CLI's own
+independently-versioned nimble package) stamps every harvest;
+`checkSince`/`checkUntil` prepend a re-harvest breadcrumb to a
+contradiction message when the field is absent from an older manifest
+(trigger = absence of the field alone, never a version comparison — a
+manifest lacking it still attaches and behaves identically otherwise).
+Non-pointer scalar parameter drift and variadic-ness changes remain an
+honest, documented residual gap: a valid implicit C conversion converts
+silently and is uncatchable without reversing the call-based assert's
+const-tolerance (issue #11), which is not on the table.
+
 ## Compact Instructions
 When compacting, preserve in the summary: the active RFC and its handoff-doc path, the current stage/round, slices done vs remaining, open forks awaiting me, and the exact resume command. After compacting, re-read the handoff doc and MEMORY.md before continuing.
 

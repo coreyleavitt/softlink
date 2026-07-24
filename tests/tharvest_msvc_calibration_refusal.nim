@@ -20,8 +20,9 @@
 ## (false `verified`) AND the known-absent fixture's existence reference
 ## never fires either (also false `verified`, not the `absent` a working
 ## existence probe would report). Either deviation alone is enough to trip
-## calibration; this fixture trio trips both, independently, so a real
-## regression in only one of the two constructs would still be caught.
+## calibration; this fixture (a quad as of RFC-0003 slice B3's
+## `calib_param_drifted`) trips both, independently, so a real regression
+## in only one of the two constructs would still be caught.
 ##
 ## Run ONLY by `task testMsvcExitCodes` (softlink.nimble) — see that task's
 ## own doc comment for why MSVC gets this narrower nimble-task surface

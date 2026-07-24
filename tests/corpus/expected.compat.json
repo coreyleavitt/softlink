@@ -38,6 +38,46 @@
         "verified": [{ "hi": "3.0.0" }],
         "unknown": [{ "lo": "3.0.0" }]
       }
+    },
+    "corpuslib_gated_until": {
+      "header": {
+        "verified": [{ "hi": "2.0.0" }],
+        "mismatch": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_gated_since": {
+      "header": {
+        "verified": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "absent": [{ "hi": "2.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_gated_crosscheck": {
+      "header": {
+        "verified": [{ "hi": "2.0.0" }],
+        "mismatch": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_param_drift": {
+      "header": {
+        "verified": [{ "hi": "2.0.0" }],
+        "mismatch": [{ "lo": "2.0.0", "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_const_return": {
+      "header": {
+        "verified": [{ "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
+    },
+    "corpuslib_const_param": {
+      "header": {
+        "verified": [{ "hi": "3.0.0" }],
+        "unknown": [{ "lo": "3.0.0" }]
+      }
     }
   }
 }

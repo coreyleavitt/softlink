@@ -21,6 +21,7 @@ you need more depth than "how do I use this."
 
 - [Producer side: `softlink_harvest`](#producer-side-softlink_harvest)
   - [What it does](#what-it-does)
+  - [What a harvested fact means](#what-a-harvested-fact-means)
   - [Classification table](#classification-table)
   - [Calibration preflight](#calibration-preflight)
   - [Fast path](#fast-path)
@@ -56,27 +57,157 @@ subdirectory, your fetch script should copy *that directory's contents*
 into `<corpusDir>/<version>/`, not preserve the `include/` wrapper —
 otherwise `#include "yourlib.h"` won't resolve against the snapshot.
 
+### What a harvested fact means
+
+Every fact this tool records — `verified`, `absent`, `mismatch`, `unknown`
+— is **ground truth about that version's installed headers**, independent
+of any compatibility scaffolding (`since`/`until`/`verifyWhen` gates,
+vendored `{.prototype.}` declarations) the binding itself carries so that
+*user compiles and runtime loads* work across versions (RFC-0003 §2). This
+is not a mode and there is no flag to select it: every probe compile this
+tool issues defeats the gates and prototype declarations it would otherwise
+respect. `verified` means the header, read alone, matches the declared C
+signature — not "your binding, with its particular gates, happened to
+build."
+
+**Why gates and prototypes are defeated (the bug this closes).** Before
+RFC-0003, a probe TU carried the same `#if (verifyWhen)` wraps a user
+compile does. At a version where the gate evaluates false, the whole
+verification apparatus vanished under the preprocessor, the probe compiled
+trivially, and the harvester recorded `verified` at exactly the version the
+gate exists to protect against — the gate that makes user compiles safe was
+precisely what made the corpus fact for that version worthless. A vendored
+`{.prototype.}` declaration has the same failure shape for removals: a
+`prototype`+`header` proc's TU-presence survives a header dropping the
+symbol, so a naive probe never notices it's gone. Defeating both,
+unconditionally, is what makes a harvested fact trustworthy standalone — you
+can hand a `.compat.json` to `checkUntil` without also auditing which gates
+happened to be open when it was produced.
+
+**Feature-gated symbols are a corpus-baseline concern, not a pragma
+question.** A hand-written `{.verifyWhen.}` might guard a library version,
+or it might guard a compile-time feature flag (`#if defined
+(MBEDTLS_SSL_PROTO_TLS1_3)`); softlink can't tell these apart mechanically,
+and there is no sound way to defeat only the "version" ones. Ground truth
+therefore defeats **all** gates uniformly. If a symbol is genuinely
+feature-gated, the fix is on the corpus side: your harvest baseline build
+must enable the feature the same way your real deployment does (RFC-0001's
+baseline-build contract already covers this). With the feature off,
+`absent` at that version is simply true of those headers as configured. A
+symbol that must never be corpus-audited at all already has its own
+pragma: `{.noverify.}`.
+
+**The honest residual: non-pointer scalar drift.** The verify assert stays
+call-based and const-tolerant (issue #11's founding decision) rather than
+comparing full function-pointer types, so a parameter drift that is a
+*valid implicit C conversion* — `int` widening to `long`, an enum growing a
+member — converts silently and is never caught, on any toolchain, by
+construction. A variadic-ness change is the same story. Closing this would
+require the full-type assert the design explicitly rejects (it would
+false-mismatch every `cstring`-vs-`const char *` binding — issue #11 again).
+If your binding has a parameter shape like this, `{.until.}` still gets you
+*declared* protection: `checkUntil` cross-checks a bound you assert, it just
+can't discover that bound for you the way it now does for pointer-shaped
+drift.
+
+**Do not hand-edit a committed manifest.** When a harvest run looks wrong,
+it's tempting to patch the JSON directly. The nim-z3 workstream that
+produced RFC-0003 considered and rejected this: a hand edit is invisible to
+`git diff` against the next real harvest, so it either silently reverts on
+the next scheduled regeneration or silently diverges from what a fresh
+harvest would actually find — either way defeating the point of the living
+CI guard below. If a fact looks wrong, fix it upstream of the manifest (the
+corpus, the calibration, or the binding's own gate) and re-harvest.
+
+**The living CI guard.** A committed manifest, kept honest by the two fixes
+above, is exactly what [`ci-template.yaml`](#the-b6-ci-template) turns into
+a standing regression test: regenerate on a schedule, `git diff --exit-code`
+against the committed copy, fail the job on any difference. A new drift at
+a version the corpus didn't previously flag now shows up as a decisive
+`mismatch`/`absent`, not a silent `unknown` a human has to notice by hand.
+
+**`checkUntil` rule (b′) fires less often now.** Rule (b′) — an `unknown`
+fact at or above a declared `until` is itself a hard error, because it's
+neither confirmation nor contradiction — exists specifically because
+parameter-only drift used to be *unclassifiable*: the harvester couldn't
+decide `mismatch` for it, so the honest fallback was `unknown`, and rule
+(b′) is what stopped that non-answer from silently passing as a confirmed
+bound. RFC-0003's parameter-drift fix means the case rule (b′) was written
+for — a real signature drift landing on `unknown` instead of `mismatch` —
+now correctly lands on `mismatch` and is caught by rule (a)/(c) directly.
+Rule (b′) still exists and still fires (a broken baseline build at the
+corpus tip still yields `unknown` for everything), just for a narrower set
+of cases than before this fix.
+
+**`since` and `until` compose on one proc.** The harvester's gate-defeat
+doesn't care which pragma produced a proc's gate string — it's an opaque C
+predicate either way — so a proc carrying both a `since` and an `until`
+(bounding a window on both sides) defeats correctly and classifies exactly
+like a one-sided bound would. RFC-0003 slice C1 proves this end to end
+against a real corpus.
+
+**MSVC.** `/we4133` (escalating the pointer-parameter-mismatch warning to an
+error) is not accepted as a pin spelling the way `-Werror=...` is for
+GCC/Clang — nothing in this tool auto-detects or special-cases it. That's
+fine in practice: the calibration preflight already refuses to harvest
+under MSVC in every flag configuration this project tests, because the
+fourth calibration symbol (parameter-only drift) requires a live,
+teeth-having verification tier, and MSVC's default mode either has no tier
+(the `_Generic` fallback) or a tier that doesn't escalate C4133. That's a
+*principled* refusal (exit code 2, no manifest written) — never a silently
+wrong fact — not a gap you need to work around. A caller could in
+principle restore MSVC teeth by supplying `/we4133` in their own extra
+flags; this is unsupported and untested, but calibration will tell you
+immediately whether it worked.
+
 ### Classification table
 
 For each `(version, symbol)` pair, up to three real `nim c --noLinking`
 compiles run, each with the corpus version's headers shadowing any
 system-installed copy (`-I <corpusDir>/<version>` prepended) plus
 `-Werror=implicit-function-declaration` (an absent symbol must be a hard
-compile error, never a warning a lenient toolchain shrugs off):
+compile error, never a warning a lenient toolchain shrugs off),
+`-Werror=incompatible-pointer-types` (RFC-0003 §5.2(i): a pointer-parameter
+drift must be a hard verify failure on every GCC/Clang version, not just
+GCC≥14's own default — this is what makes parameter-only drift decisively
+`mismatch`; the clang CI leg's `clangHarvestOptions()` additionally pins
+Clang's separate `-Werror=incompatible-function-pointer-types`) and
+`-d:softlinkStrictVerify` (RFC-0003 §5.2(iii): turns an otherwise-silent
+"verification unsupported on this compiler/mode" no-op into a hard compile
+failure the harvester can recognize, so a degraded toolchain is loud
+instead of a silent hole):
 
 | baseline (`ProbeOnly=-`) | existence probe | verify (full assert) | classification |
 |---|---|---|---|
 | fail | — | — | `unknown` — this version's headers are broken/missing for this module |
 | ok | fail | — | `absent` — the header doesn't declare the symbol at all |
 | ok | ok | ok | `verified` — the pinned Nim signature matches |
-| ok | ok | fail, softlink's own assert text present | `mismatch` — a real signature drift |
-| ok | ok | fail, softlink's assert text ABSENT | `unknown` — some other compile failure, not evidence of a signature mismatch |
+| ok | ok | fail, deterministic (reproduced on a retry), verification tier available | `mismatch` — a real signature drift |
+| ok | ok | fail, but the strict-mode needle shows this compile's verification tier was structurally unavailable, OR the failure did not reproduce on retry (flaky) | `unknown` — no trustworthy signature evidence either way |
 
-Every step is structural (compiles either succeed or fail) — the *only*
-place any compiler output is textually inspected is confirming softlink's
-own fixed `"... signature mismatch vs ..."` assert message appears, and
-only as a second opinion on a `verify`-stage failure the pipeline has
-already structurally identified.
+A `verify`-stage failure is never recorded on the strength of a single
+compile (RFC-0003 §5.2(ii), "decisive requires deterministic" — a
+corpus×symbol harvest is thousands of subprocess invocations, and a
+transient failure — an OOM-killed `cc1`, a compiler crash — must never be
+misread as a signature fact): a failing verify probe is retried once
+before its failure is recorded, and output matching a known
+infrastructure-failure shape (an internal compiler error, a
+signal-terminated compiler process) aborts the entire harvest with no
+manifest written at all, rather than ever recording a poisoned fact.
+
+Every structural step (compiles either succeed or fail) is complemented by
+a SMALL, fixed set of textual checks on a `verify`-stage failure's
+output — never a substitute for the structural decision, only refinements
+of it once a failure has already been structurally identified: confirming
+softlink's own fixed `"... signature mismatch vs ..."` assert message
+(confirming evidence for `mismatch`, not required for it — RFC-0003 §5.2(ii)
+narrowed the older design, where its absence alone forced `unknown`);
+recognizing the strict-mode `"...signature verification unavailable
+here..."` needle (this compile's verification tier could not run at all);
+and recognizing known infrastructure-failure shapes (the loud-abort guard
+above). Older revisions of this document claimed assert-message
+confirmation was the *only* place compiler output is ever inspected — that
+claim predates RFC-0003 and is corrected here.
 
 A proc whose only declaration source is `{.prototype.}` (no `{.header.}`)
 verifies against a vendored, corpus-**invariant** declaration — there is
@@ -88,15 +219,24 @@ skipped for the identical reason.
 ### Calibration preflight
 
 Before touching your real corpus, the harvester compiles a small, built-in
-known-answer trio (one symbol that should classify `verified`, one
-`absent`, one `mismatch`) through the *identical* pipeline. If even one of
-the three doesn't come out as expected, the run **aborts with no manifest
-written** and a toolchain diagnosis — the structural guard against a
-degraded verification tier (default-mode MSVC's no-op `_Generic`/`__typeof__`
-fallback silently "verifies" everything, unconditionally) or a
-misconfigured toolchain (implicit-declaration-as-warning instead of
-error) poisoning a manifest with false `verified` facts. This is exit code
-2 (see [below](#drift-alarm-and-exit-codes)).
+known-answer quad (one symbol that should classify `verified`, one
+`absent`, one `mismatch` via return-type drift, one `mismatch` via
+parameter-only pointer drift) through the *identical* pipeline. If even one
+of the four doesn't come out as expected, the run **aborts with no
+manifest written** and a toolchain diagnosis — the structural guard against
+a degraded verification tier (default-mode MSVC's no-op
+`_Generic`/`__typeof__` fallback silently "verifies" everything,
+unconditionally), a misconfigured toolchain (implicit-declaration-as-warning
+instead of error), or a diagnostics-severity pin
+(`-Werror=incompatible-pointer-types`) that's absent, stripped, or
+ineffective for parameter-only pointer drift — poisoning a manifest with
+false `verified` facts. The fourth symbol also proves this last case is not
+merely theoretical: MSVC under `/std:clatest` treats pointer-parameter
+mismatch as a warning by default and understands none of the GCC/Clang
+`-Werror=` spellings, so calibration refuses there too — MSVC harvest
+refuses in every flag configuration this project ships an opts literal
+for, never silently misclassifying. This is exit code 2 (see
+[below](#drift-alarm-and-exit-codes)).
 
 ### Fast path
 
@@ -130,7 +270,7 @@ whole point is catching drift in CI, before any process loads anything:
 |---|---|
 | `0` | ok — manifest written, no `mismatch` inside the support range |
 | `1` | **drift alarm** — at least one symbol has a `mismatch` classification inside the (optionally `--support-range`-narrowed) claimed support range |
-| `2` | **calibration refused** — the toolchain failed the built-in preflight trio; **no manifest was written** |
+| `2` | **calibration refused** — the toolchain failed the built-in preflight quad; **no manifest was written** |
 | `3` | **usage/input error** — bad flags, missing dump/corpus, malformed manifest inputs |
 
 When the drift alarm trips, the diagnosis names *every* offending symbol
@@ -154,7 +294,8 @@ harvest is, by default, a version you're claiming to support.
   "schema": 1,
   "lib": "z3",
   "harvest": { "toolchain": "gcc 14.2", "tier": "builtin-compat",
-               "abi": "linux-lp64", "date": "2026-07-15" },
+               "abi": "linux-lp64", "date": "2026-07-15",
+               "harvesterVersion": "0.10.0" },
   "corpus": [{ "version": "4.15.0", "source": "git:z3prover/z3@<sha>" }],
   "symbols": {
     "Z3_replace_re_all": { "header": { "absent":   [{ "hi": "4.15.8" }],
@@ -162,6 +303,15 @@ harvest is, by default, a version you're claiming to support.
   }
 }
 ```
+
+- `harvest.harvesterVersion` (RFC-0003 §2, slice C1) is the softlink
+  package version that performed the harvest — provenance metadata, not a
+  behavior switch. OPTIONAL: a manifest committed before this field
+  existed simply omits it and continues to attach and behave identically;
+  `checkSince`/`checkUntil` prepend a short re-harvest note to a
+  contradiction message when it's absent (absence of the field is the
+  sole trigger — nothing compares its value). This tool always stamps it
+  going forward.
 
 - Intervals are half-open (`lo` inclusive, `hi` exclusive); either bound
   omitted means unbounded in that direction. Omitting both means "every
@@ -217,8 +367,8 @@ Flags:
 | `--fast-path` | off | try a define-free whole-module compile per version first ([Fast path](#fast-path)) |
 | `--support-range:<lo>..<hi>` | entire corpus | narrow the drift alarm's window; either bound omissible |
 | `--nim-path:<p>` (repeatable) | *none* | extra `--path:` entries for probe compiles — see [below](#package-layout--local-dependency-resolution) for why the default is empty, not `src` |
-| `--extra-flag:<f>` (repeatable) | `--passC:-Werror=implicit-function-declaration` | extra raw `nim c` flag for every probe compile; **appends** to the default unless `--no-default-flags` is also given |
-| `--no-default-flags` | off | drop the built-in default extra flag; only explicit `--extra-flag` values (if any) apply |
+| `--extra-flag:<f>` (repeatable) | `--passC:-Werror=implicit-function-declaration`, `--passC:-Werror=incompatible-pointer-types` | extra raw `nim c` flag for every probe compile; **appends** to the defaults unless `--no-default-flags` is also given. The harvest-reserved defines (`softlinkStrictVerify`, `softlinkProbeGroundTruth`, `softlinkHarvestSession`, `softlinkProbeOnly`, `softlinkProbeExistence`) cannot be set this way — any spelling of `-d`/`--define` naming one of them, under the same case/underscore-insensitive switch and identifier rules the real `nim` CLI itself accepts (e.g. `-D:`, `--Define=`, `--de_fine:softlink_probe_ground_truth=false`), is refused with a hard error (exit 3); they are harvest-session invariants the harvester itself controls on every probe compile |
+| `--no-default-flags` | off | drop the built-in default extra flags; only explicit `--extra-flag` values (if any) apply |
 | `--include-prefix:<p>` | `-I` | include-dir flag spelling for the target C toolchain (`/I` for MSVC) |
 | `--help` | — | usage text, exit 0 |
 
