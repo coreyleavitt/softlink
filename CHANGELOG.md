@@ -2,7 +2,7 @@
 
 All notable changes to softlink are documented here.
 
-## [Unreleased]
+## [0.11.0] - 2026-07-24
 
 ### Fixed
 
