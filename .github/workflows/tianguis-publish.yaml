@@ -1,0 +1,92 @@
+name: tianguis-publish
+
+# Publishes softlink to the tianguis Nim package registry.
+#
+# TWO ways to fire:
+#   1. workflow_dispatch (manual, from the Actions tab) — pick a `ref`
+#      (tag or SHA) to publish. Use this for the first smoke test and for
+#      re-publishing an existing tag. The job checks out that exact ref, so
+#      `milpa publish` packs the TAGGED tree, not the branch HEAD.
+#   2. push of a "v*" tag — fires automatically ONLY when the tag is pushed
+#      with a real credential (a human `git push --tags`, or a PAT-based
+#      workflow). NOTE: release.yaml creates its tag/release via
+#      `gh release create` with the default GITHUB_TOKEN, and GitHub's
+#      loop-prevention means a GITHUB_TOKEN-created ref does NOT trigger
+#      further workflows — so a release.yaml run will NOT auto-chain here.
+#      Trigger this workflow manually (option 1) after a release.yaml bump,
+#      or push the tag by hand.
+#
+# Runs the composite action in softlink's OWN job (not a reusable-workflow
+# `uses:` at the jobs: level) — required by tianguis's trust model: a
+# composite action executes inside the calling job, so cosign's Fulcio cert
+# SAN and the sigstore attestation signature are both stamped with
+# softlink's own per-repo GitHub Actions identity, not a shared one. See
+# coreyleavitt/tianguis's .github/actions/publish/action.yaml header for the
+# full rationale + docs/adoption/github.md for the author-facing copy-paste.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or SHA to publish (e.g. v0.11.0) — checked out and packed."
+        required: true
+        default: "v0.11.0"
+      dry-run:
+        description: "Smoke test: still packs+pushes+signs the OCI artifact, but dispatch skips committing an index entry."
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # cosign keyless signing + this action's own
+                        # sigstore-python attestation signing + the
+                        # dispatch-endpoint bearer token — all three derive
+                        # their identity from THIS job because the publish
+                        # action is a composite action, not a reusable
+                        # workflow.
+      contents: read    # actions/checkout below
+      packages: write   # push the OCI artifact to GHCR
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # On workflow_dispatch, check out the chosen ref (so the TAGGED
+          # tree is published, not the default branch); on a tag push,
+          # github.ref already points at the tag.
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: coreyleavitt/tianguis/.github/actions/publish@main
+        with:
+          # softlink has no milpa.kdl at its repo root at v0.11.0, so
+          # `milpa publish` can't auto-derive --name from the published
+          # tree (see resolve_publish_name in milpa's publishing.py) —
+          # pass it explicitly.
+          name: softlink
+          # The version passed to `milpa publish --version`. On a tag push
+          # this is the tag (github.ref_name, e.g. "v0.11.0"); on manual
+          # dispatch it's the chosen ref. milpa accepts a leading "v" and
+          # enforces that a <version>/v<version> git tag points at HEAD.
+          version: ${{ github.event.inputs.ref || github.ref_name }}
+          # target: defaults to ghcr.io/coreyleavitt/softlink (derived from
+          # github.repository, lowercased) — no override needed.
+          #
+          # While milpa is still private, the composite action needs read
+          # access to clone/install it. Add MILPA_GIT_READ_PAT as a repo
+          # secret (a fine-grained PAT scoped read-only on
+          # coreyleavitt/milpa) before the first run. Remove once milpa is
+          # public.
+          milpa-git-read-pat: ${{ secrets.MILPA_GIT_READ_PAT }}
+          # dispatch dry_run: true on manual smoke (default above), false on
+          # a real tag push.
+          dry-run: ${{ github.event.inputs.dry-run || 'false' }}
+
+    # IMPORTANT (one-time, manual, GitHub package settings UI): a newly
+    # created GHCR package defaults to PRIVATE. After the FIRST successful
+    # publish, set it Public at
+    # https://github.com/users/coreyleavitt/packages/container/softlink/settings
+    # — otherwise milpa's unauthenticated `oras pull` on the CONSUMER side
+    # (anyone installing softlink via tianguis) can't fetch it.
