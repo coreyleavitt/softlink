@@ -93,6 +93,15 @@ jobs:
           # Update version in nimble file.
           sed -i "0,/^version .*/s//version       = \"$VERSION\"/" softlink.nimble
 
+          # Update the version-of-record const in lockstep (RFC-0003 C1):
+          # `checkVersionOfRecordPin()` runs first in `nimble test` and fails
+          # the Test job below if softlink.nimble and softlink/versions drift
+          # — bumping only the nimble file here is exactly the careless bump
+          # that pin polices.
+          sed -i "s/^const softlinkVersion\* = \".*\"/const softlinkVersion* = \"$VERSION\"/" src/softlink/versions.nim
+          grep -q "const softlinkVersion\* = \"$VERSION\"" src/softlink/versions.nim || {
+            echo "::error::failed to stamp src/softlink/versions.nim"; exit 1; }
+
           # Commit via GitHub API (signed).
           make_blob() {
             base64 -w 0 "$1" | jq -Rs '{content: ., encoding: "base64"}' | \
@@ -100,13 +109,16 @@ jobs:
           }
 
           NIMBLE_BLOB=$(make_blob softlink.nimble)
+          VERSIONS_BLOB=$(make_blob src/softlink/versions.nim)
 
           TREE_SHA=$(gh api repos/${{ github.repository }}/git/trees \
             --input <(jq -n \
               --arg base "${{ github.sha }}" \
               --arg nimble "$NIMBLE_BLOB" \
+              --arg versions "$VERSIONS_BLOB" \
               '{base_tree: $base, tree: [
-                {path: "softlink.nimble", mode: "100644", type: "blob", sha: $nimble}
+                {path: "softlink.nimble", mode: "100644", type: "blob", sha: $nimble},
+                {path: "src/softlink/versions.nim", mode: "100644", type: "blob", sha: $versions}
               ]}') \
             --jq '.sha')
 
