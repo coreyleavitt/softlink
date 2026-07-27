@@ -1801,6 +1801,65 @@ suite "softlink/manifest — checkUntil (RFC-0002 §4.2, slice B1)":
     let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
     check not checkUntil(m, "corpuslib_early_unknown", "", "3.0.0").contradicted
 
+# Check 7 bound-covered mismatch fix (nim-z3 report, softlink-mismatch-
+# warning-issue.md; CHECK7-WARNING.handoff.md): `mismatchCoveredByUntil` is
+# the pure predicate Check 7 (`src/softlink/directives.nim`) partitions
+# `mismatchedSymbols` on — true iff the symbol's recorded drift is fully
+# explained by a declared `{.until.}` bound (every `fkMismatch` interval
+# lies at-or-above `until`), so the compile-time diagnostic can downgrade
+# that case from a WARNING to a HINT. Hand-built manifests via a local
+# `mkManifest`, same convention as the `checkUntil` suite above
+# (`harvesterVersion` stamped so these tests exercise the predicate alone,
+# unperturbed by the ground-truth breadcrumb).
+suite "softlink/manifest — mismatchCoveredByUntil (Check 7 bound-covered mismatch fix)":
+  proc mkManifest(corpus: seq[string], sf: SymbolFacts): CompatManifest =
+    CompatManifest(schema: 1, lib: "testlib", abi: "linux-lp64",
+                    harvesterVersion: "0.10.0",
+                    corpus: corpus, symbols: @[sf])
+
+  test "mismatchCoveredByUntil: mismatch at-or-above until -> true (tracer bullet)":
+    var sf = SymbolFacts(cname: "Z3_fpa_get_numeral_sign")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "4.16.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "4.16.0", hi: "")
+    let m = mkManifest(@["4.10.0", "4.16.0", "4.18.0"], sf)
+    check mismatchCoveredByUntil(m, "Z3_fpa_get_numeral_sign", "4.16.0")
+
+  test "mismatchCoveredByUntil: until empty (unbounded symbol) -> false":
+    var sf = SymbolFacts(cname: "testlib_noop")
+    sf.header[fkMismatch].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    check not mismatchCoveredByUntil(m, "testlib_noop", "")
+
+  test "mismatchCoveredByUntil: a mismatch interval starting BELOW until -> false (straddle)":
+    var sf = SymbolFacts(cname: "corpuslib_straddle")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "1.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "1.0.0", hi: "2.0.0")
+    sf.header[fkVerified].add VersionInterval(lo: "2.0.0", hi: "3.0.0")
+    sf.header[fkMismatch].add VersionInterval(lo: "3.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0", "3.0.0"], sf)
+    # Both mismatch intervals must be at-or-above "3.0.0" to be covered by
+    # `until: "3.0.0"` -- the [1.0.0, 2.0.0) one is below it, so this is a
+    # straddling/uncovered mismatch even though the trailing one qualifies.
+    check not mismatchCoveredByUntil(m, "corpuslib_straddle", "3.0.0")
+
+  test "mismatchCoveredByUntil: mismatch interval open at -infinity (lo == \"\") -> false":
+    var sf = SymbolFacts(cname: "corpuslib_open_lo")
+    sf.header[fkMismatch].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    check not mismatchCoveredByUntil(m, "corpuslib_open_lo", "1.0.0")
+
+  test "mismatchCoveredByUntil: symbol not found in manifest -> false":
+    var sf = SymbolFacts(cname: "some_other_symbol")
+    sf.header[fkMismatch].add VersionInterval(lo: "1.0.0", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    check not mismatchCoveredByUntil(m, "not_in_manifest", "1.0.0")
+
+  test "mismatchCoveredByUntil: symbol has no mismatch interval at all -> false":
+    var sf = SymbolFacts(cname: "corpuslib_clean")
+    sf.header[fkVerified].add VersionInterval(lo: "", hi: "")
+    let m = mkManifest(@["1.0.0", "2.0.0"], sf)
+    check not mismatchCoveredByUntil(m, "corpuslib_clean", "5.0.0")
+
 # RFC-0003 §2/§7 slice C1: `parseManifest`'s new OPTIONAL `harvest.
 # harvesterVersion` field, and the `checkSince`/`checkUntil` ground-truth
 # breadcrumb its absence triggers. Pure-function level (no macro, no real

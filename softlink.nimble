@@ -1631,7 +1631,8 @@ task test, "Run tests":
   const manifestTmplBases = ["testlib", "testlib_schema2", "testlib_wronglib",
     "testlib_overlap", "testlib_gap", "testlib_since", "testlib_vp_subset",
     "testlib_vp_since", "testlib_abi_mismatch", "testlib_until",
-    "testlib_until_unknown", "testlib_until_unknown_stamped"]
+    "testlib_until_unknown", "testlib_until_unknown_stamped",
+    "testlib_until_covered"]
 
   proc runManifestChecks() =
     const mdir = "tests/manifests/"
@@ -1786,6 +1787,55 @@ task test, "Run tests":
 
     expectManifestCompileOk(mcBase & "tests/tcheck_manifest_mismatch_warning.nim",
       ["recorded a 'mismatch' interval"], [])
+
+    # Check 7 bound-covered mismatch fix (nim-z3 report softlink-mismatch-
+    # warning-issue.md; CHECK7-WARNING.handoff.md): a mismatch fully
+    # explained by a declared, checkUntil-validated `{.until.}` bound must
+    # downgrade to a HINT ("bound-covered mismatch"), NOT the unbounded-
+    # drift warning above — `tests/manifests/testlib_until_covered.
+    # compat.json` records `testlib_add` as verified below / mismatch at-
+    # or-above its declared `until: "2.0.0"`.
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_mismatch_covered.nim",
+      ["bound-covered mismatch"], ["recorded a 'mismatch' interval"])
+    expectDiag(mcBase & "tests/tcheck_manifest_mismatch_covered.nim",
+      "bound-covered mismatch hint (default)", "bound-covered mismatch", "Hint:")
+    # Same strict-audit escalation convention Check 8's not-in-manifest
+    # hint already uses (`-d:softlinkStrictVerify` above).
+    expectDiag(mcBase & "-d:softlinkStrictVerify tests/tcheck_manifest_mismatch_covered.nim",
+      "bound-covered mismatch warning (strict)", "bound-covered mismatch", "Warning:")
+
+    # Partition proof: one covered (`testlib_add`, until-bounded) and one
+    # uncovered (`testlib_noop`, unbounded) mismatched symbol in the SAME
+    # directive — the warning must name only the uncovered symbol, the
+    # hint only the covered one.
+    expectManifestCompileOk(mcBase & "tests/tcheck_manifest_mismatch_mixed.nim",
+      ["recorded a 'mismatch' interval: testlib_noop",
+       "bound-covered mismatch", "testlib_add"], [])
+    # Line-scoped partition proof: each diagnostic is one compiler output
+    # line (softlink's `warning`/`hint` calls never embed a literal
+    # newline in these messages) — split the captured output on newlines
+    # and, per needle, isolate the ONE line containing it, then assert the
+    # OTHER symbol's name is absent from that specific line. This is
+    # strictly stronger than `expectManifestCompileOk`'s whole-output
+    # `mustContain`/`mustNotContain` (which can't distinguish "present
+    # somewhere" from "present in the wrong diagnostic").
+    let mixedOutput = runCapture(mcBase & "tests/tcheck_manifest_mismatch_mixed.nim")
+    var warningLine, hintLine = ""
+    for ln in mixedOutput.splitLines():
+      if "recorded a 'mismatch' interval" in ln: warningLine = ln
+      if "bound-covered mismatch" in ln: hintLine = ln
+    if warningLine.len == 0 or hintLine.len == 0:
+      echo mixedOutput
+      quit("softlink: partition proof: expected both a warning line and a " &
+           "hint line in tcheck_manifest_mismatch_mixed.nim's output")
+    if "testlib_add" in warningLine:
+      echo mixedOutput
+      quit("softlink: partition proof: the WARNING line named the covered " &
+           "symbol 'testlib_add' — it must name only the uncovered one")
+    if "testlib_noop" in hintLine:
+      echo mixedOutput
+      quit("softlink: partition proof: the HINT line named the uncovered " &
+           "symbol 'testlib_noop' — it must name only the covered one")
 
     # RFC-0001 §9/§C.1/§C.4b: the version-probe static drift-call scan —
     # a probe directly calling a wrapper whose symbol carries any

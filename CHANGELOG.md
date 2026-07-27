@@ -2,6 +2,27 @@
 
 All notable changes to softlink are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+**Bound-covered mismatches no longer warn on every consumer build**
+(diagnostic severity only — no fact, check, or refusal behavior changed).
+`compatManifest`'s mismatch warning (Check 7) used to fire for *any*
+recorded `mismatch` interval, including one fully explained by a declared
+`{.until.}` bound the until-contradiction check had already validated on
+the same pass — punishing exactly the RFC-0002/RFC-0003 blessed path
+(declare the bound, commit the ground-truth manifest) with a spurious
+warning on every downstream compile (reported by nim-z3 for
+`Z3_fpa_get_numeral_sign`). The mismatched set is now partitioned: a
+mismatch with no declared bound explaining it keeps the warning, text
+unchanged; a bound-covered mismatch (every `mismatch` interval at or above
+the declared `until` — `mismatchCoveredByUntil`, the new pure predicate in
+`softlink/manifest`) emits a distinct "bound-covered mismatch (expected;
+declared {.until.})" hint instead, escalated to a warning under
+`-d:softlinkStrictVerify` (the same audit-mode convention as the
+not-in-manifest hint). Unbounded drift still warns loudly.
+
 ## [0.11.0] - 2026-07-24
 
 ### Fixed

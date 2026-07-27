@@ -326,7 +326,10 @@ symbol per version, whether it was verified, absent, mismatched, or
 unclassifiable — then a `compatManifest` directive attaches the result to
 your `dynlib`/`verifyProcs` block for compile-time drift checks (a
 contradicted `{.since.}` or `{.until.}` claim is a hard error; a recorded
-`mismatch` warns; a bound symbol missing from the manifest hints).
+`mismatch` with no declared bound explaining it warns, while a mismatch
+fully covered by a declared `{.until.}` bound only hints — expected drift,
+the mechanism working as designed; a bound symbol missing from the
+manifest hints).
 
 The one-screen happy path:
 
@@ -471,7 +474,9 @@ invalid, and refusal follows the declaration even off-corpus — see
   Nothing gets refused: drifted-on-paper symbols stay resolved and
   callable, and `fooCompat()` reports them as present (there's no
   "resolved but drifted" entry to serve). Drift visibility stays at
-  compile time, where the manifest's recorded `mismatch` already warns.
+  compile time, where the manifest's recorded `mismatch` already warns
+  (or, for a mismatch fully covered by a declared `{.until.}` bound,
+  hints).
 - **Downstream consumer** (can't edit the binding's source; needs an
   override for a vendor rebuild under an old version string):
   `-d:softlinkNoDriftRefusal` — build-wide, wins over every block's own

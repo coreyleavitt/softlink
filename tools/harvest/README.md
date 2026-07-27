@@ -516,7 +516,9 @@ runtime footprint to refuse.
 argument on `dynlib` blocks (`compatManifest("z3.compat.json", refuse = false)`),
 scoping the per-block drift-refusal escape hatch: with a `versionProbe`
 also on the block, `refuse = false` disables drift refusal — no symbol is
-ever refused; the recorded `mismatch` still warns at compile time (above).
+ever refused; the recorded `mismatch` still surfaces at compile time
+(above): a warning when no declared bound explains it, a hint when it is
+bound-covered.
 See the runtime half of this feature —
 `versionProbe`, `fooCompat()`/`CompatReport`, and drift refusal itself —
 in the main **[README](../../README.md#runtime-versionprobe-foocompat-and-drift-refusal)**.
@@ -552,9 +554,15 @@ With a manifest attached, at compile time:
 - **Disjoint/exhaustive validation.** Every symbol/version pair must land
   in exactly one of the four fact buckets; a hand-merge that leaves a gap
   or an overlap is a compile error naming the symbol and version.
-- **Mismatch warning.** Any bound symbol with a recorded `mismatch`
-  interval anywhere gets a compile-time warning pointing at
-  `softlink harvest`/the drift alarm.
+- **Mismatch warning.** A bound symbol with a recorded `mismatch`
+  interval that no declared bound explains gets a compile-time warning
+  pointing at `softlink harvest`/the drift alarm. A mismatch fully
+  covered by a declared `{.until.}` bound (every mismatch interval at or
+  above the bound — the RFC-0002 blessed path, already validated by the
+  until-contradiction check) is downgraded to a "bound-covered mismatch"
+  hint instead, escalated back to a warning under
+  `-d:softlinkStrictVerify` for harvest audits — expected drift must not
+  cry wolf on every consumer build.
 - **Not-in-manifest hint.** Bound symbols absent from the manifest
   entirely produce a hint ("N symbols not in compat manifest — regenerate
   with softlink harvest") — a stale manifest stays visible instead of

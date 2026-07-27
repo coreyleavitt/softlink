@@ -461,15 +461,62 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   for p in procs:
     if isCorpusTrackable(p.noVerify, p.headerFile.len > 0): trackable.add p.nameStr
 
-  # Check 7: mismatch warning.
+  # Check 7: mismatch warning. Partitioned per the nim-z3 report
+  # (softlink-mismatch-warning-issue.md) / CHECK7-WARNING.handoff.md: a
+  # symbol's recorded `mismatch` interval is either UNCOVERED (no declared
+  # bound explains it — genuine unexpected drift, keep the WARNING, text
+  # UNCHANGED so the existing nimble grep pins for the unbounded fixture
+  # stay valid) or bound-COVERED (`mismatchCoveredByUntil`, softlink/
+  # manifest — every mismatch interval lies at-or-above a declared
+  # `{.until.}`, downgraded to a HINT: expected, not a surprise).
+  #
+  # `covered` can ONLY mean "declares `until`, and the bound is consistent"
+  # — no other shape reaches here. Every symbol Check 6 (checkSince) and
+  # Check 6b (checkUntil) validated above already hard-`error`ed out of
+  # expansion if its bound were inconsistent with the manifest: checkSince
+  # rule (b) hard-errors a `verified`/`mismatch` fact BELOW a declared
+  # `since` (so a `since`-only symbol's mismatch, if any, is never below
+  # its own lower bound — but `since` alone says nothing about an UPPER
+  # bound, so a since-only mismatch is never "covered", only ever
+  # uncovered/genuine drift), and checkUntil rule (a) hard-errors a
+  # `mismatch` fact INSIDE the declared `[since|-∞, until)` window. A
+  # symbol that both declares `until` and survives to this point therefore
+  # has every mismatch interval at-or-above that `until` by construction —
+  # `mismatchCoveredByUntil` re-derives this from the manifest data
+  # directly (invariant-independent: it doesn't merely trust the check
+  # ordering above) rather than assuming it.
   let mismatched = mismatchedSymbols(m, trackable)
-  if mismatched.len > 0:
+  var uncoveredMismatch, coveredMismatch: seq[string] = @[]
+  for name in mismatched:
+    var untilForName = ""
+    for p in procs:
+      if p.nameStr == name:
+        untilForName = p.untilVersion
+        break
+    if mismatchCoveredByUntil(m, name, untilForName):
+      coveredMismatch.add name
+    else:
+      uncoveredMismatch.add name
+
+  if uncoveredMismatch.len > 0:
     warning("softlink: " & macroName & ": compat manifest " & absPath &
-            ": " & $mismatched.len & " symbol" &
-            (if mismatched.len != 1: "s" else: "") &
-            " recorded a 'mismatch' interval: " & mismatched.join(", ") &
+            ": " & $uncoveredMismatch.len & " symbol" &
+            (if uncoveredMismatch.len != 1: "s" else: "") &
+            " recorded a 'mismatch' interval: " & uncoveredMismatch.join(", ") &
             " — see the drift alarm / softlink harvest for details",
             directive.node)
+
+  if coveredMismatch.len > 0:
+    let coveredMsg = "softlink: " & macroName & ": compat manifest " & absPath &
+            ": " & $coveredMismatch.len & " bound-covered mismatch" &
+            (if coveredMismatch.len != 1: "es" else: "") &
+            " (expected; declared {.until.}): " & coveredMismatch.join(", ") &
+            " — the recorded drift is fully explained by the declared " &
+            "bound; see the drift alarm / softlink harvest for details"
+    when defined(softlinkStrictVerify):
+      warning(coveredMsg, directive.node)
+    else:
+      hint(coveredMsg, directive.node)
 
   # Check 8: not-in-manifest hint. RFC-0002 §4.4, code-review finding CR1-1:
   # a bounded (`{.since/until.}`) proc entirely absent from the manifest gets

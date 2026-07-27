@@ -782,6 +782,42 @@ func mismatchedSymbols*(m: CompatManifest, boundCNames: seq[string]): seq[string
     if symOpt.isSome and symOpt.get.header[fkMismatch].len > 0:
       result.add cname
 
+func mismatchCoveredByUntil*(m: CompatManifest, cname, until: string): bool =
+  ## Check 7 bound-covered mismatch fix (nim-z3 report `softlink-mismatch-
+  ## warning-issue.md`; RFC-0001 §B.5's mismatch warning, downgraded per
+  ## `CHECK7-WARNING.handoff.md`): true iff `cname`'s recorded drift is
+  ## FULLY explained by a declared `{.until.}` bound, i.e.
+  ##   `until` is non-empty, AND
+  ##   `cname` has at least one `fkMismatch` interval in `m`, AND
+  ##   EVERY such interval lies entirely at-or-above `until`
+  ##   (`lo` non-empty and `cmpVersion(lo, until) >= 0`).
+  ##
+  ## Callers (Check 7 in `src/softlink/directives.nim`) only ever consult
+  ## this for a symbol `mismatchedSymbols` has already reported -- which
+  ## necessarily HAS a mismatch interval -- but this function is total, and
+  ## honest about its two degenerate inputs: a symbol absent from the
+  ## manifest, or one with no `fkMismatch` interval at all, both return
+  ## `false` (there is nothing here for a bound to explain, so it cannot be
+  ## "covered").
+  ##
+  ## A mismatch interval with `lo == ""` (open at -infinity) ALSO returns
+  ## `false`: such an interval extends below any finite `until`, so it can
+  ## never be "at or above" the bound. A well-formed manifest for a symbol
+  ## that actually declares `until` should never produce this shape (Check
+  ## 5's disjoint/exhaustive invariant plus `checkUntil` rule (a) already
+  ## hard-error an in-window mismatch upstream, in `directives.nim`) -- but
+  ## this predicate is invariant-independent by design (it doesn't rely on
+  ## check ordering) and stays honest about the input rather than assuming.
+  if until.len == 0: return false
+  let symOpt = findSymbol(m, cname)
+  if symOpt.isNone: return false
+  let sf = symOpt.get
+  if sf.header[fkMismatch].len == 0: return false
+  for iv in sf.header[fkMismatch]:
+    if iv.lo.len == 0 or cmpVersion(iv.lo, until) < 0:
+      return false
+  true
+
 func firstMismatchInterval*(symbols: seq[SymbolFacts], cname, probedVersion: string):
                              Option[VersionInterval] =
   ## RFC-0001 §C.3, slice C4b: the runtime drift-refusal lookup — given
