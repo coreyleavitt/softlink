@@ -363,6 +363,25 @@ The other motivating case: multiple `dynlib` blocks over *one* library (e.g. spl
 
 Rules: the argument is a single non-empty string literal, and must itself be a valid Nim identifier (it's spliced by concatenation into every generated name — `load<Base>`, `unload<Base>`, `<lowerBase>Loaded`, and so on). At most one `identBase` per block, in any position — a second one is a compile-time error telling you to merge them. `identBase` has no meaning in `verifyProcs` (there's no `loadX`/wrapper surface for it to rename) and is rejected there like any other non-proc statement.
 
+### Pattern override: redirecting a block's search pattern at build time
+
+A `dynlib` block's pattern string is also the input to identifier derivation (`libNameToIdent`, or an explicit `identBase`) — so rewriting it to test a "library absent" or "library redirected" scenario silently renames every `loadX`/`unloadX`/`xxxLoaded` proc too, unless the block already pins `identBase` explicitly. softlink closes that coupling: every `dynlib` block accepts a compile-time **pattern override**, keyed on the block's own *effective* identBase (its explicit `identBase`, or the derived one) — set it from outside the source file, and only the runtime search pattern changes:
+
+```sh
+nim c -d:softlink.pattern.Gtk4="libgtk4-totally-absent.so" myapp.nim
+```
+
+```nim
+dynlib "libgtk-4.so(|.1)":     # derives identBase "Gtk4"
+  proc gtk_init(argc: ptr cint, argv: ptr ptr cstring) {.cdecl, header: "gtk/gtk.h".}
+```
+
+Built with the define above, `loadGtk4()` searches for `libgtk4-totally-absent.so` instead of the declared pattern — useful for redirecting to a bundled or renamed copy of a library at build time, or, as here, deliberately forcing a "library not found" path in a test build without touching the binding's source at all. Every other name and mechanism stays keyed on the DECLARED pattern/identBase, completely unaffected by the override: `loadGtk4`/`unloadGtk4`/`gtk4Loaded` (identifier derivation), header verification, an attached `compatManifest`, probe facts, and drift/bound logic all read `"libgtk-4.so(|.1)"` and `"Gtk4"` exactly as written. The override is consumed at **load time only** — inside `loadGtk4()` itself, immediately before the library search runs.
+
+The override string is a full softlink pattern in its own right, not a plain filename: it goes through the identical alternation/version-suffix expansion (`libCandidates`) a hand-written pattern would, so `LoadResult.attempts`/`osLoaderDetail` on a failed load name the OVERRIDE's own candidates — which is what makes a redirected-to-absent test build actually informative about what was searched for, not just that something failed.
+
+Rules: the override is looked up under the key `softlink.pattern.<Base>`, where `<Base>` is the block's effective identBase (its `identBase` directive if present, otherwise the same derived base `libNameToIdent` computes from the pattern) — two blocks sharing one declared pattern text but distinct `identBase`s (the `identBase` directive's own second motivating case, above) get two independently-settable overrides, never one shared knob. An empty override (the default — nothing was defined) means "no override": the block's declared pattern is used exactly as before this feature existed, and every existing binding is unaffected by upgrading to a softlink version that has it. Not available in `verifyProcs`: that macro has no library identity at all (no pattern argument, no `loadX`), so there is nothing for a pattern override to redirect.
+
 ### Statement pass-through: types, consts, and helpers alongside declarations
 
 Real binding modules aren't a flat list of proc declarations — they interleave a `type` for a bitflag or handle, a `const` for a default, and small helper procs (`==`, `hash`, `$`) with the declarations that use them, organized by narrative rather than by kind. `dynlib` supports this directly: a **bodyless proc is a binding declaration** (the only thing that means "resolve this symbol at runtime"); **everything else passes through verbatim** — a `type` or `const` section, a proc *with* a body, a `var`/`let`/`template`/`when`, or a doc comment.
@@ -385,6 +404,18 @@ dynlib "libwidget.so":
 `widget_create`/`widget_destroy` bind exactly as before; `WidgetHandle`, `WidgetDefaultFlags`, and the `==` helper are ordinary Nim code that happens to live inside the block — no `{.header.}`, no calling convention, no verification, because they declare nothing to load. This keeps a migration from `{.importc, dynlib.}` to `dynlib` a per-proc pragma swap, never a whole-file restructuring pass that hoists every type and helper out to a separate section first.
 
 One asymmetry to know about: a `type`/`const` section is visible to every binding in the block regardless of which side of it they're declared on (softlink hoists these ahead of the pointer-var declarations they might be used in), but a passed-through helper proc follows ordinary Nim rules for top-level procs — it may call any binding declared *above* it, not one declared below, exactly as if you'd hand-written two top-level procs in that order. `verifyProcs` (below) doesn't get this feature at all: it exists solely to verify signatures, so every statement in its body still must be a proc declaration.
+
+**One hard limit: a `when` hiding a bodyless proc is not a conditional binding.** Pass-through treats a `when` as one opaque statement, spliced through verbatim — correct for a `when` guarding ordinary helper code, but it means the body-scan loop that recognizes bindings never looks inside a `when`'s branches at all. A bodyless proc written there (a natural-looking attempt at a compile-time-conditional binding) is invisible to `dynlib`, gets no function-pointer var, no wrapper, no `loadX` slot, and re-emits as ordinary code that still has no body — Nim's own bare "implementation expected" is what you'd see, not a softlink diagnostic pointing at the real mistake:
+
+```nim
+dynlib "libfoo.so":
+  when defined(useNewApi):
+    proc foo_new_call(x: cint): cint {.cdecl, header: "foo.h".}   # NOT a binding — never scanned
+  else:
+    proc foo_old_call(x: cint): cint {.cdecl, header: "foo.h".}   # NOT a binding — never scanned
+```
+
+softlink catches this at macro-expansion time instead: any bodyless proc found inside a `when`'s branches — at any nesting depth — is a compile-time error naming the fix (split into separate `dynlib` blocks, one per configuration, disambiguated with `identBase`; or wrap the *whole* block in a top-level `when` so each expansion sees an ordinary, unconditional set of bindings). A `when` whose branches contain only bodied helpers, types, consts, or other ordinary statements is unaffected — it stays exactly the pass-through this section describes. `verifyProcs` has no blind spot here to close: it accepts no pass-through of any kind, so a `when` there — hiding a bodyless proc or not — already fails with its own, pre-existing "body must contain only proc declarations" error.
 
 ## Thread Safety
 

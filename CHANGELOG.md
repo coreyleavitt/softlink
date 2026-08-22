@@ -2,6 +2,62 @@
 
 All notable changes to softlink are documented here.
 
+## [Unreleased]
+
+### Added
+
+**Per-block pattern-override seam.** Every `dynlib` block now accepts a
+compile-time override of its runtime search pattern, set from outside the
+source file: `-d:softlink.pattern.<Base>="<override pattern>"`, where
+`<Base>` is the block's *effective* identBase (its explicit `identBase`
+directive, or the same derived base `libNameToIdent` would compute). Closes
+a coupling the `identBase` directive's own motivating cases already hinted
+at: a block's pattern string is also the input to identifier derivation, so
+rewriting it to test a "library absent/redirected" scenario silently
+renames every `loadX`/`unloadX`/`xxxLoaded` proc too, unless the block
+already pinned `identBase`. The override is consumed at **load time only**
+— identifier derivation, header verification, an attached
+`compatManifest`, probe facts, and drift/bound logic all stay keyed on the
+DECLARED pattern/identBase, completely unaffected. The override string is a
+full softlink pattern in its own right (alternations and version suffixes
+go through the identical `libCandidates` expansion a hand-written pattern
+would), so `LoadResult.attempts`/`osLoaderDetail` on a failed load name the
+override's own candidates. Two blocks sharing one declared pattern text but
+distinct `identBase`s get two independently-settable overrides, never one
+shared knob. An empty override (nothing defined, the default) means "no
+override" — every existing binding is unaffected by upgrading. Not
+available in `verifyProcs`: that macro has no library identity at all (no
+pattern argument, no `loadX`), so there is nothing for a pattern override
+to redirect. Dotted `-d:` keys (`softlink.pattern.<Base>`, mirrored by
+`{.strdefine: "softlink.pattern.<Base>".}`) were confirmed to work as
+expected before landing this design — no fallback spelling was needed. See
+the README's
+["Pattern override: redirecting a block's search pattern at build time"](README.md#pattern-override-redirecting-a-blocks-search-pattern-at-build-time)
+section.
+
+**Softlink-authored diagnostic for conditional binding declarations inside
+a `when`.** Statement pass-through (0.12.0's item 4) treats a `when`
+statement in a `dynlib` block body as one opaque statement, spliced through
+verbatim — correct for a `when` guarding ordinary helper code, but it means
+the body-scan loop that recognizes bindings never looks inside a `when`'s
+branches. A bodyless proc declared there (a natural-looking attempt at a
+compile-time-conditional binding) was invisible to `dynlib`: no
+function-pointer var, no wrapper, no `loadX` slot, and the re-emitted code
+still had no proc body — Nim's own bare "implementation expected" surfaced
+instead of a softlink diagnostic naming the actual mistake. `dynlib` now
+scans a `when` statement's branches — at any nesting depth — for a bodyless
+proc declaration and, if any is found, raises a compile-time error naming
+the fix (split into separate `dynlib` blocks, one per configuration,
+disambiguated with `identBase`; or wrap the whole block in a top-level
+`when`). A `when` whose branches contain only bodied helpers, types,
+consts, or other ordinary statements is unaffected — it stays exactly the
+pass-through it already was. `verifyProcs` has no corresponding blind spot:
+it accepts no pass-through of any kind, so a `when` there already failed
+(and still fails) with its own, pre-existing "body must contain only proc
+declarations" error, regardless of what the `when` hides. See the README's
+["Statement pass-through: types, consts, and helpers alongside declarations"](README.md#statement-pass-through-types-consts-and-helpers-alongside-declarations)
+section (the "one hard limit" paragraph).
+
 ## [0.12.0] - 2026-08-22
 
 ### Added

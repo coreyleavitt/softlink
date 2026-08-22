@@ -1852,6 +1852,31 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_passthrough_verifyprocs.nim",
       ["verifyProcs body must contain only proc declarations"])
 
+    # RFC 0011: softlink-authored diagnostic for conditional binding
+    # declarations. A `when` inside a `dynlib` block is ordinary pass-
+    # through UNLESS a branch (at any nesting depth) hides a BODYLESS proc
+    # decl — the shape that reads as "conditional binding" but that the
+    # flat body-scan loop (and the pass-through rule above) can never see.
+    # `tfail_when_bodyless_proc.nim`/`tfail_when_nested_bodyless_proc.nim`
+    # pin the negative (direct and nested); `tcheck_when_passthrough_ok.nim`
+    # pins the positive (bodied-only `when` stays untouched);
+    # `tfail_when_bodyless_proc_verifyprocs.nim` pins that `verifyProcs` has
+    # no blind spot to close here at all — it already rejects any `when`
+    # via its own pre-existing, narrower "body must contain only proc
+    # declarations" rule, so the SAME shape there hits that EXISTING
+    # message, never the new dynlib-specific one.
+    expectManifestCompileFail(mcBase & "tests/tfail_when_bodyless_proc.nim",
+      ["conditional binding declarations are not supported inside a dynlib block"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_when_nested_bodyless_proc.nim",
+      ["conditional binding declarations are not supported inside a dynlib block"])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_when_passthrough_ok.nim", [], [])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_when_bodyless_proc_verifyprocs.nim",
+      ["verifyProcs body must contain only proc declarations"],
+      ["conditional binding declarations are not supported"])
+
     # RFC 0011 S0a item 6: the block-level `noverify: "reason"` directive —
     # parse/validation, duplicate-guard, and verifyProcs-rejection checks,
     # mirroring the `identBase` group directly above. The two positive
@@ -2307,6 +2332,32 @@ task test, "Run tests":
   # directly), so — like `tests/tharvest_cli.nim` — they run once,
   # unconditionally, identically on every OS leg rather than being
   # duplicated into all three `when`/`elif`/`else` branches below.
+  # RFC 0011: per-block pattern-override seam (`tests/tpattern_override.nim`,
+  # see its own doc comment). Every block binds a permanently-absent,
+  # explicit (non-derived) garbage pattern, so this needs no built
+  # testlib/libmagic/libvern artifact and runs identically, portably, on
+  # every OS leg — like the four fixtures immediately below, it runs once,
+  # unconditionally, rather than being tripled into the OS branches further
+  # down. Compiled and run THREE times: plain (story a: no define -> the
+  # declared pattern, unchanged), with block A's override active (stories
+  # b/d: the override redirects block A's candidates; block B, over the
+  # IDENTICAL declared pattern text but a different identBase, is
+  # unaffected), and with block C's override active (story c: a
+  # derived-base block's override key is the DERIVED base). The two
+  # `-d:testOverride*` defines are this fixture's own private test-only
+  # flags (folded into a compile-time bool the test body reads, mirroring
+  # `tests/tcompat_drift_required.nim`'s `driftRefusalOverridden` trick) —
+  # unrelated to softlink's own public `-d:softlink.pattern.<Base>` knob,
+  # which is set alongside them below exactly as a real consumer would set
+  # it.
+  exec "nim c -r --path:src tests/tpattern_override.nim"
+  exec "nim c -r --path:src -d:testOverrideA " &
+       "-d:softlink.pattern.PatOverrideA=libpatoverride_override_target_a.so " &
+       "tests/tpattern_override.nim"
+  exec "nim c -r --path:src -d:testOverrideC " &
+       "-d:softlink.pattern.Patoverridebarexyz=libpatoverride_override_target_c.so " &
+       "tests/tpattern_override.nim"
+
   exec "nim c -r --path:src tests/tcov_manifest_bytecap.nim"
   exec "nim c -r --path:src tests/tcov_manifest_shape_guards.nim"
   exec "nim c -r --path:src tests/tcov_classify_absence_multi_pair.nim"

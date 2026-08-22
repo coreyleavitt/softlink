@@ -785,6 +785,44 @@ proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string])
       return true
   false
 
+proc collectBodylessProcDeclsInWhen(whenStmt: NimNode): seq[NimNode] =
+  ## RFC 0011 (softlink-authored diagnostic for conditional binding
+  ## declarations): recursively walks a top-level `when` statement's
+  ## branches — `nnkElifBranch`/`nnkElifExpr` and a trailing
+  ## `nnkElse`/`nnkElseExpr`, nested `when`s included — looking for a
+  ## BODYLESS proc declaration (`nnkProcDef` with an empty body), the exact
+  ## shape that means "binding declaration" everywhere else in a `dynlib`
+  ## block body. Statement pass-through (RFC 0011 S0a item 4) treats a
+  ## `when` as one opaque statement to splice through verbatim — correct
+  ## for a `when` guarding ordinary helper code, but it means the body-scan
+  ## loop that recognizes bindings NEVER looks inside a `when`'s branches at
+  ## all, so a user who writes a bodyless proc there (evidently trying to
+  ## make a CONDITIONAL binding) gets no binding, no softlink diagnostic,
+  ## and — because the proc is re-emitted as ordinary code with no defined
+  ## body — Nim's own bare "implementation expected" once the generated
+  ## code is compiled. Returns every offending proc def found (possibly
+  ## none, meaning the `when` is legitimate pass-through and must be left
+  ## untouched); the caller turns a non-empty result into ONE softlink
+  ## error naming the first offender.
+  for branch in whenStmt:
+    # `nnkElifBranch`/`nnkElifExpr` have 2 children (cond, stmts); a
+    # trailing `nnkElse`/`nnkElseExpr` has 1 (stmts) — the branch's
+    # statement list is always its LAST child either way.
+    let stmts = branch[branch.len - 1]
+    if stmts.kind != nnkStmtList: continue
+    for s in stmts:
+      if s.kind == nnkProcDef and s.body.kind == nnkEmpty:
+        result.add(s)
+      elif s.kind == nnkWhenStmt:
+        result.add(collectBodylessProcDeclsInWhen(s))
+
+const conditionalBindingErrorMsg =
+  "softlink: dynlib: conditional binding declarations are not supported " &
+  "inside a dynlib block: a `when` passes through as ordinary code and " &
+  "its procs are never scanned as bindings. Split into separate `dynlib` " &
+  "blocks (one per configuration, distinct `identBase`), or wrap the " &
+  "whole block in a top-level `when`."
+
 macro dynlib*(libPattern: static[string], body: untyped): untyped =
   ## Generate type-safe, runtime-optional bindings for a dynamic library.
   ## The generated ``loadXxx``/``unloadXxx`` procs are **not thread-safe**.
@@ -1047,6 +1085,45 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         newCall(ident("declared"), handleName),
         newStmtList(errPragma))))
 
+  # RFC 0011 (per-block pattern-override seam): a compile-time-overridable
+  # copy of this block's search pattern, keyed on the block's EFFECTIVE
+  # identBase (`baseName` — the explicit `identBase` override if present,
+  # else the derived one), NOT on `resolvedPattern`/`libPatternLit` — this
+  # is what keeps the override from ever touching identifier derivation,
+  # verification, the manifest, probe-facts, or drift logic, all of which
+  # key off the DECLARED pattern/identBase exactly as before. Consumed at
+  # LOAD TIME ONLY, in `loadBody` below: empty (the default) means "no
+  # override", and `loadX` uses the declared pattern unchanged. A non-empty
+  # override is a full softlink pattern in its own right — it goes through
+  # the identical `libCandidates` alternation/version-suffix expansion a
+  # hand-written pattern would, so `LoadResult.attempts`/`osLoaderDetail`
+  # name the OVERRIDE's own candidates, not the declared ones. See the
+  # README's "Pattern override: redirecting a block's search pattern at
+  # build time" section. Two blocks over the same declared pattern text but
+  # different `identBase`s (the `identBase` directive's own second
+  # motivating case) get two independently-keyed overrides, by construction
+  # — this const's name and its strdefine key both derive from `baseName`,
+  # which is exactly what disambiguates them. Not emitted for `verifyProcs`:
+  # that macro has no library identity at all (no `libPattern` parameter, no
+  # `loadX`), so there is no pattern to override in the first place — see
+  # the README section for the explicit non-applicability note.
+  let patternOverrideName = ident(baseNameLower & "PatternOverride")
+  result.add(newNimNode(nnkConstSection).add(
+    newNimNode(nnkConstDef).add(
+      newNimNode(nnkPragmaExpr).add(
+        patternOverrideName,
+        newNimNode(nnkPragma).add(
+          newNimNode(nnkExprColonExpr).add(
+            ident("strdefine"),
+            newStrLitNode("softlink.pattern." & baseName)
+          )
+        )
+      ),
+      newEmptyNode(),
+      newStrLitNode("")
+    )
+  ))
+
   # var handle: LibHandle
   result.add(newNimNode(nnkVarSection).add(
     newNimNode(nnkIdentDefs).add(
@@ -1211,6 +1288,17 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         # observable about the passed-through code itself — it only lets
         # every binding see it regardless of source position.
         hoisted.add(stmt)
+      of nnkWhenStmt:
+        # RFC 0011: a `when` is ordinary pass-through UNLESS one of its
+        # branches (at any nesting depth) hides a bodyless proc decl — see
+        # `collectBodylessProcDeclsInWhen`'s own doc comment for why the
+        # ordinary pass-through rule can never see that shape on its own.
+        # A `when` with only bodied helpers/types/consts/statements is
+        # untouched, exactly like every other pass-through statement.
+        let offenders = collectBodylessProcDeclsInWhen(stmt)
+        if offenders.len > 0:
+          error(conditionalBindingErrorMsg, offenders[0])
+        orderedItems.add(DynlibItem(kind: diPassthrough, stmt: stmt))
       else:
         orderedItems.add(DynlibItem(kind: diPassthrough, stmt: stmt))
       continue
@@ -2246,6 +2334,28 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
        declaredBoundRequiredCandidates.len > 0:
       loadBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
 
+    # Per-block pattern-override seam: resolve the pattern actually PASSED
+    # to the loader this call — the compile-time override (`<base>
+    # PatternOverride` above, set via `-d:softlink.pattern.<Base>=...`) when
+    # non-empty, otherwise the block's own declared/resolved pattern
+    # (`libPatternLit`) unchanged. This is the ONLY site the override
+    # affects — every other reference to `libPatternLit` in this macro
+    # (error messages, the dup-block guard, `SoftlinkError.library`) keeps
+    # naming the DECLARED pattern, exactly as documented.
+    #   var effectivePattern: string
+    #   if <base>PatternOverride.len > 0: effectivePattern = <base>PatternOverride
+    #   else: effectivePattern = "<declared pattern>"
+    let effectivePatternName = genSym(nskVar, "effectivePattern")
+    loadBody.add(newNimNode(nnkVarSection).add(
+      newNimNode(nnkIdentDefs).add(effectivePatternName, ident("string"), newEmptyNode())))
+    var patternOverrideIf = newNimNode(nnkIfStmt)
+    patternOverrideIf.add(newNimNode(nnkElifBranch).add(
+      infix(newDotExpr(patternOverrideName, ident("len")), ">", newLit(0)),
+      newStmtList(newAssignment(effectivePatternName, patternOverrideName))))
+    patternOverrideIf.add(newNimNode(nnkElse).add(
+      newStmtList(newAssignment(effectivePatternName, libPatternLit))))
+    loadBody.add(patternOverrideIf)
+
     # RFC 0011 S0a item 5: let loadOutcome = loadLibPatternDetailed(pattern)
     #                       handle = loadOutcome.handle
     # `loadLibPatternDetailed` (softlink/loader.nim) replaces the plain
@@ -2253,10 +2363,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # first-hit-wins ordering (it's built directly on `loadLibPattern`'s own
     # `libCandidates`), but it also carries back the OS loader's diagnostic
     # for every candidate that failed, consumed by the `lrLibNotFound`
-    # branch just below.
+    # branch just below. Called against `effectivePattern` (above), not
+    # `libPatternLit` directly, so an active pattern override is what the
+    # loader actually tries.
     let loadOutcomeName = genSym(nskLet, "loadOutcome")
     loadBody.add(newLetStmt(loadOutcomeName,
-      newCall(ident("loadLibPatternDetailed"), libPatternLit)))
+      newCall(ident("loadLibPatternDetailed"), effectivePatternName)))
     loadBody.add(newAssignment(handleName, newDotExpr(loadOutcomeName, ident("handle"))))
 
     # if handle.isNil: write this block's own "probe hasn't run" report
