@@ -90,6 +90,38 @@ except SoftlinkError as e:
   echo e.msg      # "libmbedtls.so(.16|.14|): library not loaded, cannot call: mbedtls_ssl_init"
 ```
 
+### Loader-error detail on `lrLibNotFound`
+
+`lrLibNotFound` doesn't just mean "not installed" — it also covers a
+present-but-broken library (wrong architecture, a missing transitive
+dependency in a partial bundle). `LoadResult.attempts` names every concrete
+candidate the pattern expanded to and carries the OS loader's own
+diagnostic for each, so the two cases are distinguishable instead of
+collapsing into one opaque result:
+
+```nim
+let r = loadMbedtls()
+if r.kind == lrLibNotFound:
+  for a in r.attempts:
+    echo a.candidate, ": ", a.osError   # dlerror()/FormatMessage(GetLastError()) text
+  # Or, for a one-line rendering:
+  echo r.osLoaderDetail
+  # "libmbedtls.so.16: cannot open shared object file: No such file or directory; ..."
+```
+
+On Linux/macOS, `dlerror()` already tells the two cases apart on its own —
+a truly-absent library says so, but a *present* library with a missing
+transitive dependency names the missing dependency by its own filename,
+not the library you asked for. On Windows, plain `LoadLibrary` collapses
+both into the identical `ERROR_MOD_NOT_FOUND`; softlink runs a
+`LoadLibraryEx(..., DONT_RESOLVE_DLL_REFERENCES)` preflight (which skips
+import resolution) automatically on that specific error and annotates
+`osError` when it reveals the target file itself does exist. `attempts` is
+empty on every other `LoadResultKind`, including a success where an
+earlier candidate in the pattern failed before a later one loaded — once
+the load succeeds, an earlier failure carries no information worth
+keeping.
+
 ### Optional symbols
 
 Mark individual functions as optional for version-tier bindings:

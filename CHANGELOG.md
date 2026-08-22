@@ -98,6 +98,38 @@ always duplicating `nimName`. See the README's
 ["`{.symbol: "c_name"}` — bind under a different C name"](README.md#symbol-c_name--bind-under-a-different-c-name)
 section.
 
+**Loader-error detail on `lrLibNotFound` (RFC 0011 S0a item 5).** `loadX`
+no longer discards the OS loader's own diagnostic when a library fails to
+load: `LoadResult.attempts: seq[CandidateAttempt]` (new field on the
+`lrLibNotFound` branch only — no new `LoadResultKind`) names every concrete,
+post-pattern-expansion candidate the loader tried and carries the OS
+loader's diagnostic for each — `dlerror()` text on Linux/macOS,
+`FormatMessage`-rendered `GetLastError()` text on Windows — so "library
+absent" and "library found but failed to load" (wrong architecture, missing
+transitive dependency) are distinguishable instead of collapsing into one
+opaque `lrLibNotFound`. `LoadResult.osLoaderDetail: string` renders the
+`seq` as a one-line `"candidate: error; candidate: error"` string for
+callers that just want text (e.g. an `OSError.msg`). On success, `attempts`
+is empty — an earlier candidate's failure carries no information once a
+later one succeeds. Internally, `dynlib`'s generated `loadX` now calls the
+new `softlink/loader.loadLibPatternDetailed` instead of
+`std/dynlib.loadLibPattern` directly; it reuses `std/dynlib`'s own exported
+`libCandidates` for pattern expansion, so candidate ordering and
+first-hit-wins semantics are unchanged. **Windows-specific finding
+(measured, not assumed):** plain `LoadLibraryA` returns the identical
+`ERROR_MOD_NOT_FOUND` (126) both for a truly-absent DLL and for a present
+DLL whose transitive dependency is missing — Windows does not name the
+missing dependency the way `dlerror()` does on Linux. A
+`LoadLibraryExA(path, 0, DONT_RESOLVE_DLL_REFERENCES)` preflight (which
+skips import resolution) cheaply separates the two cases — confirmed
+succeeding for the present-target case and failing for the truly-absent
+case — so `softlink/loader.nim`'s Windows path runs it automatically on
+that specific error code and annotates the message when it fires, without
+overclaiming distinguishability beyond what was actually measured. See the
+README's
+["Loader-error detail on `lrLibNotFound`"](README.md#loader-error-detail-on-lrlibnotfound)
+section.
+
 ### Changed
 
 **`libNameToIdent`'s leading-alternation normalization is now general

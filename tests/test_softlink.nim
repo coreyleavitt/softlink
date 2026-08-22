@@ -1323,6 +1323,23 @@ suite "softlink — error paths":
   test "lrLibNotFound for missing library":
     check loadDefinitelyNotReal().kind == lrLibNotFound
 
+  # RFC 0011 S0a item 5, story (e): the per-candidate OS-loader detail is
+  # reachable through the generated `loadX` public API, both structured
+  # (`LoadResult.attempts`) and as a one-line rendering (`osLoaderDetail`).
+  # `libdefinitely_not_real.so` (declared above) is a single-candidate
+  # pattern (no `(a|b)` alternation), so exactly one attempt is expected.
+  test "osLoaderDetail: candidate name + OS error text reachable through the public LoadResult API":
+    let r = loadDefinitelyNotReal()
+    check r.kind == lrLibNotFound
+    check r.attempts.len == 1
+    check r.attempts[0].candidate == "libdefinitely_not_real.so"
+    check r.attempts[0].osError.len > 0
+    let detail = r.osLoaderDetail
+    check "libdefinitely_not_real.so" in detail
+    check r.attempts[0].osError in detail
+    # A non-lrLibNotFound result renders no loader detail at all.
+    check loadTestlib().osLoaderDetail == ""
+
   # RFC-0001 §9/§C.5 — degradation matrix, cell 3 ("neither" — no
   # versionProbe, no compatManifest at all, the plain pre-Stage-C shape):
   # `definitelyNotRealC2Compat` (directly below) pins the DIFFERENT,

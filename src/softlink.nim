@@ -30,9 +30,19 @@ import ./softlink/procinfo
 import ./softlink/pragmas
 import ./softlink/directives
 import ./softlink/verify
+import ./softlink/loader
 # Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
        stdDynlib.unloadLib
+# RFC 0011 S0a item 5: `loadX`'s generated body now calls
+# `loader.loadLibPatternDetailed` instead of `stdDynlib.loadLibPattern`
+# directly (see the `dynlib` macro's loadBody codegen below) — exported for
+# the SAME reason as the `stdDynlib` re-exports above (macro-generated code
+# living in the consuming module resolves it unqualified). `loadLibPattern`
+# itself stays exported too: it's still part of softlink's public surface
+# for callers who want the plain stdlib behavior directly, even though
+# `dynlib`'s own codegen no longer calls it.
+export loader.CandidateAttempt, loader.loadLibPatternDetailed
 # NOTE: `compatManifest`/`versionProbe` (the RFC-0001 §B.5/§9 "erroring
 # stub" proc/template) stay declared directly below in THIS file, rather
 # than moving to `softlink/pragmas` with the rest of the directive-parsing
@@ -66,9 +76,37 @@ type
       missing*: seq[string]
     of lrSymbolNotFound:
       symbol*: string
-    of lrLibNotFound, lrOk:
+    of lrLibNotFound:
+      attempts*: seq[loader.CandidateAttempt]
+        ## RFC 0011 S0a item 5: every concrete (post pattern-expansion)
+        ## candidate the loader tried, and the OS loader's own diagnostic
+        ## for each — see `softlink/loader.loadLibPatternDetailed`, which
+        ## replaces the plain `loadLibPattern` call this branch used to be
+        ## built from. Empty only in the (currently unreachable) case that
+        ## `pattern` itself expands to zero candidates. Use `osLoaderDetail`
+        ## below for a one-line rendering.
+    of lrOk:
       discard
 
+proc osLoaderDetail*(r: LoadResult): string =
+  ## RFC 0011 S0a item 5: a one-line-simple rendering of `r.attempts`, for
+  ## consumers (e.g. oyamel's planned `GtkApiError.osLoaderDetail`) that
+  ## just want a human-readable string, not the structured `seq` — pins the
+  ## RENDERED FORM's content (candidate names + error text present), not
+  ## exact formatting; format freely in future revisions.
+  ##
+  ## `""` for every `LoadResultKind` other than `lrLibNotFound` (including
+  ## the empty-attempts case, which cannot occur through the generated
+  ## `loadX` path today but is handled defensively rather than indexing
+  ## into an empty seq).
+  if r.kind != lrLibNotFound or r.attempts.len == 0:
+    return ""
+  var parts = newSeq[string](r.attempts.len)
+  for i, a in r.attempts:
+    parts[i] = a.candidate & ": " & a.osError
+  parts.join("; ")
+
+type
   Attestation* = enum
     ## RFC-0001 §C.2, slice C2 (finding #11 split C2 into six): `CompatReport
     ## .attestation` — six diagnostically distinct "how much do we trust this
@@ -2092,8 +2130,18 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
        declaredBoundRequiredCandidates.len > 0:
       loadBody.add(newAssignment(driftStoriesName, prefix(newNimNode(nnkBracket), "@")))
 
-    # handle = loadLibPattern(pattern)
-    loadBody.add(newAssignment(handleName, newCall(ident("loadLibPattern"), libPatternLit)))
+    # RFC 0011 S0a item 5: let loadOutcome = loadLibPatternDetailed(pattern)
+    #                       handle = loadOutcome.handle
+    # `loadLibPatternDetailed` (softlink/loader.nim) replaces the plain
+    # `loadLibPattern` call this used to be — same candidate expansion, same
+    # first-hit-wins ordering (it's built directly on `loadLibPattern`'s own
+    # `libCandidates`), but it also carries back the OS loader's diagnostic
+    # for every candidate that failed, consumed by the `lrLibNotFound`
+    # branch just below.
+    let loadOutcomeName = genSym(nskLet, "loadOutcome")
+    loadBody.add(newLetStmt(loadOutcomeName,
+      newCall(ident("loadLibPatternDetailed"), libPatternLit)))
+    loadBody.add(newAssignment(handleName, newDotExpr(loadOutcomeName, ident("handle"))))
 
     # if handle.isNil: write this block's own "probe hasn't run" report
     # (RFC-0001 §9/§C.2, finding #11 — `probeNotRunFields()`: `atProbeNotRun`
@@ -2101,10 +2149,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # Phase-1 early return happens only before the first ever load, or right
     # after unloadX already reset the probe state vars to their own zero
     # values, so this IS the correct value here, not merely a placeholder)
-    # + return LoadResult(kind: lrLibNotFound)
+    # + return LoadResult(kind: lrLibNotFound, attempts: loadOutcome.attempts)
     loadBody.add(newIfStmt((
       newCall(ident("isNil"), handleName),
       unwindStmt(unloadHandle = false, resultKind = ident("lrLibNotFound"),
+                 resultFields = @[("attempts", newDotExpr(loadOutcomeName, ident("attempts")))],
                  reportFields = probeNotRunFields())
     )))
 

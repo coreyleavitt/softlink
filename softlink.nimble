@@ -2445,6 +2445,19 @@ task test, "Run tests":
     exec "gcc -shared -fPIC -o tests/libmagic.so tests/testlib.c"
     # Versioned soname with NO bare libvern.so — forces the major fallback.
     exec "gcc -shared -fPIC -o tests/libvern.so.3 tests/testlib.c"
+    # RFC 0011 S0a item 5 (loader-error detail on lrLibNotFound) fixtures:
+    # - libgarbage.so: present on disk, not a valid ELF shared object —
+    #   proves "absent" vs. "found but failed to load" are distinguishable
+    #   (story b).
+    # - libhasdep.so: a real, valid .so linked against libstubdep.so at
+    #   build time; libstubdep.so is deleted immediately after, leaving a
+    #   DT_NEEDED entry that can never resolve — the Linux analogue of a
+    #   partial-bundle missing transitive dependency (story c).
+    writeFile("tests/libgarbage.so", "not an elf file\n")
+    exec "gcc -shared -fPIC -o tests/libstubdep.so tests/stubdep.c"
+    exec "gcc -shared -fPIC -o tests/libhasdep.so tests/hasdep.c -L tests -lstubdep"
+    rmFile("tests/libstubdep.so")
+    exec "LD_LIBRARY_PATH=./tests nim c -r --path:src tests/tloader_detail.nim"
     exec "LD_LIBRARY_PATH=./tests nim c -r --path:src --passC:-I. tests/test_softlink.nim"
     exec "LD_LIBRARY_PATH=./tests nim cpp -r --path:src --passC:-I. tests/test_softlink.nim"
     # RFC-0001 slice A4, optional extra confidence (gcc/clang-gated only —
@@ -2610,3 +2623,50 @@ task testMsvcExitCodes, "RFC-0001 slice A9: MSVC-only exit-code compile-failure 
   # (exit-code-only) rationale as immediately above.
   expectCompileFailure("nim c" & vccFlags &
     "tests/tfail_versionmacros_header_missing.nim")
+
+task testWindows, "RFC 0011 S0a item 5: Windows loader-error-detail measurement leg":
+  ## Repeatable driver for `tests/tloader_windows.nim` (stories f/g — the
+  ## RFC's "measure-don't-assert" obligation for the Windows leg). Windows-
+  ## only; a no-op on every other target (mirrors `task testMsvcExitCodes`'s
+  ## own `when defined(windows)`-free style, since this task's own body is
+  ## gcc/mingw commands that only make sense there).
+  ##
+  ## Per this project's own Windows container workflow (writing PE outputs
+  ## directly onto a mounted volume corrupts them — see
+  ## `feedback_docker_exe` in the operator's memory notes, the same
+  ## rationale `task test`'s Windows branch sidesteps by building fixtures
+  ## in-place rather than via a mounted-volume copy step): this task builds
+  ## `victim.dll`/`missing_dep.dll` and compiles `tloader_windows.exe` into
+  ## a fresh temp directory under the OS temp root (`getTempDir()`), never
+  ## into the repo tree itself, and runs the exe from there.
+  when defined(windows):
+    # NimScript's `os`-shim has no `getTempDir`/`/` — build the path from
+    # `%TEMP%` (falling back to the container workflow's own documented
+    # `C:\temp`, see this project's CLAUDE.md) by hand instead.
+    let tempRoot = getEnv("TEMP", r"C:\temp")
+    let workDir = tempRoot & r"\softlink_win_loader_test"
+    if dirExists(workDir): rmDir(workDir)
+    mkDir(workDir)
+    let missingDepC = workDir & r"\missing_dep.c"
+    let victimC = workDir & r"\victim.c"
+    let missingDepDll = workDir & r"\missing_dep.dll"
+    let exePath = workDir & r"\tloader_windows.exe"
+    let nimcacheDir = workDir & r"\nc"
+    cpFile("tests/missing_dep.c", missingDepC)
+    cpFile("tests/victim.c", victimC)
+    withDir workDir:
+      exec "gcc -shared -o missing_dep.dll missing_dep.c -Wl,--out-implib,libmissing_dep.dll.a"
+      exec "gcc -shared -o victim.dll victim.c -L. -lmissing_dep"
+    rmFile(missingDepDll)
+    # `victim.dll` (present, dependency deleted) and `totally_absent_xyz.dll`
+    # (never created) are both resolved by `tloader_windows.nim` via a bare
+    # filename, so it must run with `workDir` as its own working directory —
+    # `LoadLibraryA`'s search order checks the calling process's directory
+    # first.
+    exec "nim c -o:" & exePath & " --nimcache:" & nimcacheDir &
+         " --path:src tests/tloader_windows.nim"
+    withDir workDir:
+      exec exePath
+    rmDir(workDir)
+  else:
+    echo "testWindows: no-op on this target (RFC 0011 S0a item 5 stories f/g are Windows-only)"
