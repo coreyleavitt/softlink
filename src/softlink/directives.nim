@@ -316,6 +316,110 @@ proc versionMacrosDupError*(macroName: string, first, second: VersionMacrosDirec
   "versionMacros(...) directive; a dynlib/verifyProcs block may declare " &
   "version macros at most once."
 
+func isValidNimIdentifier(s: string): bool =
+  ## RFC 0011 S0a item 1: is `s` a legal Nim identifier fragment for
+  ## `identBase`'s override? Starts with an ASCII letter (never `_` — the
+  ## SAME "must start with a letter" rule the pattern-derived `baseName`
+  ## already enforces in the `dynlib` macro, right after its own
+  ## derivation — requiring it here too means both paths converge on one
+  ## shared invariant instead of two), each subsequent character a letter,
+  ## digit, or a single underscore (Nim's identifier grammar forbids two
+  ## consecutive underscores and a trailing one). The override is spliced
+  ## by string concatenation into every generated identifier (`load<Base>`,
+  ## `softlinkHandle<Base>`, `<lowerBase>Loaded`, ...), so it must be
+  ## independently legal here — an invalid fragment would otherwise surface
+  ## as an opaque parse error deep in the macro's OWN generated code, not a
+  ## softlink diagnostic (CONTRIBUTING.md's "every macro error is
+  ## softlink-authored" rule).
+  if s.len == 0: return false
+  if not s[0].isAlphaAscii: return false
+  if s[^1] == '_': return false
+  for i in 1 ..< s.len:
+    let c = s[i]
+    if c != '_' and not c.isAlphaAscii and not c.isDigit: return false
+    if c == '_' and s[i - 1] == '_': return false
+  true
+
+type
+  IdentBaseDirective* = object
+    ## RFC 0011 S0a item 1: one parsed `identBase` body directive — at most
+    ## one per `dynlib` block, any position (mirrors `CompatManifestDirective`
+    ## et al above). UNLIKE those, `identBase` is not consumed by the
+    ## `dynlib` macro's own per-statement body loop — its result must be
+    ## known BEFORE `baseName` is derived, since `baseName` immediately
+    ## drives every generated identifier the moment it's computed (see
+    ## `scanIdentBase` below, and the `dynlib` macro's call to it ahead of
+    ## its `baseName` derivation). `present == false` is the zero value (no
+    ## directive in this block — `baseName` falls back to
+    ## `libNameToIdent(libPattern)`, unchanged).
+    present*: bool
+    overrideName*: string  ## the validated identifier base, as written
+    node*: NimNode          ## the directive call node, for diagnostic anchoring
+
+func isIdentBaseCall*(stmt: NimNode): bool =
+  ## True when `stmt` is an `identBase ...` directive statement —
+  ## `identBase "Glib"` (`nnkCommand`) or `identBase("Glib")` (`nnkCall`) —
+  ## checked structurally against the bare identifier text, exactly like
+  ## `isCompatManifestCall` above (the block's body is `untyped`, so
+  ## nothing has been resolved to an actual symbol yet).
+  stmt.kind in {nnkCall, nnkCommand} and stmt.len >= 1 and
+    stmt[0].kind == nnkIdent and $stmt[0] == "identBase"
+
+proc parseIdentBaseDirective*(stmt: NimNode, macroName: string): IdentBaseDirective =
+  ## RFC 0011 S0a item 1: parse one recognized `identBase` directive
+  ## statement's argument shape — exactly one non-empty string-literal
+  ## argument that is itself a valid Nim identifier (`isValidNimIdentifier`
+  ## above). Any other shape (no argument, more than one, a non-literal
+  ## argument, an empty string, or an invalid identifier) is a
+  ## directive-specific macro error here, never the generic body-shape
+  ## error `dynlib` raises for an unrecognized statement.
+  result.present = true
+  result.node = stmt
+  if stmt.len != 2 or stmt[1].kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+    error(macroName & ": identBase requires exactly one string literal " &
+          "argument naming the identifier base, e.g. identBase(\"Glib\")", stmt)
+    return
+  let name = stmt[1].strVal
+  if name.len == 0:
+    error(macroName & ": identBase's argument must be non-empty", stmt[1])
+    return
+  if not isValidNimIdentifier(name):
+    error(macroName & ": identBase's argument '" & name &
+          "' is not a valid Nim identifier", stmt[1])
+    return
+  result.overrideName = name
+
+proc identBaseDupError*(macroName: string, first, second: IdentBaseDirective): string =
+  ## RFC 0011 S0a item 1: "at most one identBase per block, any position" —
+  ## voiced like `compatManifestDupError`/`versionMacrosDupError` above.
+  "softlink: " & macroName & ": duplicate identBase directive in one " &
+  "block ('" & first.overrideName & "' and '" & second.overrideName &
+  "') — merge them into a single identBase directive; a dynlib block may " &
+  "override its identifier base at most once."
+
+proc scanIdentBase*(body: NimNode, macroName: string): IdentBaseDirective =
+  ## RFC 0011 S0a item 1: scan `body` for an `identBase` directive BEFORE
+  ## the `dynlib` macro's own per-statement body loop runs. This is why
+  ## `identBase` is NOT a drop-in fourth case alongside `compatManifest`/
+  ## `versionProbe`/`versionMacros`: those three are recognized inside that
+  ## loop and consumed strictly AFTER it finishes, while `baseName` is
+  ## derived BEFORE the loop even starts and immediately drives every
+  ## generated identifier from that point on — so `identBase`'s result has
+  ## to be available earlier than the loop, not later. The loop still
+  ## recognizes `isIdentBaseCall` and `continue`s past any statement
+  ## accepted here (this proc has already fully validated and consumed
+  ## it), so it's never mistaken for a proc declaration and never
+  ## re-emitted. Works "usable regardless of position in the block" by
+  ## construction: this scan sees the WHOLE body up front, same as the
+  ## macro's main loop does for the other three directives.
+  for stmt in body:
+    if isIdentBaseCall(stmt):
+      let d = parseIdentBaseDirective(stmt, macroName)
+      if result.present:
+        error(identBaseDupError(macroName, result, d), stmt)
+      else:
+        result = d
+
 type
   AppliedManifest* = object
     ## RFC-0001 §B.5/§9, slice B6b: `applyCompatManifest`'s return value.

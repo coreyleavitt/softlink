@@ -265,12 +265,50 @@ proc computeMissingPartition(symbols: seq[SymbolFacts], missingSymbols: seq[stri
 # it); `emitPrototypeDecl` is used only inside `genVerifyBlock` itself and
 # stays private to that module.
 
+func leadingAlternationStem(pattern: string): tuple[found: bool, stem, rest: string] =
+  ## RFC 0011 S0a item 2: if `pattern` opens with a parenthesized
+  ## alternation — `"(alt1|alt2|...)"` — whose alternatives all reduce to
+  ## the SAME stem after stripping an optional literal "lib" prefix from
+  ## each, returns that common stem plus the remainder of `pattern`
+  ## following the closing paren. This is the general form of the fix
+  ## below: `"(lib|)"` (bare optional-lib prefix — both alternatives reduce
+  ## to "") and `deriveLibPattern`'s own Windows output
+  ## `"(lib" & stem & "|" & stem & ")"` (both alternatives reduce to
+  ## `stem`) are the SAME shape with a different common stem — one rule
+  ## handles both, rather than special-casing the empty-stem spelling as a
+  ## distinct case from the non-empty one. Alternatives that reduce to
+  ## DIFFERENT stems (no principled pick) or a pattern with no leading
+  ## group at all leave `found = false`; the caller then falls back to
+  ## treating `pattern` unchanged, exactly as before this fix existed.
+  if pattern.len == 0 or pattern[0] != '(':
+    return (false, "", pattern)
+  let closeIdx = pattern.find(')')
+  if closeIdx < 0:
+    return (false, "", pattern)
+  let alts = pattern[1 ..< closeIdx].split('|')
+  if alts.len < 2:
+    return (false, "", pattern)
+  var stem = alts[0]
+  if stem.startsWith("lib"): stem = stem[3 .. ^1]
+  for i in 1 ..< alts.len:
+    var alt = alts[i]
+    if alt.startsWith("lib"): alt = alt[3 .. ^1]
+    if alt != stem:
+      return (false, "", pattern)
+  (true, stem, pattern[closeIdx + 1 .. ^1])
+
 func libNameToIdent(libPattern: string): string =
   ## Derive an identifier base name from a library pattern string.
-  ## Strips "lib" prefix, truncates at first dot, removes non-alphanumeric
-  ## characters (underscores, hyphens, etc.), and capitalizes.
-  ## Examples: "libmbedtls.so(.16|)" → "Mbedtls", "libfoo_bar.so" → "Foobar"
+  ## Normalizes a leading optional-`lib` alternation (`"(lib|)stem..."`,
+  ## `"(libstem|stem)..."` — see `leadingAlternationStem` above, RFC 0011
+  ## S0a item 2) the same as a literal "lib" prefix, truncates at the first
+  ## dot, removes non-alphanumeric characters (underscores, hyphens, etc.),
+  ## and capitalizes.
+  ## Examples: "libmbedtls.so(.16|)" → "Mbedtls", "libfoo_bar.so" → "Foobar",
+  ## "(lib|)glib-2.0-0.dll" → "Glib2" (same as "libglib-2.0.so(|.0)").
   var name = libPattern
+  let alt = leadingAlternationStem(name)
+  if alt.found: name = alt.stem & alt.rest
   if name.startsWith("lib"): name = name[3 .. ^1]
   let dotIdx = name.find('.')
   if dotIdx >= 0: name = name[0 ..< dotIdx]
@@ -723,13 +761,28 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   let resolvedPattern =
     if libPattern.isLogicalName: deriveLibPattern(libPattern, currentLibOs())
     else: libPattern
-  # Derive the ident base from the *logical* name (the macro argument), NOT the
-  # OS-expanded pattern: deriveLibPattern's Windows form "(libz3|z3).dll" would
-  # mangle through libNameToIdent to "Libz3z3", breaking cross-OS ident
-  # stability (loadLibz3z3 on Windows vs loadZ3 elsewhere). Using libPattern
-  # makes the generated idents identical across every target by construction.
-  # (For explicit patterns, resolvedPattern == libPattern, so this is a no-op.)
-  let baseName = libNameToIdent(libPattern)
+  # RFC 0011 S0a item 1: `identBase` overrides `baseName` below — scanned
+  # BEFORE `baseName` is derived (see `scanIdentBase`'s own doc comment for
+  # why this can't be a fourth case inside the per-statement body loop
+  # further down, like `compatManifest`/`versionProbe`/`versionMacros`).
+  let identBaseOverride = scanIdentBase(body, "dynlib")
+  # Absent an `identBase` override, derive the ident base from the
+  # *logical* name (the macro argument), NOT the OS-expanded pattern.
+  # RFC 0011 S0a item 2 closed the historical trap here: deriveLibPattern's
+  # Windows form "(libz3|z3).dll" used to mangle through libNameToIdent to
+  # "Libz3z3" (vs "Z3" from the logical name, breaking cross-OS ident
+  # stability) — libNameToIdent's leading-alternation normalization now
+  # reduces it the same way "Z3" does, so deriving from `libPattern` here
+  # is belt-and-suspenders for that case, not load-bearing. It STAYS
+  # load-bearing for hand-authored EXPLICIT per-OS patterns with
+  # irreducibly different stems across platforms — e.g. Windows
+  # "(lib|)gtk-4-1.dll" (base "Gtk41") vs Linux "libgtk-4.so(|.1)" (base
+  # "Gtk4") — no string-level normalization can unify "4-1" and "4".
+  # `identBase` (above) is the escape hatch for exactly that case, and for
+  # giving multiple blocks over one library distinct load-proc names.
+  let baseName =
+    if identBaseOverride.present: identBaseOverride.overrideName
+    else: libNameToIdent(libPattern)
   if baseName.len == 0:
     error("cannot derive identifier from dynlib pattern '" & libPattern & "'", body)
   if not baseName[0].isAlphaAscii:
@@ -1009,9 +1062,19 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         versionMacrosDirective = d
       continue
 
+    # RFC 0011 S0a item 1: the `identBase` body directive — already fully
+    # scanned, validated, and consumed by `scanIdentBase` ABOVE, before
+    # `baseName` was derived (see that proc's own doc comment for why this
+    # is the one directive NOT recognized-and-consumed inside this loop
+    # like the three above). This branch only needs to skip it here so
+    # it's never mistaken for a proc declaration and never re-emitted.
+    if isIdentBaseCall(stmt):
+      continue
+
     if stmt.kind != nnkProcDef:
       error("dynlib body must contain only proc declarations (or a " &
-            "compatManifest, versionProbe, or versionMacros directive)", stmt)
+            "compatManifest, versionProbe, versionMacros, or identBase " &
+            "directive)", stmt)
 
     let procName = stmt[0]
     let nameStr = $procName

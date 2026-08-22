@@ -48,17 +48,59 @@ suite "isLogicalName — magic vs verbatim (escape hatch) routing":
 
 suite "logical-name ident derivation is OS-invariant (C1 regression)":
   # The macro derives its load/unload/loaded proc names from libNameToIdent
-  # applied to the *logical name*, never to the OS-expanded pattern. Feeding the
-  # Windows-expanded pattern "(libz3|z3).dll" to libNameToIdent mangles it to
-  # "Libz3z3" — which would generate loadLibz3z3 on Windows while Linux/macOS
-  # generate loadZ3. Deriving from the logical name keeps idents identical
-  # across every target by construction.
+  # applied to the *logical name*, never to the OS-expanded pattern — this
+  # stays correct-by-construction regardless of what libNameToIdent does
+  # with any one pattern shape, and remains load-bearing for hand-authored
+  # explicit per-OS patterns with irreducibly different stems across
+  # platforms (e.g. "(lib|)gtk-4-1.dll" vs "libgtk-4.so(|.1)" — RFC 0011's
+  # `identBase` motivating case: no string-level normalization can unify
+  # "4-1" and "4").
   test "logical name yields a stable, OS-independent base ident":
     check libNameToIdent("z3") == "Z3"
     check libNameToIdent("libz3") == "Z3"
-  test "the OS-expanded Windows pattern is the trap the macro must avoid":
-    check libNameToIdent(deriveLibPattern("z3", osWindows)) == "Libz3z3"
-    check libNameToIdent("z3") != libNameToIdent(deriveLibPattern("z3", osWindows))
+  # RFC 0011 S0a item 2: the general leading-alternation `(lib|)`
+  # normalization fix (see the "libNameToIdent — leading-alternation"
+  # suite below) closes this exact trap for bare-stem libraries —
+  # deriveLibPattern's Windows form "(libz3|z3).dll" is the optional-lib
+  # prefix spelled per-candidate rather than via "(lib|)"'s bare
+  # alternation, and treating the two spellings differently would just be
+  # the same bug under a different mask. The OS-expanded pattern is
+  # therefore no longer a trap for this shape; this test is kept (renamed
+  # from "is the trap... must avoid") as a live pin that it stays closed.
+  test "the OS-expanded Windows pattern no longer diverges (RFC 0011 item 2)":
+    check libNameToIdent(deriveLibPattern("z3", osWindows)) == "Z3"
+    check libNameToIdent("z3") == libNameToIdent(deriveLibPattern("z3", osWindows))
+
+suite "libNameToIdent — leading-alternation `(lib|)` normalization (RFC 0011 item 2)":
+  # Bug: the optional-`lib` alternation the pattern grammar already defines
+  # (`"(lib|)stem..."`, `"(libstem|stem)..."`) was NOT treated the same as
+  # a literal "lib" prefix — only a plain startsWith("lib") was stripped.
+  # Fix: a LEADING parenthesized alternation whose alternatives all reduce
+  # to the same stem after optional-lib-prefix stripping is replaced by
+  # that stem before the rest of the derivation (dot-truncation, non-alnum
+  # stripping, capitalization) runs, unchanged.
+  test "the motivating example: (lib|) bare optional prefix":
+    check libNameToIdent("(lib|)glib-2.0-0.dll") == "Glib2"
+
+  test "matches the equivalent Linux explicit-alternation pattern":
+    check libNameToIdent("(lib|)glib-2.0-0.dll") ==
+          libNameToIdent("libglib-2.0.so(|.0)")
+
+  test "general form: two DIFFERENT alternatives that reduce to the same stem":
+    # deriveLibPattern's own Windows shape: "(lib" & stem & "|" & stem & ")".
+    check libNameToIdent("(libz3|z3).dll") == "Z3"
+    check libNameToIdent("(libfoo|foo).so") == "Foo"
+
+  test "alternative order doesn't matter":
+    check libNameToIdent("(|lib)glib-2.dll") == "Glib2"
+
+  test "alternatives that do NOT reduce to a common stem fall back unchanged":
+    # No principled stem to pick — falls back to the pre-fix behavior (the
+    # whole leading group survives into the non-alnum strip).
+    check libNameToIdent("(libfoo|bar).dll") == "Libfoobar"
+
+  test "malformed group (no closing paren) falls back unchanged, never crashes":
+    check libNameToIdent("(unbalanced.dll") == "Unbalanced"
 
 # System library tests — Linux only (library names produce consistent identifiers)
 when defined(linux):
@@ -1281,6 +1323,32 @@ when defined(linux):
     test "resolves libvern.so.3 with no bare libvern.so present":
       check loadVern().kind == lrOk
       check testlib_versioned() == 7
+
+
+# RFC 0011 S0a item 1: `identBase` overrides the derived identifier base.
+# Motivating case: multiple dynlib blocks over ONE library needing distinct
+# load-proc names — proven here by a SECOND block over the exact same
+# `TestLib` pattern the main suite's own block (near the top of this file)
+# already uses, which is only possible because `identBase` picks a
+# different base (the dup-block guard fires on `declared(softlinkHandle<Base>)`,
+# so two blocks deriving the SAME base from the SAME pattern would collide).
+# `testlib_dropped` (declared in testlib.h, never defined in testlib.c —
+# see its own header comment) is unused as a wrapper anywhere else in this
+# file, so binding it {.optional.} here can't collide with another dynlib
+# block's wrapper proc AND still proves a real end-to-end load/dispatch
+# cycle (lrOkPartial, not a compile-only fixture).
+dynlib TestLib:
+  identBase "TestlibAlt"
+  proc testlib_dropped(): cint {.cdecl, optional, header: "tests/testlib.h".}
+
+suite "identBase (RFC 0011 S0a item 1) — override drives every generated name":
+  test "loadTestlibAlt/unloadTestlibAlt/testlibaltLoaded exist and work independently of loadTestlib":
+    check not testlibaltLoaded()
+    check loadTestlibAlt().kind == lrOkPartial
+    check testlibaltLoaded()
+    check not testlib_droppedAvailable()
+    unloadTestlibAlt()
+    check not testlibaltLoaded()
 
 
 # RFC-0001 slice B0: softlink/versions — comparator + pinned types.

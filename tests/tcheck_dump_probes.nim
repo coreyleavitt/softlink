@@ -17,6 +17,14 @@
 ## - a `verifyProcs` block (base name "VerifyTestlib_noop" — see the
 ##   tag-reuse rationale on `dumpProbeFacts`'s call site in
 ##   src/softlink.nim): a single header-verified proc.
+## - RFC 0011 S0a item 1: a SECOND `dynlib` block over the EXACT SAME
+##   pattern as the first ("libdumpfoo.so"), distinguished only by an
+##   `identBase "DumpfooAlt"` override — the RFC's own motivating scenario
+##   (multiple blocks over one library needing distinct load-proc names).
+##   Proves `identBase`'s override flows through `dumpProbeFacts`'s
+##   filename/`baseName`-field derivation, not just the generated Nim
+##   identifiers: without the override this block would collide with the
+##   first (same derived base "Dumpfoo") and fail to compile at all.
 ##
 ## All bindings reuse EXISTING testlib.h symbols/signatures/prototype
 ## strings already proven correct by test_softlink.nim's own fixtures
@@ -34,6 +42,10 @@ dynlib "libdumpfoo.so":
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
   proc dumpfoo_private(): cint
     {.cdecl, noverify: "vendor-private, no public header".}
+
+dynlib "libdumpfoo.so":
+  identBase "DumpfooAlt"
+  proc testlib_noop() {.cdecl, header: "tests/testlib.h".}
 
 verifyProcs:
   proc testlib_noop() {.cdecl, header: "tests/testlib.h".}

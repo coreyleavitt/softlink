@@ -992,6 +992,10 @@ task test, "Run tests":
     ## dump directory at all — this slice is purely additive).
     let dynlibFile = dumpProbesDir & "/Dumpfoo.probes.json"
     let verifyFile = dumpProbesDir & "/VerifyTestlib_noop.probes.json"
+    # RFC 0011 S0a item 1: the `identBase "DumpfooAlt"` block's dump file —
+    # named after the OVERRIDE, not the pattern-derived "Dumpfoo" the
+    # first block in this fixture already claims.
+    let dynlibAltFile = dumpProbesDir & "/DumpfooAlt.probes.json"
     if dirExists(dumpProbesDir): rmDir(dumpProbesDir)
     # No-define control: compiling the SAME fixture without the define must
     # create no dump directory whatsoever.
@@ -1006,9 +1010,11 @@ task test, "Run tests":
     mkDir(dumpProbesDir)
     writeFile(dynlibFile, "not valid json, pre-existing garbage")
     writeFile(verifyFile, "not valid json, pre-existing garbage")
+    writeFile(dynlibAltFile, "not valid json, pre-existing garbage")
     exec dumpProbesCheck
     validateProbeJson(dynlibFile, "dynlib", "Dumpfoo")
     validateProbeJson(verifyFile, "verifyProcs", "VerifyTestlib_noop")
+    validateProbeJson(dynlibAltFile, "dynlib", "DumpfooAlt")
     rmDir(dumpProbesDir)
 
   # RFC-0001 §4 B.2: define-gated probe modes (`-d:softlinkProbeOnly=<sym|->`
@@ -1771,6 +1777,26 @@ task test, "Run tests":
 
     expectManifestCompileFail(mcBase & "tests/tfail_versionmacros_header_duplicate.nim",
       ["'header' argument was given more than once"])
+
+    # RFC 0011 S0a item 1: `identBase(...)` directive parse + validation —
+    # mirrors the `compatManifest`/`versionMacros` malformed-shape and
+    # dup-guard checks above, plus a `verifyProcs`-rejection pin (design
+    # guidance's "decide and pin behavior in verifyProcs blocks" call:
+    # unrecognized there, falls into the ordinary body-shape error).
+    expectManifestCompileFail(mcBase & "tests/tfail_identbase_duplicate.nim",
+      ["duplicate identBase directive"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_identbase_bad_type.nim",
+      ["identBase requires exactly one string literal argument"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_identbase_invalid_ident.nim",
+      ["is not a valid Nim identifier"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_identbase_empty.nim",
+      ["identBase's argument must be non-empty"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_identbase_verifyprocs.nim",
+      ["verifyProcs body must contain only proc declarations"])
 
     # RFC-0002 §5/§6, slice E2: gate-synthesis bound validation — both are
     # NIM macro-time errors (`error()`-raised inside `synthesizeVersionGates`

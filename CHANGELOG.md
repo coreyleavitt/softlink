@@ -4,6 +4,42 @@ All notable changes to softlink are documented here.
 
 ## [Unreleased]
 
+### Added
+
+**`identBase` body directive (RFC 0011 S0a item 1).** Overrides the
+identifier base a `dynlib` block derives from its pattern —
+`identBase "Gtk4"` makes a block generate `loadGtk4`/`unloadGtk4`/
+`gtk4Loaded` regardless of what its pattern string would otherwise derive.
+Motivating case: per-platform explicit patterns for the same library that
+derive irreducibly different bases (e.g. Windows `"(lib|)gtk-4-1.dll"` →
+`Gtk41` vs Linux `"libgtk-4.so(|.1)"` → `Gtk4` — no string-level
+normalization can unify "4-1" and "4"), and multiple `dynlib` blocks over
+one library needing distinct load-proc names. At most one per block, any
+position; a syntactically valid, non-empty Nim identifier is required
+(rejected otherwise with a softlink-authored error, never an opaque
+generated-code parse failure); not recognized in `verifyProcs` (no
+`loadX`/wrapper surface for it to rename). See the README's
+["`identBase`: overriding the derived identifier base"](README.md#identbase-overriding-the-derived-identifier-base)
+section.
+
+### Changed
+
+**`libNameToIdent`'s leading-alternation normalization is now general
+(RFC 0011 S0a item 2) — BREAKING for any binding using an explicit
+alternation pattern.** The optional-`lib` alternation the pattern grammar
+already defines (`"(lib|)stem..."`, and the general
+`"(lib<stem>|<stem>)..."` shape `deriveLibPattern` itself emits for
+Windows) is now normalized identically to a literal `lib` prefix, closing
+an inconsistency where `"(lib|)glib-2.0-0.dll"` derived `Libglib2` instead
+of `Glib2` (the base `"libglib-2.0.so(|.0)"` already derived). **Any
+existing `dynlib` block whose pattern opens with such an alternation gets
+a renamed identifier base as of this release** — e.g. a Windows-targeting
+block written as `dynlib "(lib|)foo.dll"` now generates `loadFoo` instead
+of `loadLibfoo`. Audit any such block before upgrading; the new
+[`identBase`](README.md#identbase-overriding-the-derived-identifier-base)
+directive (above) is the escape hatch if you need to pin the previous name
+without also fixing the pattern.
+
 ### Fixed
 
 **Bound-covered mismatches no longer warn on every consumer build**
