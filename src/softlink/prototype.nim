@@ -215,7 +215,7 @@ func nonBuiltinIdentifiers*(prototype: string): seq[string] =
     for i in 0 ..< stop:
       consider(depth1[i])
 
-proc parsePrototypePragma*(pragma, stmt: NimNode, nameStr: string): tuple[raw, name: string] =
+proc parsePrototypePragma*(pragma, stmt: NimNode, nameStr, cName: string): tuple[raw, name: string] =
   ## Extract and validate the `{.prototype: "<C prototype>".}` pragma
   ## (RFC-0001 §3 A.1): a non-empty string literal — triple-quoted/
   ## multi-line strings are explicitly blessed so upstream's own
@@ -230,6 +230,17 @@ proc parsePrototypePragma*(pragma, stmt: NimNode, nameStr: string): tuple[raw, n
   ## both select a declaration source on this axis (RFC-0001 §3, "four
   ## pragma axes"). A1 only validates; nothing is emitted from the result
   ## yet (extern declaration + verify-TU wiring is slice A2).
+  ##
+  ## RFC 0011 S0a item 3: `cName` is the proc's EFFECTIVE C name — `nameStr`
+  ## itself unless a `{.symbol: "...".}` rename pragma overrides it (already
+  ## resolved by the caller's prescan, `softlink/pragmas.parseProcPragmas`,
+  ## by the time this runs — order-independent regardless of where `symbol:`
+  ## sits in the proc's own pragma list). The match check below compares
+  ## the prototype's extracted name against `cName`, not `nameStr`: a
+  ## vendored prototype describes a C declaration, so it must name the same
+  ## C symbol the proc actually resolves against, not the Nim identifier
+  ## chosen for it. `nameStr` is kept as a separate parameter purely for
+  ## diagnostic attribution ("proc 'nameStr': ...").
   if not (pragma.kind == nnkExprColonExpr and
           pragma[1].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit}):
     error("proc '" & nameStr & "': prototype pragma requires a C prototype " &
@@ -265,9 +276,9 @@ proc parsePrototypePragma*(pragma, stmt: NimNode, nameStr: string): tuple[raw, n
               "without verifying the variadic tail; write a prototype " &
               "for the fixed-arity form only", stmt)
         (raw, "")
-      elif analysis.name != nameStr:
+      elif analysis.name != cName:
         error("proc '" & nameStr & "': prototype declares '" & analysis.name &
-              "', which does not match the proc's name '" & nameStr &
+              "', which does not match the proc's C name '" & cName &
               "' — the prototype must describe the same C symbol as the " &
               "proc", stmt)
         (raw, "")

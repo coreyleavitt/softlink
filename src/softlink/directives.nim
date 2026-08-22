@@ -624,7 +624,7 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   # includes the corrected bound (softlink/manifest.checkSince computes it).
   for p in procs:
     if p.sinceVersion.len == 0: continue
-    let sc = checkSince(m, p.nameStr, p.sinceVersion)
+    let sc = checkSince(m, p.cName, p.sinceVersion)
     if sc.contradicted:
       error(sc.message, p.name)
 
@@ -639,7 +639,7 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   # against the same manifest.
   for p in procs:
     if p.untilVersion.len == 0: continue
-    let uc = checkUntil(m, p.nameStr, p.sinceVersion, p.untilVersion)
+    let uc = checkUntil(m, p.cName, p.sinceVersion, p.untilVersion)
     if uc.contradicted:
       error(uc.message, p.name)
 
@@ -650,7 +650,7 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   # invariant, never in a manifest by design). Shared by checks 7 and 8.
   var trackable: seq[string] = @[]
   for p in procs:
-    if isCorpusTrackable(p.noVerify, p.headerFile.len > 0): trackable.add p.nameStr
+    if isCorpusTrackable(p.noVerify, p.headerFile.len > 0): trackable.add p.cName
 
   # Check 7: mismatch warning. Partitioned per the nim-z3 report
   # (softlink-mismatch-warning-issue.md) / CHECK7-WARNING.handoff.md: a
@@ -681,7 +681,7 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   for name in mismatched:
     var untilForName = ""
     for p in procs:
-      if p.nameStr == name:
+      if p.cName == name:
         untilForName = p.untilVersion
         break
     if mismatchCoveredByUntil(m, name, untilForName):

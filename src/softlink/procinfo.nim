@@ -41,6 +41,18 @@ type
   SoftlinkProc* = object
     name*: NimNode
     nameStr*: string
+    cName*: string  ## RFC 0011 S0a item 3: the C symbol this proc resolves
+      ## against — `nameStr` (the Nim identifier) unless a `{.symbol:
+      ## "c_name".}` pragma overrides it. Every consumer that speaks to the
+      ## C side (both `symAddr` emission sites, the `_Static_assert`
+      ## prototype-verification codegen, manifest/`checkSince`/`checkUntil`
+      ## lookup keys, the wrapper loop's drift-candidate comparison, the
+      ## `{.prototype.}` name-match rule, and the probe-facts `cName` field)
+      ## reads THIS field, never `nameStr` — see `softlink/pragmas.
+      ## parseProcPragmas`'s `symbol:` prescan for where it's resolved. Two
+      ## Nim procs may legally share one `cName` (two slots, one `symAddr`);
+      ## the duplicate-proc guard in `dynlib`/`verifyProcs`'s body-collection
+      ## loops still keys on `nameStr`, which is unaffected by this field.
     ptrName*: NimNode
     formalParams*: NimNode
     callConv*: string

@@ -1024,6 +1024,31 @@ task test, "Run tests":
     validateProbeJson(dynlibFile, "dynlib", "Dumpfoo")
     validateProbeJson(verifyFile, "verifyProcs", "VerifyTestlib_noop")
     validateProbeJson(dynlibAltFile, "dynlib", "DumpfooAlt")
+
+    # RFC 0011 S0a item 3: `dumpfoo_alias` (`{.symbol: "testlib_unheralded".}`)
+    # proves `cName` now carries the REAL, independently-tracked C symbol —
+    # distinct from `nimName` — rather than always duplicating it (the
+    # pre-item-3 state `probeFactsJson`'s own doc comment, src/softlink.nim,
+    # used to describe). `validateProbeJson` above only checks the KEY is
+    # present, not its value, so this is a separate, targeted assertion.
+    let dumpfooJson = parseJson(readFile(dynlibFile))
+    var foundAlias = false
+    for p in dumpfooJson["procs"]:
+      if p["nimName"].getStr == "dumpfoo_alias":
+        foundAlias = true
+        if p["cName"].getStr != "testlib_unheralded":
+          quit("softlink: RFC 0011 S0a item 3: " & dynlibFile &
+               " dumpfoo_alias entry: expected cName 'testlib_unheralded', " &
+               "got '" & p["cName"].getStr & "'")
+        if p["cName"].getStr == p["nimName"].getStr:
+          quit("softlink: RFC 0011 S0a item 3: " & dynlibFile &
+               " dumpfoo_alias entry: expected cName != nimName for a " &
+               "renamed proc, both were '" & p["nimName"].getStr & "'")
+    if not foundAlias:
+      quit("softlink: RFC 0011 S0a item 3: " & dynlibFile &
+           " has no 'dumpfoo_alias' proc entry to validate")
+    echo "softlink: RFC 0011 S0a item 3: validated dumpfoo_alias cName != nimName in " & dynlibFile
+
     rmDir(dumpProbesDir)
 
   # RFC-0001 §4 B.2: define-gated probe modes (`-d:softlinkProbeOnly=<sym|->`
@@ -1855,6 +1880,60 @@ task test, "Run tests":
 
     expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_verifywhen_no_header.nim",
       ["must specify a header pragma"])
+
+    # RFC 0011 S0a item 3: the `symbol: "c_name"` rename pragma. The
+    # positive path (a renamed proc loading/dispatching, two Nim procs
+    # sharing one C symbol, `missing`/`lrSymbolNotFound.symbol` naming the
+    # C symbol) is exercised end to end in test_softlink.nim's own "symbol
+    # rename pragma" suite (needs a real load, so it belongs in the main
+    # suite, not here); this group covers everything that's a pure
+    # macro-expansion-time rejection, `--compileOnly`-checkable like every
+    # other `mcBase` fixture in this proc.
+    #
+    # `importc`, bare and valued: softlink is not the FFI importer — the
+    # rename axis is spelled `symbol:`, never `importc` (which would be a
+    # false friend, borrowing a real Nim compiler pragma's name for an
+    # unrelated axis). Both spellings fall through to the ordinary
+    # unrecognized-pragma error, no special case.
+    expectManifestCompileFail(mcBase & "tests/tfail_importc_bare.nim",
+      ["dynlib does not support pragma 'importc'"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_importc_valued.nim",
+      ["dynlib does not support pragma 'importc'"])
+
+    # `symbol:` argument validation — non-empty string literal, syntactically
+    # valid C identifier.
+    expectManifestCompileFail(mcBase & "tests/tfail_symbol_bad_type.nim",
+      ["symbol pragma requires a non-empty C identifier string literal"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_symbol_empty.nim",
+      ["symbol pragma requires a non-empty C identifier string literal"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_symbol_invalid_ident.nim",
+      ["is not a valid C identifier"])
+
+    # The `{.prototype.}` name-match rule keys on the EFFECTIVE C name
+    # (`symbol:`'s value), not the Nim identifier — a prototype naming the
+    # Nim alias instead of the real C symbol must fail its name-match
+    # exactly like naming any other wrong C symbol would.
+    expectManifestCompileFail(mcBase & "tests/tfail_symbol_prototype_name_mismatch.nim",
+      ["does not match the proc's C name 'testlib_add'"])
+
+    # Manifest/`checkSince`/`checkUntil` lookup keys on the C symbol, not
+    # the Nim name, for a renamed proc — both directions (a genuine
+    # contradiction fires; a satisfied claim is found, not reported "not in
+    # compat manifest").
+    expectManifestCompileFail(
+      mcBase & "tests/tfail_manifest_symbol_rename_since_contradiction.nim",
+      ["corrected lower bound is 2.0.0", "testlib_add"])
+
+    expectManifestCompileFail(
+      mcBase & "tests/tfail_manifest_symbol_rename_until_contradiction.nim",
+      ["corrected upper bound is until: \"2.0.0\""])
+
+    expectManifestCompileOk(
+      mcBase & "tests/tcheck_manifest_symbol_rename_found.nim", [],
+      ["not in compat manifest"])
 
     # RFC-0002 §5/§6, slice E2: gate-synthesis bound validation — both are
     # NIM macro-time errors (`error()`-raised inside `synthesizeVersionGates`

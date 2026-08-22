@@ -89,6 +89,57 @@ proc parseUntilExpr(pragma, stmt: NimNode, nameStr: string): string =
   ## for the `until` pragma.
   parseVersionBoundExpr(pragma, stmt, nameStr, "until")
 
+func isValidCIdentifier(s: string): bool =
+  ## RFC 0011 S0a item 3: the syntactic shape `{.symbol: "...".}` must
+  ## satisfy — a C identifier is `[A-Za-z_][A-Za-z0-9_]*`, nothing more.
+  ## softlink splices this string as literal C text (both `symAddr`
+  ## emission sites, the call-based `_Static_assert` chain), so anything
+  ## else would either fail confusingly deep in generated C or, worse,
+  ## "successfully" compile as something other than a plain symbol
+  ## reference — this check turns that into a softlink-authored error at
+  ## the pragma itself.
+  if s.len == 0: return false
+  if s[0] != '_' and not s[0].isAlphaAscii: return false
+  for c in s:
+    if c != '_' and not c.isAlphaNumeric: return false
+  true
+
+proc parseSymbolExpr(pragma, stmt: NimNode, nameStr: string): string =
+  ## RFC 0011 S0a item 3: extract and validate the `{.symbol: "c_name".}`
+  ## rename pragma — a non-empty string literal that is additionally a
+  ## syntactically valid C identifier (see `isValidCIdentifier`). Softlink
+  ## deliberately does not spell this `importc` (bare or valued) — that's a
+  ## real Nim compiler pragma name for an unrelated axis (the FFI import
+  ## mechanism itself), and borrowing it here while making the bare form
+  ## every Nim FFI author reflexively types a hard error would be a false
+  ## friend; `symbol:` matches how softlink's own source already talks
+  ## about "the C symbol" vs. the Nim name. `importc`, bare or valued, is
+  ## therefore simply an unrecognized pragma in a `dynlib`/`verifyProcs`
+  ## body — the existing "does not support pragma" error below covers it,
+  ## with no special case needed here.
+  ##
+  ## On a malformed value, falls back to `nameStr` (the pre-item-3 identity
+  ## default) rather than "" — `error()` has already doomed this compile;
+  ## the fallback only keeps the caller's prescan (which needs SOME string
+  ## before the rest of this proc's per-pragma loop runs — see the
+  ## `prototype` branch, which reads the resolved C name mid-loop) from
+  ## operating on an empty string while the real diagnostic propagates.
+  if pragma.kind == nnkExprColonExpr and
+     pragma[1].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit} and
+     pragma[1].strVal.strip().len > 0:
+    let v = pragma[1].strVal
+    if isValidCIdentifier(v):
+      v
+    else:
+      error("proc '" & nameStr & "': symbol pragma value '" & v &
+            "' is not a valid C identifier", stmt)
+      nameStr
+  else:
+    error("proc '" & nameStr &
+          "' symbol pragma requires a non-empty C identifier string " &
+          "literal (e.g., {.symbol: \"g_object_set\".})", stmt)
+    nameStr
+
 proc parseNoVerifyReasonExpr(pragma, stmt: NimNode, nameStr: string): string =
   ## RFC-0001 §3 A.2: extract the optional {.noverify: "justification".}
   ## string. Bare `{.noverify.}` (an `nnkIdent`, no colon) carries no
@@ -116,6 +167,10 @@ type
     ## signature — merged by each caller into its own per-proc record
     ## (`SoftlinkProc`).
     callConv*: string
+    cName*: string  ## RFC 0011 S0a item 3: the resolved EFFECTIVE C name —
+      ## always non-empty (defaults to the proc's own `nameStr` when no
+      ## `{.symbol: "...".}` pragma is present). See `SoftlinkProc.cName`'s
+      ## own doc comment (softlink/procinfo) for the full consumer list.
     headerFile*: string
     isOptional*: bool
     noVerify*: bool
@@ -146,6 +201,32 @@ proc parseProcPragmas*(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pr
   ##   duplicates); `header` is unconditionally required.
   let macroName = if mode == ppmDynlib: "dynlib" else: "verifyProcs"
   let pragmas = stmt[4]
+
+  # RFC 0011 S0a item 3: `symbol: "c_name"` is prescanned FIRST, in its own
+  # pass over this proc's pragma list, independent of the main per-pragma
+  # loop below — because the `prototype` branch of THAT loop needs the
+  # resolved EFFECTIVE C name to validate its own name-match rule
+  # (`parsePrototypePragma`'s `cName` param) regardless of whether `symbol:`
+  # happens to appear before or after `prototype:` in the author's own
+  # pragma order (Nim pragma lists carry no ordering guarantee softlink can
+  # rely on). Scoped to just this ONE proc's own pragma list — not a
+  # deferred post-body-scan pass like `applyNoVerifyDefault`'s block-level
+  # directive, which can legitimately appear anywhere in the whole block —
+  # so a simple prescan-before-the-real-loop suffices here; nothing outside
+  # this proc's own pragmas needs to be visible yet. Duplicate `symbol:`
+  # pragmas on one proc are NOT rejected — same "last one wins" convention
+  # every other value-carrying pragma here already has (`header`/`since`/
+  # `until`/etc. — none of them dup-check either). Uniform across both
+  # `ProcPragmaMode`s (design guidance: "support it uniformly, same parsing
+  # path" — a rename axis is exactly as meaningful when cross-checking a
+  # vendored/header declaration in `verifyProcs` as it is for `dynlib`'s
+  # runtime `symAddr` lookup), so no `mode` branch here at all.
+  result.cName = nameStr
+  if pragmas.kind == nnkPragma:
+    for pragma in pragmas:
+      if pragmaKeyName(pragma) == "symbol":
+        result.cName = parseSymbolExpr(pragma, stmt, nameStr)
+
   if pragmas.kind == nnkPragma:
     for pragma in pragmas:
       let pragmaName = pragmaKeyName(pragma)
@@ -153,6 +234,8 @@ proc parseProcPragmas*(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pr
         if mode == ppmDynlib and result.callConv != "":
           error("proc '" & nameStr & "' has multiple calling conventions", stmt)
         result.callConv = pragmaName
+      elif pragmaName == "symbol":
+        discard  # already resolved into result.cName by the prescan above
       elif pragmaName == "optional":
         if mode == ppmDynlib:
           result.isOptional = true
@@ -173,7 +256,7 @@ proc parseProcPragmas*(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pr
       elif pragmaName == "until":
         result.untilVersion = parseUntilExpr(pragma, stmt, nameStr)
       elif pragmaName == "prototype":
-        let (raw, name) = parsePrototypePragma(pragma, stmt, nameStr)
+        let (raw, name) = parsePrototypePragma(pragma, stmt, nameStr, result.cName)
         result.prototype = raw
         result.prototypeName = name
       elif pragmaName == "header":

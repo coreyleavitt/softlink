@@ -1104,6 +1104,113 @@ suite "statement pass-through in dynlib bodies (RFC 0011 S0a item 4)":
   test "passed-through const is visible outside the block, with its export marker intact":
     check TestlibPassthroughMagic == 7.cint
 
+# RFC 0011 S0a item 3: `{.symbol: "c_name".}` rename pragma. `identBase` (RFC
+# 0011 S0a item 1) disambiguates each block from the main `TestLib` block
+# above and from each other, since all three re-bind the same real library.
+#
+# Block 1 (stories (a)/(b)/(h)-positive): `renamedAdd` gives `testlib_add` a
+# second Nim name, cross-checked against BOTH the real header and a vendored
+# prototype naming the C symbol (not the Nim alias) — proving the
+# `{.prototype.}` name-match rule keys on `symbol:`'s C name. `renamedAdd2`
+# is a THIRD Nim view of the exact same C symbol: two Nim procs, one
+# `symAddr`, and — critically — not a duplicate-proc error (that check keys
+# on the Nim name, which differs for all three).
+dynlib TestLib:
+  identBase "SymbolRename"
+  proc renamedAdd(a: cint, b: cint): cint
+    {.cdecl, header: "tests/testlib.h",
+      prototype: "int testlib_add(int a, int b)", symbol: "testlib_add".}
+  proc renamedAdd2(a: cint, b: cint): cint
+    {.cdecl, header: "tests/testlib.h", symbol: "testlib_add".}
+
+# Block 2 (story (d), required symbol): a bogus C name on a REAL library —
+# the load must fail at the real, resolvable library, purely because the
+# (renamed) symbol doesn't exist — and the report must name the bogus C
+# symbol, never the Nim alias `requiredBogusAlias`. `{.noverify.}` because
+# no header declares a symbol that doesn't exist.
+dynlib TestLib:
+  identBase "SymbolRenameBogusRequired"
+  proc requiredBogusAlias(): cint
+    {.cdecl, noverify, symbol: "testlib_symbol_rename_bogus_required".}
+
+# Block 3 (story (d), optional symbol): same idea, but optional — the load
+# still succeeds (lrOkPartial), and `missing`/`xxxAvailable()` must both
+# reflect the bogus C symbol, not the Nim alias.
+dynlib TestLib:
+  identBase "SymbolRenameBogusOptional"
+  proc optionalBogusAlias(): cint
+    {.cdecl, optional, noverify, symbol: "testlib_symbol_rename_bogus_optional".}
+
+suite "symbol rename pragma (RFC 0011 S0a item 3)":
+  test "renamed proc loads and dispatches through the real C symbol (a)":
+    check loadSymbolRename().kind in {lrOk, lrOkPartial}
+    check renamedAdd(2, 3) == 5
+
+  test "two Nim procs sharing one C symbol both dispatch correctly — two slots, one symAddr (b)":
+    check renamedAdd2(2, 3) == 5
+    check renamedAdd(10, 32) == renamedAdd2(10, 32)
+
+  test "duplicate Nim proc names still error even when symbol: differs — the dup check keys on the Nim name (c)":
+    check not compiles(block:
+      verifyProcs:
+        proc dupSymProc(): cint {.cdecl, header: "tests/testlib.h", symbol: "testlib_gated".}
+        proc dupSymProc(): cint {.cdecl, header: "tests/testlib.h", symbol: "testlib_noop".}
+    )
+
+  test "compile-time: importc (bare and valued) is an unrecognized pragma in verifyProcs too, not a rename axis (e, verifyProcs parity)":
+    check not compiles(block:
+      verifyProcs:
+        proc icBareVp(): cint {.cdecl, header: "tests/testlib.h", importc.}
+    )
+    check not compiles(block:
+      verifyProcs:
+        proc icValuedVp(): cint {.cdecl, header: "tests/testlib.h", importc: "testlib_noop".}
+    )
+
+  test "compile-time: symbol pragma argument validation (f)":
+    check not compiles(block:
+      verifyProcs:
+        proc symBadTypeVp(): cint {.cdecl, header: "tests/testlib.h", symbol: 123.}
+    )
+    check not compiles(block:
+      verifyProcs:
+        proc symEmptyVp(): cint {.cdecl, header: "tests/testlib.h", symbol: "".}
+    )
+    check not compiles(block:
+      verifyProcs:
+        proc symBadIdentVp(): cint {.cdecl, header: "tests/testlib.h", symbol: "123bad".}
+    )
+    check compiles(block:
+      verifyProcs:
+        proc symOkVp(): cint {.cdecl, header: "tests/testlib.h", symbol: "testlib_noop".}
+    )
+
+  test "lrSymbolNotFound reports the C symbol, never the Nim alias, for a required renamed proc (d)":
+    let r = loadSymbolRenameBogusRequired()
+    check r.kind == lrSymbolNotFound
+    check r.symbol == "testlib_symbol_rename_bogus_required"
+
+  test "missing reports the C symbol, never the Nim alias, for an optional renamed proc (d)":
+    let r = loadSymbolRenameBogusOptional()
+    check r.kind == lrOkPartial
+    check r.missing == @["testlib_symbol_rename_bogus_optional"]
+    check not optionalBogusAliasAvailable()
+
+  test "compile-time: symbol: is supported uniformly in verifyProcs, same parsing path as dynlib":
+    check compiles(block:
+      verifyProcs:
+        proc vpRenamedAdd(a: cint, b: cint): cint
+          {.cdecl, header: "tests/testlib.h", symbol: "testlib_add".}
+    )
+
+  test "compile-time: prototype name-match rule keys on the C symbol, not the Nim alias (h)":
+    check not compiles(block:
+      verifyProcs:
+        proc protoAliasBadVp(a: cint, b: cint): cint
+          {.cdecl, symbol: "testlib_add",
+            prototype: "int protoAliasBadVp(int a, int b)".}
+    )
+
 # Missing library — for lrLibNotFound test
 dynlib "libdefinitely_not_real.so":
   proc testlib_notreal(): cint {.cdecl, header: "tests/testlib.h".}

@@ -125,8 +125,9 @@ Every proc in a `dynlib` (or `verifyProcs`, see below) block picks a value on in
 2. **Verification gating** — `{.verifyWhen: "EXPR".}` or nothing, orthogonal to the source axis.
 3. **Runtime requirement** — `{.optional.}` or required (the default), orthogonal to both of the above.
 4. **Validity interval** — `{.since: "x.y.z".}`, `{.until: "x.y.z".}`, both, or neither, declaring the half-open version window `[since, until)` over which the symbol's declared signature is correct. Cross-checked against a harvested compat manifest (a contradicted claim is a compile-time error) and, at runtime, drives absence classification and drift refusal. The one place this axis isn't fully free-standing: `{.until.}` requires a compile-time gate on axis 2 — hand-written, or synthesized from a block-level `versionMacros(...)` directive, which is what keeps the two axes independently *declarable* even though `until` alone can't verify itself. See [Drifted signatures](#drifted-signatures-since-until-and-versionmacros) below.
+5. **C symbol identity** — `{.symbol: "c_name".}` or nothing (the Nim proc name is also the C symbol, the common case), orthogonal to all of the above. See [`{.symbol: "c_name"}`](#symbol-c_name--bind-under-a-different-c-name) below.
 
-The rest of this section covers `verifyWhen`, `prototype`, and `noverify` in turn — the three ways to shape *how* (or whether) a symbol gets compile-time checked.
+The rest of this section covers `verifyWhen`, `prototype`, `symbol`, and `noverify` in turn — the ways to shape *how* (or against what name) a symbol gets compile-time checked.
 
 Note that `{.optional.}` is **runtime**-optional only: the symbol must still be declared in the compile-time header, because header verification runs for optional procs too. For a symbol that may also be absent from the installed headers (e.g. an API added in a newer library version), gate its verification on the library's version macro with `{.verifyWhen.}`:
 
@@ -174,6 +175,34 @@ Rules:
 - The prototype is never used for dispatch — calls always go through the `dlsym`'d function pointer, exactly as with `header`-verified procs.
 
 Why not just derive the prototype from your Nim signature automatically? Because C prototype compatibility is `const`-*intolerant* and constness can't be inferred from the Nim side — a derived prototype would turn ABI-safe `const` differences (common across header versions) into build breaks. A prototype transcribed from upstream carries the real constness.
+
+#### `{.symbol: "c_name"}` — bind under a different C name
+
+The Nim proc name is usually also the C symbol name; `{.symbol: "c_name".}` overrides that for the cases where it can't or shouldn't be:
+
+- **A fixed-arity Nim view of a variadic C function.** GLib's `g_object_set`/`g_object_get`/`g_object_new` are `NULL`-terminated variadic property setters/getters; softlink, like plain Nim FFI, has no variadic parameter list to declare. A binding instead declares one or more fixed-arity Nim procs — one per property-count shape it actually needs — that all dispatch through the *same* variadic C symbol.
+- **An alias for a C name that reads badly as Nim**, or a deliberately shorter Nim-side name for an unwieldy C one (GTK's `gtk_editable_set_text`/`gtk_editable_get_text` are a real example).
+
+```nim
+dynlib "libgobject-2.0.so(.0|)":
+  # Fixed-arity Nim view of a NULL-terminated variadic setter — dispatches
+  # through the real g_object_set, one property at a time. The vendored
+  # prototype names the C symbol (g_object_set), not the Nim proc
+  # (gObjectSet1) — see the name-match rule below.
+  proc gObjectSet1(obj: pointer, propName: cstring, value: pointer)
+    {.cdecl, header: "gobject/gobject.h",
+      prototype: "void g_object_set(void *object, const char *first_property_name, ...)",
+      symbol: "g_object_set".}
+```
+
+Rules:
+- The value must be a non-empty string literal that is a syntactically valid C identifier (`[A-Za-z_][A-Za-z0-9_]*`) — softlink splices it as literal C text into both the `dlsym`/`GetProcAddress` lookup and the `_Static_assert` verification chain.
+- **Two Nim procs may legally bind the same C symbol** — each still gets its own function-pointer slot and its own symbol lookup, but both resolve to the identical address. This is *not* the duplicate-proc error: that check is on the Nim proc name, never the C symbol, so two differently-named Nim procs sharing one `symbol:` value are unaffected by it.
+- Every runtime-facing report keys on the C symbol, never the Nim alias: `LoadResult.missing`, `LoadResult.symbol` (`lrSymbolNotFound`), drift-refusal stories (`SoftlinkError.msg`), and `compatManifest`/`{.since.}`/`{.until.}` lookups all name `g_object_set`, not `gObjectSet1`, above.
+- `{.prototype.}`'s name-match rule (above) checks against the *effective* C name too, in whichever order the two pragmas are written: a vendored prototype naming the Nim alias instead of the real C symbol is rejected exactly like one naming any other wrong symbol.
+- Accessor names (`xxxAvailable*()`, `xxxPtr*()`) still derive from the **Nim** name, unaffected by `symbol:` — only the underlying symbol lookup and verification target change.
+- Supported identically in `verifyProcs` — same parsing path as `dynlib`, so a statically-linked binding gets the same rename axis for its own signature cross-checks.
+- Deliberately not spelled `importc` (bare or valued): that's a real Nim compiler pragma for an unrelated axis (the FFI import mechanism itself), and reusing its name here — while making the bare form every Nim FFI author reflexively types a hard error — would be a false friend. `importc`, in either spelling, is simply an unrecognized pragma in a `dynlib`/`verifyProcs` body, same as any other typo.
 
 #### `{.noverify: "reason".}` — skip verification, with an optional reason
 

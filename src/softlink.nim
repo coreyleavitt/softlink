@@ -525,12 +525,15 @@ proc probeFactsJson(p: SoftlinkProc): JsonNode =
   ## (`optional` etc.) or supply the user's own type definitions from
   ## outside the block.
   ##
-  ## `cName` duplicates `nimName`: softlink has no `{.importc: "...".}`-
-  ## style rename axis today — the C symbol `symAddr`/the verify assert
-  ## look up IS the proc's Nim name (see `dynlib`'s `loadXxx` body and
-  ## `genVerifyBlock`, both keyed on `nameStr`). Both keys are still
-  ## emitted so the harvester's schema doesn't have to special-case their
-  ## current equality if that axis is ever added.
+  ## `cName` (RFC 0011 S0a item 3): the real, possibly-renamed C symbol —
+  ## `p.cName`, which is `nimName` unless a `{.symbol: "c_name".}` pragma
+  ## overrode it. The two keys were already both emitted, unconditionally
+  ## equal, before this landed (softlink then had no rename axis at all —
+  ## the C symbol `symAddr`/the verify assert looked up WAS the proc's Nim
+  ## name); that groundwork is why the harvester's schema didn't need to
+  ## change shape for this axis to arrive — only the VALUE at this one key
+  ## did, from always-equal-to-nimName to the real, independently-tracked
+  ## C symbol.
   ##
   ## `since` (RFC-0001 §B.5/§C.2, slice B6a: {.since: "x.y.z".} lands in
   ## THIS slice) now carries the real per-proc value — "" when the pragma
@@ -544,7 +547,7 @@ proc probeFactsJson(p: SoftlinkProc): JsonNode =
   ## but does not yet consume it (that's a later RFC-0002 slice).
   %*{
     "nimName": p.nameStr,
-    "cName": p.nameStr,
+    "cName": p.cName,
     "header": p.headerFile,
     "prototype": p.prototype,
     "verifyWhen": p.verifyWhen,
@@ -1162,7 +1165,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # flag, and header via the shared parser (also used by `verifyProcs`).
     let facts = parseProcPragmas(stmt, nameStr, ppmDynlib)
 
-    procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: ptrName,
+    procs.add(SoftlinkProc(name: procName, nameStr: nameStr, cName: facts.cName,
+                        ptrName: ptrName,
                         formalParams: formalParams, callConv: facts.callConv,
                         headerFile: facts.headerFile, isOptional: facts.isOptional,
                         noVerify: facts.noVerify, noVerifyReason: facts.noVerifyReason,
@@ -1448,9 +1452,9 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var mismatchCNames: HashSet[string]
   if appliedManifest.attached:
     for p in procs:
-      let symOpt = findSymbol(appliedManifest.manifest, p.nameStr)
+      let symOpt = findSymbol(appliedManifest.manifest, p.cName)
       if symOpt.isSome and symOpt.get.header[fkMismatch].len > 0:
-        mismatchCNames.incl(p.nameStr)
+        mismatchCNames.incl(p.cName)
 
   # RFC-0001 §C.1: the macro-time-only probe-body scan. No manifest
   # attached, no (well-formed) probe at all, or no symbol in this block
@@ -1487,12 +1491,12 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var requiredDriftCandidates: seq[SoftlinkProc]
   if appliedManifest.attached and hasProbe and driftRefusalEnabled:
     for p in procs:
-      if p.nameStr in mismatchCNames:
+      if p.cName in mismatchCNames:
         if p.isOptional: driftCandidates.add(p)
         else: requiredDriftCandidates.add(p)
   var driftCandidateNames: HashSet[string]
-  for p in driftCandidates: driftCandidateNames.incl(p.nameStr)
-  for p in requiredDriftCandidates: driftCandidateNames.incl(p.nameStr)
+  for p in driftCandidates: driftCandidateNames.incl(p.cName)
+  for p in requiredDriftCandidates: driftCandidateNames.incl(p.cName)
 
   # RFC-0002 §4.4/§4.9, slice C4b/C4c: procs carrying a declared
   # `since`/`until` bound — candidates for the declared-bound refusal
@@ -1517,8 +1521,8 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       if p.sinceVersion.len > 0 or p.untilVersion.len > 0:
         if p.isOptional: declaredBoundOptionalCandidates.add(p)
         else: declaredBoundRequiredCandidates.add(p)
-  for p in declaredBoundOptionalCandidates: driftCandidateNames.incl(p.nameStr)
-  for p in declaredBoundRequiredCandidates: driftCandidateNames.incl(p.nameStr)
+  for p in declaredBoundOptionalCandidates: driftCandidateNames.incl(p.cName)
+  for p in declaredBoundRequiredCandidates: driftCandidateNames.incl(p.cName)
 
   # RFC-0002 §4.4, code-review finding CR1-1 (Critical): the ATTESTED
   # path's own subset of the two lists above — bounded procs that are ALSO
@@ -1546,10 +1550,10 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var declaredBoundRequiredCandidatesAbsent: seq[SoftlinkProc]
   if appliedManifest.attached:
     for p in declaredBoundOptionalCandidates:
-      if findSymbol(appliedManifest.manifest, p.nameStr).isNone:
+      if findSymbol(appliedManifest.manifest, p.cName).isNone:
         declaredBoundOptionalCandidatesAbsent.add(p)
     for p in declaredBoundRequiredCandidates:
-      if findSymbol(appliedManifest.manifest, p.nameStr).isNone:
+      if findSymbol(appliedManifest.manifest, p.cName).isNone:
         declaredBoundRequiredCandidatesAbsent.add(p)
 
   # RFC-0001 §C.3, slice C4b design guidance (extended by C4c to the
@@ -1605,7 +1609,14 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       result.add(item.stmt)
     of diBinding:
       let p = procs[item.procIdx]
-      let nameStr = newStrLitNode(p.nameStr)
+      # RFC 0011 S0a item 3: the C symbol, not the Nim name — this literal
+      # feeds `raiseNotLoaded`/`raiseDriftRefused` (both runtime-facing,
+      # user-visible in `SoftlinkError.msg`) and `findDriftStory`'s lookup
+      # into `softlinkDriftStories<Base>` (itself keyed on `p.cName`, see
+      # the drift-story construction sites below) — all key on the C
+      # symbol per the RFC ("all runtime-facing reporting... key on the C
+      # symbol, not the Nim name").
+      let cNameLit = newStrLitNode(p.cName)
 
       # Build arg list for forwarding call
       var callNode = newCall(p.ptrName)
@@ -1617,7 +1628,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # nil check + call
       var wrapperBody = newStmtList()
       # RFC-0001 §C.3, slice C4b design guidance: for a symbol eligible for
-      # drift refusal (`p.nameStr in driftCandidateNames` — always false,
+      # drift refusal (`p.cName in driftCandidateNames` — always false,
       # hence a no-op addition, when this block has no such symbol), check
       # `softlinkDriftStories<Base>` FIRST: a hit means this pointer was
       # resolved once and then re-nilled for known drift, and the wrapper
@@ -1625,15 +1636,15 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # message. A miss (never refused, or refused-but-not-THIS-symbol)
       # falls through to the unchanged `raiseNotLoaded` call below.
       var nilBranch = newStmtList()
-      if p.nameStr in driftCandidateNames:
+      if p.cName in driftCandidateNames:
         let storySym = genSym(nskLet, "driftStory")
         nilBranch.add(newLetStmt(storySym,
-          newCall(bindSym("findDriftStory"), driftStoriesName, nameStr)))
+          newCall(bindSym("findDriftStory"), driftStoriesName, cNameLit)))
         nilBranch.add(newIfStmt((
           newNimNode(nnkInfix).add(ident(">"), newDotExpr(storySym, ident("len")), newIntLitNode(0)),
-          newStmtList(newCall(ident("raiseDriftRefused"), libPatternLit, nameStr, storySym))
+          newStmtList(newCall(ident("raiseDriftRefused"), libPatternLit, cNameLit, storySym))
         )))
-      nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
+      nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, cNameLit))
       wrapperBody.add(newIfStmt((
         newCall(ident("isNil"), p.ptrName),
         nilBranch
@@ -1781,7 +1792,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     var boundUntilVersions: seq[string] = @[]
     for p in procs:
       if p.sinceVersion.len > 0 or p.untilVersion.len > 0:
-        boundCNames.add(p.nameStr)
+        boundCNames.add(p.cName)
         boundSinceVersions.add(p.sinceVersion)
         boundUntilVersions.add(p.untilVersion)
 
@@ -1951,10 +1962,10 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           newStmtList(newAssignment(notComparableSym, newLit(true))))))
         (checkStmts, refuseSym)
 
-      proc declaredStoryExpr(nameStr, sinceStr, untilStr: string): NimNode =
+      proc declaredStoryExpr(cName, sinceStr, untilStr: string): NimNode =
         newNimNode(nnkInfix).add(ident("&"),
           newNimNode(nnkInfix).add(ident("&"),
-            newStrLitNode(nameStr & ": signature drift, declared valid only at "),
+            newStrLitNode(cName & ": signature drift, declared valid only at "),
             newCall(bindSym("formatInterval"), declaredIvNode(sinceStr, untilStr))),
           newStrLitNode("; refusing unsafe dispatch"))
 
@@ -1963,7 +1974,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # and "first hit wins" (a hit `return`s via `unwindStmt`, so any
       # later check in program order simply never runs).
       for p in requiredCandidates:
-        let symNameLit = newStrLitNode(p.nameStr)
+        let symNameLit = newStrLitNode(p.cName)
         let (checkStmts, refuseSym) = buildBoundCheck(p.sinceVersion, p.untilVersion)
         let versionSnapshotSym = genSym(nskLet, "declBoundReqVersion")
         let reqMissingSym = genSym(nskVar, "declBoundReqMissing")
@@ -1976,7 +1987,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           newNimNode(nnkTupleConstr).add(
             newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
             newNimNode(nnkExprColonExpr).add(ident("story"),
-              declaredStoryExpr(p.nameStr, p.sinceVersion, p.untilVersion)))))
+              declaredStoryExpr(p.cName, p.sinceVersion, p.untilVersion)))))
         hitStmts.add(newNimNode(nnkVarSection).add(newNimNode(nnkIdentDefs).add(
           reqMissingSym,
           newNimNode(nnkBracketExpr).add(ident("seq"), bindSym("MissingReasonEntry")),
@@ -2007,7 +2018,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # OPTIONAL candidates: re-nil the pointer and keep classifying
       # (unchanged shape from C4b).
       for p in optionalCandidates:
-        let symNameLit = newStrLitNode(p.nameStr)
+        let symNameLit = newStrLitNode(p.cName)
         let (checkStmts, refuseSym) = buildBoundCheck(p.sinceVersion, p.untilVersion)
 
         var refuseStmts = newStmtList()
@@ -2017,7 +2028,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           newNimNode(nnkTupleConstr).add(
             newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
             newNimNode(nnkExprColonExpr).add(ident("story"),
-              declaredStoryExpr(p.nameStr, p.sinceVersion, p.untilVersion)))))
+              declaredStoryExpr(p.cName, p.sinceVersion, p.untilVersion)))))
         refuseStmts.add(newCall(newDotExpr(partitionSym, ident("add")),
           newNimNode(nnkTupleConstr).add(
             newNimNode(nnkExprColonExpr).add(ident("symbol"), symNameLit),
@@ -2109,7 +2120,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # Phase 1: Resolve all REQUIRED symbols into temp vars
     for p in procs:
       if p.isOptional: continue
-      let symName = newStrLitNode(p.nameStr)
+      let symName = newStrLitNode(p.cName)
       let tempSym = genSym(nskLet, "sym")
 
       var procTy = newNimNode(nnkProcTy)
@@ -2146,7 +2157,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
 
     for p in procs:
       if not p.isOptional: continue
-      let symName = newStrLitNode(p.nameStr)
+      let symName = newStrLitNode(p.cName)
       let tempSym = genSym(nskLet, "sym")
 
       var procTy = newNimNode(nnkProcTy)
@@ -2383,13 +2394,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # that guard always-true, hence a no-op if added, so it is omitted
       # rather than emitted as dead-but-harmless ceremony.
       for p in requiredDriftCandidates:
-        let symNameLit = newStrLitNode(p.nameStr)
+        let symNameLit = newStrLitNode(p.cName)
         let mismatchSym = genSym(nskLet, "reqMismatch")
         let versionSnapshotSym = genSym(nskLet, "reqDriftVersion")
         let reqMissingSym = genSym(nskVar, "reqMissingPartition")
         let storyExpr = newNimNode(nnkInfix).add(ident("&"),
           newNimNode(nnkInfix).add(ident("&"),
-            newStrLitNode(p.nameStr & ": signature drift at "),
+            newStrLitNode(p.cName & ": signature drift at "),
             newCall(bindSym("formatInterval"), newCall(bindSym("get"), mismatchSym))),
           newStrLitNode(" per compat manifest; refusing unsafe dispatch"))
         var hitStmts = newStmtList()
@@ -2455,11 +2466,11 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
           newNimNode(nnkBracketExpr).add(ident("seq"), bindSym("MissingReasonEntry")),
           newEmptyNode())))
         for p in driftCandidates:
-          let symNameLit = newStrLitNode(p.nameStr)
+          let symNameLit = newStrLitNode(p.cName)
           let mismatchSym = genSym(nskLet, "mismatch")
           let storyExpr = newNimNode(nnkInfix).add(ident("&"),
             newNimNode(nnkInfix).add(ident("&"),
-              newStrLitNode(p.nameStr & ": signature drift at "),
+              newStrLitNode(p.cName & ": signature drift at "),
               newCall(bindSym("formatInterval"), newCall(bindSym("get"), mismatchSym))),
             newStrLitNode(" per compat manifest; refusing unsafe dispatch"))
           var refuseStmts = newStmtList()
@@ -2772,7 +2783,8 @@ proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: Co
       error("duplicate proc '" & nameStr & "' in verifyProcs block", stmt)
     seenNames.incl(nameStr)
     let facts = parseProcPragmas(stmt, nameStr, ppmVerifyProcs)
-    result.procs.add(SoftlinkProc(name: procName, nameStr: nameStr, ptrName: procName,
+    result.procs.add(SoftlinkProc(name: procName, nameStr: nameStr, cName: facts.cName,
+      ptrName: procName,
       formalParams: formalParams, callConv: facts.callConv, headerFile: facts.headerFile,
       isOptional: false, verifyWhen: facts.verifyWhen, prototype: facts.prototype,
       sinceVersion: facts.sinceVersion, untilVersion: facts.untilVersion,

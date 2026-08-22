@@ -32,6 +32,12 @@
 ## file's job is to exercise the DUMP, not to re-prove header verification
 ## itself.
 ##
+## RFC 0011 S0a item 3: `dumpfoo_alias` — a `{.symbol: "...".}`-renamed
+## proc — proves the probe-facts `cName` key carries the REAL C symbol,
+## distinct from `nimName`, once the rename axis exists (see
+## `probeFactsJson`'s doc comment in src/softlink.nim: `cName` used to
+## always equal `nimName` because softlink had no rename axis at all).
+##
 ## NOT compiled by the regular test suite; see the `nimble test` task.
 import softlink
 
@@ -42,6 +48,8 @@ dynlib "libdumpfoo.so":
   proc testlib_future(): cint {.cdecl, optional, header: "tests/testlib.h".}
   proc dumpfoo_private(): cint
     {.cdecl, noverify: "vendor-private, no public header".}
+  proc dumpfoo_alias(): cint
+    {.cdecl, noverify, symbol: "testlib_unheralded".}
 
 dynlib "libdumpfoo.so":
   identBase "DumpfooAlt"

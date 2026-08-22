@@ -359,7 +359,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
       "existence-only probe is meaningless without exactly one target " &
       "symbol. Got softlinkProbeOnly=" & gotDesc & ". Pass the exact C " &
       "name of the symbol being probed, e.g. -d:softlinkProbeOnly=" &
-      procs[0].nameStr & "."
+      procs[0].cName & "."
     error(msg, allProcs[0].name)
 
   # RFC-0003 §4.1 misuse rule: `softlinkProbeGroundTruth` set without
@@ -435,7 +435,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     # fire (the name IS in `allProcs`) even though every genuinely-
     # verifiable proc in the block is being silently, totally suppressed —
     # exactly the failure mode this warning exists to catch.
-    for p in procs: blockCNames.incl(p.nameStr)
+    for p in procs: blockCNames.incl(p.cName)
     var unmatched: seq[string]
     for name in probeOnlyList:
       if name notin blockCNames:
@@ -457,9 +457,12 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     ## {.prototype.} extern decl) must be omitted this compile — probing is
     ## active and this proc is neither the "-" sentinel's "everything"
     ## target nor a member of `probeOnlyList`. A singleton list reduces to
-    ## exactly the pre-B7 `p.nameStr != softlinkProbeOnly` check (byte-
-    ## identical behavior — see `parseProbeOnlyList`'s doc comment).
-    probeOnlyActive and (softlinkProbeOnly == "-" or p.nameStr notin probeOnlyList)
+    ## exactly the pre-B7 `p.cName != softlinkProbeOnly` check (byte-
+    ## identical behavior — see `parseProbeOnlyList`'s doc comment). RFC
+    ## 0011 S0a item 3: keyed on `p.cName`, not `p.nameStr` — this define
+    ## names a real C symbol (the harvester's own bisection target), not a
+    ## Nim identifier.
+    probeOnlyActive and (softlinkProbeOnly == "-" or p.cName notin probeOnlyList)
 
   template isProbedExistence(p: SoftlinkProc): bool =
     ## RFC-0001 §4 B.2: true when this proc IS the probed symbol AND
@@ -472,7 +475,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
     ## coexist, but guards this predicate against acting on a partially-
     ## parsed multi-symbol list while that error is still propagating.
     probeOnlyActive and softlinkProbeExistence and probeOnlyList.len == 1 and
-      p.nameStr == probeOnlyList[0]
+      p.cName == probeOnlyList[0]
 
   template isProbedTarget(p: SoftlinkProc): bool =
     ## RFC-0003 §5.2(iv): true when this proc is (one of) the probed
@@ -652,11 +655,11 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         var existBody = newNimNode(nnkBracket)
         existBody.add(newStrLitNode(
           "\n#if defined(__cplusplus)\n(void)sizeof(decltype(&" &
-          p.nameStr & "));\n" &
+          p.cName & "));\n" &
           "#elif defined(__GNUC__)\n(void)sizeof(__typeof__(&" &
-          p.nameStr & "));\n" &
+          p.cName & "));\n" &
           "#elif defined(_MSC_VER) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L\n" &
-          "(void)sizeof(__typeof__(&" & p.nameStr & "));\n"))
+          "(void)sizeof(__typeof__(&" & p.cName & "));\n"))
         when defined(softlinkStrictVerify):
           existBody.add(newStrLitNode(
             "#else\n#error \"softlink: existence probe unavailable here " &
@@ -702,7 +705,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         if p.headerFile != "": p.headerFile
         elif p.prototype.len > 0: "vendored prototype"
         else: "declaration"
-      let errMsg = "softlink: " & p.nameStr & " signature mismatch vs " & declSource
+      let errMsg = "softlink: " & p.cName & " signature mismatch vs " & declSource
 
       # Helper: build the call args portion of emit array
       # Result: [symName, "(", p1, ", ", p2, ", ", ..., ")"]
@@ -742,7 +745,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
       assertBody.add(newStrLitNode(
         "\n#if defined(__cplusplus)\nstatic_assert(\n  std::is_same<\n" &
         "    typename softlink_strip_ptr_const<decltype("))
-      buildCallArgs(assertBody, p.nameStr, dummyVars)
+      buildCallArgs(assertBody, p.cName, dummyVars)
       assertBody.add(newStrLitNode(")>::type,\n    "))
       if p.hasReturn:
         addTypeToEmit(assertBody, p.formalParams[0])
@@ -760,7 +763,7 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         "#elif defined(__GNUC__)\n_Static_assert(\n  __builtin_types_compatible_p(\n    __typeof__("))
       if retIsPointerLike:
         assertBody.add(newStrLitNode("*"))
-      buildCallArgs(assertBody, p.nameStr, dummyVars)
+      buildCallArgs(assertBody, p.cName, dummyVars)
       assertBody.add(newStrLitNode("),\n    "))
       if p.hasReturn:
         if retIsPointerLike:
@@ -801,16 +804,16 @@ proc genVerifyBlock*(allProcs: seq[SoftlinkProc], tag: string,
         # `const char *`-returning proc — e.g. libz3's `Z3_string` (#11 on MSVC).
         assertBody.add(newStrLitNode(
           "_Static_assert(\n  _Generic(*(__typeof__("))
-        buildCallArgs(assertBody, p.nameStr, dummyVars)
+        buildCallArgs(assertBody, p.cName, dummyVars)
         assertBody.add(newStrLitNode("))0,\n    __typeof__(*("))
         addTypeToEmit(assertBody, p.formalParams[0])
         assertBody.add(newStrLitNode(
           ")0): 1, default: 0),\n  \"" & errMsg & "\"\n);\n"))
       else:
         # Non-pointer: call + _Generic __typeof__ pointer trick
-        buildCallArgs(assertBody, p.nameStr, dummyVars)
+        buildCallArgs(assertBody, p.cName, dummyVars)
         assertBody.add(newStrLitNode(";\n_Static_assert(\n  _Generic((__typeof__("))
-        buildCallArgs(assertBody, p.nameStr, dummyVars)
+        buildCallArgs(assertBody, p.cName, dummyVars)
         assertBody.add(newStrLitNode(")*)0,\n    "))
         if p.hasReturn:
           addTypeToEmit(assertBody, p.formalParams[0])

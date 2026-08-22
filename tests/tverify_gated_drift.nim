@@ -14,14 +14,18 @@
 ## (a scalar mismatch is silently converted at the call site — invisible
 ## to softlink's call-based assert, verified by hand).
 ##
-## softlink has no `{.importc: "...".}`-style C-name rename axis — the C
-## symbol IS the Nim proc name (`probeFactsJson`'s doc comment,
-## src/softlink.nim) — so "declaring the symbol twice" needs two separate
-## blocks. `dynlib` is unusable here even across two DIFFERENT library
-## patterns: every proc also gets a zero-arg `xxxPtr*(): proc type`
-## accessor (`src/softlink.nim`, ~line 1343) named ONLY from `p.nameStr`
-## (no per-block prefix), so two dynlib blocks both binding
-## `testlib_drifted` collide on `testlib_driftedPtr` — Nim reports
+## Even with RFC 0011 S0a item 3's `{.symbol: "c_name".}` rename axis,
+## "declaring the symbol twice" still needs two separate blocks: `dynlib`
+## is unusable here even across two DIFFERENT library patterns, because
+## every proc also gets a zero-arg `xxxPtr*(): proc type` accessor
+## (`src/softlink.nim`, ~line 1343) named from `p.nameStr` — the Nim name,
+## deliberately UNCHANGED by `symbol:` (see that pragma's own doc comment) —
+## so two dynlib blocks binding `testlib_drifted` under either its real
+## name or a `symbol:`-renamed alias still collide on `testlib_driftedPtr`
+## the moment either block picks the same Nim proc name; a rename axis
+## sidesteps a C-name collision, not this one, which is purely Nim-side.
+## Two blocks both naming their proc `testlib_drifted` (this fixture's own
+## shape, below) collide regardless — Nim reports
 ## "overloaded 'testlib_driftedPtr' leads to ambiguous calls" even when the
 ## two blocks' `testlib_drifted` signatures themselves differ enough to be
 ## legal overloads (verified by hand). `verifyProcs` has no such

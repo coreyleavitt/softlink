@@ -71,6 +71,33 @@ covers. See the README's
 ["Block-level `noverify` default"](README.md#block-level-noverify-default)
 section.
 
+**`{.symbol: "c_name".}` rename pragma (RFC 0011 S0a item 3).** A proc's C
+symbol no longer has to equal its Nim name: `{.symbol: "c_name".}` binds a
+Nim proc against a different, explicitly-named C symbol. Needed for
+fixed-arity Nim views of variadic C functions (GLib's
+`g_object_set`/`g_object_get`/`g_object_new`) and for aliasing an unwieldy
+C name (GTK's `gtk_editable_*_text` family) to a cleaner Nim one. Two Nim
+procs may legally share one C symbol — each gets its own function-pointer
+slot and its own lookup, both resolving the same address; this is not the
+duplicate-proc error, which keys on the Nim name and is unaffected. Every
+runtime-facing report (`LoadResult.missing`, `LoadResult.symbol` on
+`lrSymbolNotFound`, drift-refusal stories, `compatManifest`/`{.since.}`/
+`{.until.}` lookups) and the `{.prototype.}` name-match rule now key on the
+C symbol, not the Nim name. Accessor names (`xxxAvailable*()`, `xxxPtr*()`)
+and the duplicate-proc guard are unaffected — both still derive from/key on
+the Nim name. Deliberately not spelled `importc` (bare or valued): that
+name belongs to a real, unrelated Nim compiler pragma, and reusing it here
+— while making the bare form every Nim FFI author reflexively types a hard
+error — would be a false friend; both spellings remain ordinary
+unrecognized pragmas in a `dynlib`/`verifyProcs` body. The pragma's own
+argument validation (non-empty string literal, syntactically valid C
+identifier) is a softlink-authored compile-time error. Supported
+identically in `verifyProcs` — same parsing path as `dynlib`. The
+probe-facts dump's `cName` key now carries the real C symbol instead of
+always duplicating `nimName`. See the README's
+["`{.symbol: "c_name"}` — bind under a different C name"](README.md#symbol-c_name--bind-under-a-different-c-name)
+section.
+
 ### Changed
 
 **`libNameToIdent`'s leading-alternation normalization is now general
