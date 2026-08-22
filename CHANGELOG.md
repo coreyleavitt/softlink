@@ -228,6 +228,55 @@ declared {.until.})" hint instead, escalated to a warning under
 `-d:softlinkStrictVerify` (the same audit-mode convention as the
 not-in-manifest hint). Unbounded drift still warns loudly.
 
+### Fixed
+
+**`trustedWrappers`/`softlink/fatal` — MSVC link failure and a CI hang,
+both found by real CI after the initial RFC 0011 S0b landing.**
+
+- *MSVC link failure (`windows-msvc` CI leg):* `LNK2019 unresolved external
+  ... __imp_GetProcessWindowStation`/`__imp_GetUserObjectInformationW`/
+  `__imp_MessageBoxW`. mingw links `user32` into its default library set;
+  MSVC does not. `softlink/fatal.nim` now `{.passL.}`s the correct library
+  for whichever C backend Nim selected (`user32.lib` under `--cc:vcc`,
+  `-luser32` otherwise) — no change to which symbols are declared or how
+  they're used, purely a linker-input fix.
+
+- *A 30-minute CI hang (`windows-mingw` CI leg, `nimble test`):* the
+  in-process fatal-guard suite (`tests/tfatal.nim`) popped a real,
+  un-clickable `MessageBoxW` and never returned. Root cause: a GitHub-
+  hosted Windows runner's own interactive autologon session has a VISIBLE
+  window station — the exact condition the dialog gate treats as "a human
+  is watching" — indistinguishable, by any environment check, from a
+  genuine desktop. The window-station check itself (added to close the
+  *previous* incident, a container hang — see the entry above) was correct
+  as boolean logic; the mistake was letting an IN-PROCESS test reach the
+  real sink path at all, on the theory that "it never calls `_Exit`, so
+  it's safe." That theory doesn't hold once the sink itself can block.
+  Fixed structurally, not with another environment heuristic (none can
+  reliably tell "interactive desktop with a human" apart from "headless CI
+  on a visible station"):
+  - The in-process test seam (`softlinkFatalTestEntry`) now exercises
+    *only* the atomic CAS guard (`claimFatalGuard`, newly split out) and
+    never reaches real diagnostic-sink I/O (`performFatalSinks`, also
+    newly split out) — an in-process test invocation can no longer perform
+    real UI, by construction, regardless of environment.
+  - The dialog-gating *decision* is now a standalone pure function,
+    `shouldShowFatalDialog*(hasConsole, stationVisible,
+    noFatalDialogDefined: bool): bool`, unit-tested directly as a full
+    boolean truth table (no environment dependency, runs identically on
+    every platform) instead of relying on the real environment to exercise
+    each branch.
+  - Every subprocess child compiled by the default, cross-platform
+    `nimble test` path (`tests/fatal_child_basic.nim`/`fatal_child_race.nim`/
+    `fatal_child_wrapper.nim`, via `tests/tfatal.nim`'s `compileChild`) is
+    now unconditionally compiled with `-d:softlinkNoFatalDialog`, so each
+    is provably unable to open a dialog in ANY environment, not merely
+    unlikely to in today's container. The one fixture that deliberately
+    omits the define to prove the window-station gate itself
+    (`tests/fatal_child_gui.nim`) is confined to the container-targeted
+    `task testWindows` and documented, in both the fixture and the task,
+    as safe only where the window station is non-visible.
+
 ## [0.11.0] - 2026-07-24
 
 ### Fixed

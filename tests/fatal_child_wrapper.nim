@@ -14,9 +14,12 @@
 ## since `loadTestlib()` is never called; compiled with `--passC:-I.` from
 ## the repo root, same as every other `mcBase`-style fixture in this repo.
 ##
-## Compiled WITHOUT `-d:softlinkTesting` — production `softlinkFatal`. NOT
-## run directly by `nimble test`; `tests/tfatal.nim` compiles and runs this
-## as a subprocess and inspects its captured stderr and exit code.
+## Compiled WITHOUT `-d:softlinkTesting` — production `softlinkFatal` — and
+## WITH `-d:softlinkNoFatalDialog` (`tests/tfatal.nim`'s `compileChild`
+## adds it unconditionally, for every child it builds; see that proc's own
+## doc comment for why). NOT run directly by `nimble test`; `tests/
+## tfatal.nim` compiles and runs this as a subprocess and inspects its
+## captured stderr and exit code.
 import std/exitprocs
 import softlink
 

@@ -118,8 +118,44 @@ proc cWriteStderr(msg: cstring) {.importc: "softlink_fatal_write_stderr", nodecl
 proc cBlockForever() {.importc: "softlink_fatal_block_forever", nodecl, raises: [], noreturn.}
 proc cExit(code: cint) {.importc: "_Exit", header: "<stdlib.h>", raises: [], noreturn.}
 
+func shouldShowFatalDialog*(hasConsole, stationVisible, noFatalDialogDefined: bool): bool {.raises: [].} =
+  ## RFC 0011 S0b, post-CI-hang hardening: the PURE decision behind
+  ## whether `fatalCore`'s Windows `MessageBoxW` sink fires, extracted
+  ## from the real WinAPI queries specifically so it is unit-testable as
+  ## plain boolean logic, on ANY platform, without needing a real
+  ## interactive desktop OR a real non-interactive one to exercise every
+  ## branch. This split exists because relying on the REAL environment to
+  ## exercise these branches is exactly what let a genuine incident reach
+  ## CI: a GitHub-hosted Windows runner's own autologon session has a
+  ## VISIBLE window station — identical, by this exact check, to a real
+  ## human's desktop — so no environment-based test can safely probe the
+  ## "show" branch at all; it must be pinned as a truth table instead (see
+  ## `tests/tfatal.nim`'s own dedicated suite for `shouldShowFatalDialog`).
+  ##
+  ## `true` iff: no console is attached AND the window station is
+  ## genuinely interactive/visible AND the build-wide opt-out
+  ## (`-d:softlinkNoFatalDialog`) was not set. Any one of the three
+  ## conditions failing means "do not show" — see this module's own
+  ## top-of-file doc comment for the full rationale of each condition.
+  not hasConsole and stationVisible and not noFatalDialogDefined
+
 when defined(windows):
   import std/widestrs
+
+  # RFC 0011 S0b, post-CI-hang hardening (windows-msvc link failure): mingw
+  # links `user32` into its default library set; MSVC does NOT — a plain
+  # `importc` declaration against `user32.dll` symbols (`OutputDebugStringA`/
+  # `GetConsoleWindow`/`MessageBoxW`/`GetProcessWindowStation`/
+  # `GetUserObjectInformationW`, all below) links cleanly under mingw/gcc but
+  # fails MSVC's linker with `LNK2019 unresolved external ... __imp_...` for
+  # every one of them — confirmed by CI. `--passL` the right library for
+  # whichever C backend Nim selected; `vcc` is the symbol Nim itself defines
+  # when `--cc:vcc` is in effect (this project's own MSVC CI leg and
+  # `softlink.nimble`'s `vccFlags`), so no new detection mechanism is needed.
+  when defined(vcc):
+    {.passL: "user32.lib".}
+  else:
+    {.passL: "-luser32".}
 
   proc winOutputDebugStringA(s: cstring) {.importc: "OutputDebugStringA",
     header: "<windows.h>", stdcall, raises: [].}
@@ -216,45 +252,64 @@ var softlinkFatalGuard: Atomic[bool]
   ## true` path); every other call, on any thread, observes `true` and
   ## short-circuits.
 
-proc fatalCore(diagnostic: string): bool {.raises: [].} =
-  ## The CAS-guarded diagnostic-work step, shared by `softlinkFatal` (the
-  ## real, always-terminates entry point) and, under `-d:softlinkTesting`
-  ## only, `softlinkFatalTestEntry` (same production code path, minus the
-  ## terminating tail — see that proc's own doc comment for why this
-  ## split is the test seam rather than a substitutable hook inside
-  ## `softlinkFatal` itself).
+proc claimFatalGuard(): bool {.raises: [].} =
+  ## RFC 0011 S0b item (ii)(b), post-CI-hang hardening: the CAS reentrancy
+  ## guard, split out as its OWN proc (previously inlined into
+  ## `fatalCore`) specifically so the in-process test seam
+  ## (`softlinkFatalTestEntry`, below) can exercise the guard WITHOUT ever
+  ## calling `performFatalSinks` — see that proc's own doc comment for why
+  ## that separation is now load-bearing, not merely a refactor.
   ##
-  ## Returns `true` iff THIS call is the one that performed the diagnostic
-  ## work (the CAS's winner); `false` means an earlier call — possibly
-  ## still in flight on another thread — already claimed the guard, and
-  ## this call did nothing.
+  ## Returns `true` iff THIS call is the one that claimed the guard (the
+  ## CAS's winner, entitled to perform the real diagnostic work); `false`
+  ## means an earlier call — possibly still in flight on another thread —
+  ## already claimed it.
   var expected = false
-  result = softlinkFatalGuard.compareExchange(expected, true)
-  if not result:
-    return
+  softlinkFatalGuard.compareExchange(expected, true)
+
+proc performFatalSinks(diagnostic: string) {.raises: [].} =
+  ## The REAL diagnostic-sink work — called ONLY by `fatalCore` (the
+  ## production `softlinkFatal` path), NEVER by the in-process test seam
+  ## (`softlinkFatalTestEntry`). This split exists because of a genuine
+  ## incident: a GitHub-hosted Windows CI runner's own autologon session
+  ## has a VISIBLE window station — indistinguishable, by any environment
+  ## heuristic this module can compute, from a real human's interactive
+  ## desktop — so an in-process unit test that reached this proc for real
+  ## on such a runner popped an actual, unclickable `MessageBoxW` dialog
+  ## and hung the whole CI job for 30 minutes until it was cancelled. No
+  ## environment-based gate can safely distinguish "interactive desktop
+  ## with a human" from "headless CI on a visible station"; the only
+  ## sound fix is that an in-process test invocation must NEVER reach real
+  ## OS-level I/O in the first place — see `softlinkFatalTestEntry`'s own
+  ## doc comment for what replaces it (a pure-logic truth table for the
+  ## dialog decision, plus subprocess fixtures compiled with
+  ## `-d:softlinkNoFatalDialog` for the real sink path).
   cWriteStderr(cstring(diagnostic & "\n"))
   when defined(windows):
     winOutputDebugStringA(cstring(diagnostic))
     when not defined(softlinkNoFatalDialog):
-      if winGetConsoleWindow().isNil and winWindowStationIsVisible():
-        # RFC 0011 S0b: `MessageBoxW` only when BOTH (a) the process has no
-        # attached console (`GetConsoleWindow() == NULL` — a GUI-subsystem
-        # process, user32 present even when GTK is not, where stderr has
-        # no reader a human will ever see) AND (b) the window station is
-        # genuinely interactive/visible (`winWindowStationIsVisible`,
-        # above — NOT true in a service/container/session-0 context, where
-        # (a) alone is also true but there is no desktop to show a dialog
-        # on at all). A console-subsystem process already has the
-        # diagnostic on a visible stderr; popping a modal dialog on top of
-        # that would be redundant, and would block a process a script or
-        # CI runner is watching for a plain exit code. A non-visible
-        # window station has NEITHER a console NOR a desktop — condition
-        # (a) alone would wrongly route it here, where `MessageBoxW` never
-        # returns (confirmed empirically, see `winWindowStationIsVisible`'s
-        # own doc comment) — condition (b) is what closes that gap.
+      if shouldShowFatalDialog(hasConsole = not winGetConsoleWindow().isNil,
+                                stationVisible = winWindowStationIsVisible(),
+                                noFatalDialogDefined = false):
+        # RFC 0011 S0b: see `shouldShowFatalDialog`'s own doc comment for
+        # the full rationale of each of its three conditions —
+        # `noFatalDialogDefined` is passed `false` literally here because
+        # this whole branch only exists in the generated code when
+        # `-d:softlinkNoFatalDialog` was NOT given (the `when` above); the
+        # define's OTHER effect — compiling this branch, and the
+        # `MessageBoxW` symbol itself, out of the program entirely — is
+        # unrelated to and additional to what the pure function decides.
         discard winMessageBoxW(nil, newWideCString(diagnostic),
           newWideCString("softlink: fatal error"),
           mbIconError or mbOk or mbSystemModal)
+
+proc fatalCore(diagnostic: string): bool {.raises: [].} =
+  ## The CAS-guarded diagnostic-work step `softlinkFatal` (the real,
+  ## always-terminates entry point) calls. Returns `true` iff THIS call
+  ## performed the diagnostic work (the CAS's winner).
+  result = claimFatalGuard()
+  if result:
+    performFatalSinks(diagnostic)
 
 proc softlinkFatal*(diagnostic: string) {.noreturn, raises: [].} =
   ## RFC 0011 S0b: the trusted wrapper's nil-pointer branch calls this
@@ -289,14 +344,29 @@ when defined(softlinkTesting):
     ## whether this proc exists; nothing here substitutes, wraps, or
     ## conditionally branches around anything `softlinkFatal` does.
     ##
-    ## Calls the SAME `fatalCore` production code `softlinkFatal` calls —
-    ## the CAS guard and every diagnostic sink run for real — and returns
-    ## its `firstEntry` result instead of terminating the process, so an
-    ## in-process `std/unittest` suite can drive the guard (including
-    ## genuine concurrent entry from multiple real OS threads) and observe
-    ## the outcome directly, rather than only ever seeing it via a
-    ## subprocess's exit code and captured stderr.
-    fatalCore(diagnostic)
+    ## Calls `claimFatalGuard` (the SAME CAS step `fatalCore` calls) and
+    ## returns its result — but, POST-CI-HANG HARDENING, deliberately
+    ## does NOT call `performFatalSinks`, not even for the winning case.
+    ## An earlier revision of this seam called the full `fatalCore` (sinks
+    ## included) and was proven unsafe by a real incident: a GitHub-hosted
+    ## Windows CI runner's own interactive autologon session has a VISIBLE
+    ## window station, indistinguishable from a genuine human desktop by
+    ## any check `shouldShowFatalDialog` can make — so the in-process
+    ## suite's very first "claim the guard" test popped a real, unclickable
+    ## `MessageBoxW` and hung the CI job for 30 minutes. `diagnostic` is
+    ## therefore accepted but UNUSED here (kept in the signature so the
+    ## call site reads identically to `softlinkFatal`'s own) — an
+    ## in-process test observes ONLY the guard's own compare-and-swap
+    ## semantics, never real OS-level I/O. Sink CONTENT is pinned
+    ## elsewhere instead: `shouldShowFatalDialog`'s own truth-table unit
+    ## tests pin the dialog decision as pure logic (no environment
+    ## dependency at all), and the subprocess fixtures
+    ## (`tests/fatal_child_*.nim`, compiled with `-d:softlinkNoFatalDialog`
+    ## — see each fixture's own doc comment) exercise the REAL production
+    ## sink path in an isolated child process that can never open a dialog
+    ## regardless of what window station it happens to run under.
+    discard diagnostic
+    claimFatalGuard()
 
   proc resetFatalGuardForTest*() {.raises: [].} =
     ## Test-only: force the guard back to its pristine (`false`) state

@@ -9,9 +9,12 @@
 ## zero (a hang) and never two (both threads doing full diagnostic work).
 ##
 ## Compiled WITHOUT `-d:softlinkTesting` — production `softlinkFatal` on
-## both threads. NOT run directly by `nimble test`; `tests/tfatal.nim`
-## compiles and runs this as a subprocess and inspects its captured stderr
-## (counting occurrences of each diagnostic) and exit code.
+## both threads — and WITH `-d:softlinkNoFatalDialog` (`tests/tfatal.nim`'s
+## `compileChild` adds it unconditionally, for every child it builds; see
+## that proc's own doc comment for why). NOT run directly by `nimble test`;
+## `tests/tfatal.nim` compiles and runs this as a subprocess and inspects
+## its captured stderr (counting occurrences of each diagnostic) and exit
+## code.
 import softlink/fatal
 
 proc worker1() {.thread.} =

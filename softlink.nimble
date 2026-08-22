@@ -2316,13 +2316,27 @@ task test, "Run tests":
   # subsystem (`softlink/fatal`), standalone. `-d:softlinkTesting` gates
   # ONLY this file's own in-process CAS-guard suite (`softlink/fatal`'s
   # `softlinkFatalTestEntry`/`resetFatalGuardForTest` seam, which does not
-  # exist without the define) — the subprocess suite it also drives
-  # compiles its two children (`tests/fatal_child_basic.nim`/
-  # `tests/fatal_child_race.nim`) WITHOUT the define, so those exercise
-  # genuine production `softlinkFatal`. `--threads:on`: both the in-process
-  # concurrent-CAS test and the race subprocess fixture spawn real OS
-  # threads. Needs no built testlib/libmagic/libvern (same rationale as the
-  # four fixtures directly above), so it runs once, unconditionally too.
+  # exist without the define) — that in-process suite deliberately touches
+  # NO real diagnostic-sink I/O (see `tests/tfatal.nim`'s own CI-incident
+  # doc comment: an earlier revision did, and hung a real GitHub Windows
+  # CI runner for 30 minutes via a real, un-clickable `MessageBoxW`, since
+  # that runner's interactive autologon session has a VISIBLE window
+  # station indistinguishable from a human desktop). The dialog-gating
+  # DECISION itself is pinned separately as pure logic
+  # (`shouldShowFatalDialog`'s own truth-table suite, same file). The
+  # subprocess suite compiles three children (`tests/fatal_child_basic.nim`/
+  # `fatal_child_race.nim`/`fatal_child_wrapper.nim`) WITHOUT
+  # `-d:softlinkTesting` (genuine production `softlinkFatal`) but WITH
+  # `-d:softlinkNoFatalDialog` unconditionally (`tests/tfatal.nim`'s
+  # `compileChild`) — this runs on every CI matrix leg, including real
+  # interactive-desktop Windows runners, so every child it spawns must be
+  # PROVABLY unable to open a dialog, not merely unlikely to in today's
+  # container. `--threads:on`: both the in-process concurrent-CAS test and
+  # the race subprocess fixture spawn real OS threads. Needs no built
+  # testlib/libmagic/libvern for ITSELF (same rationale as the four
+  # fixtures directly above) — `fatal_child_wrapper.nim` builds its own
+  # `libtestlib.h`-verified dynlib block internally but never loads the
+  # real library at runtime — so this runs once, unconditionally too.
   exec "nim c -r -d:softlinkTesting --threads:on --path:src tests/tfatal.nim"
 
   # Portable-diagnostics migration (Windows CI fix): every check below this
@@ -2838,6 +2852,18 @@ task testWindows, "RFC 0011 S0a item 5: Windows loader-error-detail measurement 
     # `runWithTimeout`, not a bare `exec`/`gorgeEx` — this exact fixture is
     # what wedged the container the first time; a regression here must fail
     # loudly with a clear timeout, never hang the task/container again.
+    #
+    # ENVIRONMENT REQUIREMENT (see `tests/fatal_child_gui.nim`'s own,
+    # much longer, doc comment for the full incident writeup): this fixture
+    # is compiled WITHOUT `-d:softlinkNoFatalDialog` on purpose and is only
+    # safe where the window station is NON-VISIBLE. `task testWindows` is
+    # driven exclusively against the `ghcr.io/coreyleavitt/nim:2.2.10-mingw`
+    # CONTAINER image (a non-visible window station by construction) — never
+    # against a bare/interactive Windows host, and never folded into `task
+    # test` (the cross-platform gate, which DOES run on real interactive-
+    # desktop Windows CI runners — confirmed the hard way: a GitHub-hosted
+    # Windows runner's autologon session has a VISIBLE station and would
+    # pop a real, un-clickable dialog for this exact fixture).
     let guiWorkDir = tempRoot & r"\softlink_win_fatal_gui_test"
     if dirExists(guiWorkDir): rmDir(guiWorkDir)
     mkDir(guiWorkDir)
