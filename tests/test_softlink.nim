@@ -280,6 +280,43 @@ dynlib TestLib:
     {.cdecl, prototype: "void testlib_proto_gated_false(double a, double b, double c)",
       verifyWhen: "TESTLIB_VERSION >= 99".}
 
+  # RFC 0011 S0a item 4: statement pass-through in dynlib bodies. Binding
+  # modules routinely interleave narrative type/const/helper definitions
+  # with declarations (a struct's Nim type declared alongside the
+  # functions that use it, not hoisted into a separate "types" file) — a
+  # bodyless proc is still the only thing that means "resolve this symbol
+  # at runtime"; everything else here passes through verbatim.
+
+  # (a) the common direction: a `type` section declared first, used by a
+  # LATER binding's own signature — no forward-reference concern, since
+  # pointer vars are only emitted after every passed-through type/const
+  # section in this block (see `dynlib`'s "hoisted" codegen).
+  type
+    ScaleFactor = distinct cint
+
+  proc testlib_double(x: ScaleFactor): ScaleFactor {.cdecl, noverify.}
+
+  # (b)/(c) helper procs WITH a body over the passed-through type — these
+  # pass through verbatim (unlike the bodyless proc above, which is a
+  # binding declaration).
+  proc `==`(a, b: ScaleFactor): bool = cint(a) == cint(b)
+  proc `$`(a: ScaleFactor): string = $cint(a)
+
+  ## (d) a standalone doc-comment statement (`nnkCommentStmt`) — preserved
+  ## verbatim, not merely tolerated, so docgen still sees it.
+
+  # (e) the reverse direction (deliverable 2): the binding is declared
+  # BEFORE the type it uses in its own signature — legal because
+  # type/const sections are hoisted ahead of every pointer-var declaration
+  # in this block, regardless of their own source position.
+  proc testlib_triple(x: TripleFactor): TripleFactor {.cdecl, noverify.}
+
+  type
+    TripleFactor = distinct cint
+
+  # (f) a passed-through const, exported like any other top-level const.
+  const TestlibPassthroughMagic* = 7.cint
+
   # RFC-0001 §9/§C.1, slice C1b: the mode-controlled probe (see `ProbeMode`
   # above). `pmNormal` calls the block's OWN bound wrapper `testlib_add` —
   # the TDD suite's item 1 ("probe calling a bound wrapper"), proving the
@@ -1045,6 +1082,27 @@ suite "softlink":
   # compiles(block:) fails for that unrelated reason. Instead the nimble test
   # task compiles tests/tfail_duplicate_dynlib.nim expecting the clear
   # "collides with an earlier dynlib block" error.
+
+suite "statement pass-through in dynlib bodies (RFC 0011 S0a item 4)":
+  # The ScaleFactor/TripleFactor pair, `==`/`$` helpers, doc comment, and
+  # `TestlibPassthroughMagic` const all live in the `dynlib TestLib:` block
+  # above (tests/test_softlink.nim), interleaved with ordinary bindings —
+  # reaching these tests at all already proves that whole block compiled.
+  test "type declared BEFORE its binding: wrapper dispatches through the real C symbol":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check testlib_double(ScaleFactor(21.cint)) == ScaleFactor(42.cint)
+
+  test "type declared AFTER its binding (deliverable 2, reverse direction)":
+    check loadTestlib().kind in {lrOk, lrOkPartial}
+    check cint(testlib_triple(TripleFactor(10.cint))) == 30.cint
+
+  test "passed-through helper procs (== and $) over the passed-through type work":
+    check ScaleFactor(4.cint) == ScaleFactor(4.cint)
+    check not (ScaleFactor(4.cint) == ScaleFactor(5.cint))
+    check $ScaleFactor(5.cint) == "5"
+
+  test "passed-through const is visible outside the block, with its export marker intact":
+    check TestlibPassthroughMagic == 7.cint
 
 # Missing library — for lrLibNotFound test
 dynlib "libdefinitely_not_real.so":

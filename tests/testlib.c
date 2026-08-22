@@ -47,3 +47,7 @@ TESTLIB_API int testlib_protoonly(void) { return 77; }
  * prototype depends entirely on the gate's C-preprocessor truth value. */
 TESTLIB_API int testlib_proto_gated_true(void) { return 88; }
 TESTLIB_API int testlib_proto_gated_false(void) { return 55; }
+
+/* RFC 0011 S0a item 4: statement pass-through fixtures — see testlib.h. */
+TESTLIB_API int testlib_double(int x) { return x * 2; }
+TESTLIB_API int testlib_triple(int x) { return x * 3; }

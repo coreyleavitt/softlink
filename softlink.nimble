@@ -1798,6 +1798,18 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_identbase_verifyprocs.nim",
       ["verifyProcs body must contain only proc declarations"])
 
+    # RFC 0011 S0a item 4: statement pass-through in `dynlib` bodies — the
+    # one hard limit (a passed-through helper calling a binding declared
+    # LATER in the same block is refused, same as two hand-written
+    # top-level procs would be) and the `verifyProcs` asymmetry (pass-
+    # through is a `dynlib`-only feature; `verifyProcs` keeps its
+    # unrelaxed rule). See each fixture's own doc comment.
+    expectManifestCompileFail(mcBase & "tests/tfail_passthrough_forward_ref.nim",
+      ["undeclared identifier", "testlibForwardTarget"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_passthrough_verifyprocs.nim",
+      ["verifyProcs body must contain only proc declarations"])
+
     # RFC-0002 §5/§6, slice E2: gate-synthesis bound validation — both are
     # NIM macro-time errors (`error()`-raised inside `synthesizeVersionGates`
     # itself, from a `softlink/gates.GateResult` failure case), so

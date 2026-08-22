@@ -117,6 +117,14 @@ TESTLIB_API const char *testlib_const_string(void);
 TESTLIB_API const char *testlib_const_lookup(int key);
 TESTLIB_API char *testlib_mutable_string(void);  /* non-const baseline */
 
+/* RFC 0011 S0a item 4: statement pass-through in dynlib bodies — plain
+ * int-in/int-out symbols used purely to exercise a passed-through Nim
+ * `type` in a binding's own signature, in both directions (type declared
+ * before its binding, and type declared after). See
+ * tests/test_softlink.nim's ScaleFactor/TripleFactor pair. */
+TESTLIB_API int testlib_double(int x);
+TESTLIB_API int testlib_triple(int x);
+
 #ifdef __cplusplus
 }
 #endif

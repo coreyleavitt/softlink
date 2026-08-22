@@ -22,6 +22,26 @@ generated-code parse failure); not recognized in `verifyProcs` (no
 ["`identBase`: overriding the derived identifier base"](README.md#identbase-overriding-the-derived-identifier-base)
 section.
 
+**Statement pass-through in `dynlib` bodies (RFC 0011 S0a item 4).** A
+`dynlib` block no longer requires every statement to be a proc declaration:
+a bodyless proc is still a binding declaration (the only thing that resolves
+a symbol at runtime), but a `type`/`const` section, a proc *with* a body
+(e.g. a helper `==`/`hash`), a `var`/`let`/`template`/`when`, or a doc
+comment now passes through verbatim — matching how real binding modules
+organize a struct's Nim type, a default constant, or a small helper next to
+the declarations that use it, instead of forcing them into a separate
+section. Passed-through `type`/`const` sections are visible to every
+binding in the block regardless of source position (a binding may use one
+declared before or after it); a passed-through helper proc follows ordinary
+Nim top-level rules and may call a binding declared above it but not below
+it. `verifyProcs` is unaffected — it exists solely to verify signatures, so
+every statement there must still be a proc declaration. A misspelled
+directive (e.g. `identBas "X"`) is no longer rejected with a
+softlink-authored error; it is now ordinary user code and fails with Nim's
+own "undeclared identifier" instead. See the README's
+["Statement pass-through: types, consts, and helpers alongside declarations"](README.md#statement-pass-through-types-consts-and-helpers-alongside-declarations)
+section.
+
 ### Changed
 
 **`libNameToIdent`'s leading-alternation normalization is now general

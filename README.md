@@ -254,6 +254,29 @@ The other motivating case: multiple `dynlib` blocks over *one* library (e.g. spl
 
 Rules: the argument is a single non-empty string literal, and must itself be a valid Nim identifier (it's spliced by concatenation into every generated name — `load<Base>`, `unload<Base>`, `<lowerBase>Loaded`, and so on). At most one `identBase` per block, in any position — a second one is a compile-time error telling you to merge them. `identBase` has no meaning in `verifyProcs` (there's no `loadX`/wrapper surface for it to rename) and is rejected there like any other non-proc statement.
 
+### Statement pass-through: types, consts, and helpers alongside declarations
+
+Real binding modules aren't a flat list of proc declarations — they interleave a `type` for a bitflag or handle, a `const` for a default, and small helper procs (`==`, `hash`, `$`) with the declarations that use them, organized by narrative rather than by kind. `dynlib` supports this directly: a **bodyless proc is a binding declaration** (the only thing that means "resolve this symbol at runtime"); **everything else passes through verbatim** — a `type` or `const` section, a proc *with* a body, a `var`/`let`/`template`/`when`, or a doc comment.
+
+```nim
+dynlib "libwidget.so":
+  type
+    WidgetHandle = distinct pointer   ## opaque handle returned by widget_create
+
+  const WidgetDefaultFlags = 0x1.cint
+
+  proc widget_create(flags: cint): WidgetHandle {.cdecl, header: "widget.h".}
+  proc widget_destroy(h: WidgetHandle) {.cdecl, header: "widget.h".}
+
+  ## WidgetHandle has no natural ordering, only identity — borrow equality
+  ## from the underlying pointer so callers can compare handles directly.
+  proc `==`(a, b: WidgetHandle): bool = pointer(a) == pointer(b)
+```
+
+`widget_create`/`widget_destroy` bind exactly as before; `WidgetHandle`, `WidgetDefaultFlags`, and the `==` helper are ordinary Nim code that happens to live inside the block — no `{.header.}`, no calling convention, no verification, because they declare nothing to load. This keeps a migration from `{.importc, dynlib.}` to `dynlib` a per-proc pragma swap, never a whole-file restructuring pass that hoists every type and helper out to a separate section first.
+
+One asymmetry to know about: a `type`/`const` section is visible to every binding in the block regardless of which side of it they're declared on (softlink hoists these ahead of the pointer-var declarations they might be used in), but a passed-through helper proc follows ordinary Nim rules for top-level procs — it may call any binding declared *above* it, not one declared below, exactly as if you'd hand-written two top-level procs in that order. `verifyProcs` (below) doesn't get this feature at all: it exists solely to verify signatures, so every statement in its body still must be a proc declaration.
+
 ## Thread Safety
 
 `loadXxx`, `unloadXxx`, and the generated wrapper procs are **not thread-safe**. The loaded state and function pointer dispatch are not atomic. If you load/unload from multiple threads, or call wrapper procs concurrently with `unloadXxx`, you must synchronize externally.

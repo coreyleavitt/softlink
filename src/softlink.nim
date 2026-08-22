@@ -952,6 +952,25 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       resultConstr.add(newNimNode(nnkExprColonExpr).add(ident(fieldName), valNode))
     result.add(newNimNode(nnkReturnStmt).add(resultConstr))
 
+  # RFC 0011 S0a item 4: a body statement is either a BINDING (a bodyless
+  # proc declaration — dynlib's actual reason for existing) or PASS-
+  # THROUGH (anything else: a `type`/`const` section, a proc WITH a body,
+  # a `var`/`let`/`template`/`when`, or a doc-comment statement).
+  # `orderedItems` (populated by the body-scan loop below) records both
+  # kinds in ONE source-ordered list, which is what lets final emission
+  # (further below) interleave a passed-through helper with the wrapper of
+  # a binding it calls in the same relative order the author wrote them —
+  # walking `procs` and a separate pass-through seq independently could
+  # not reconstruct that interleaving once both lists are collected.
+  type
+    DynlibItemKind = enum
+      diBinding
+      diPassthrough
+    DynlibItem = object
+      case kind: DynlibItemKind
+      of diBinding: procIdx: int
+      of diPassthrough: stmt: NimNode
+
   result = newStmtList()
 
   # Duplicate-block guard. Two dynlib blocks whose patterns derive the same
@@ -1015,8 +1034,13 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     )
   ))
 
-  # Collect proc info and generate pointer vars
+  # Collect proc info, hoisted type/const sections, and pass-through
+  # statements (RFC 0011 S0a item 4). See `DynlibItem`'s doc comment above
+  # for why bindings and pass-through statements share one source-ordered
+  # list (`orderedItems`) instead of two independent seqs.
   var procs: seq[SoftlinkProc]
+  var hoisted: seq[NimNode]
+  var orderedItems: seq[DynlibItem]
   var seenNames: HashSet[string]
   var manifestDirective: CompatManifestDirective
   var versionProbeDirective: VersionProbeDirective
@@ -1071,10 +1095,39 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     if isIdentBaseCall(stmt):
       continue
 
-    if stmt.kind != nnkProcDef:
-      error("dynlib body must contain only proc declarations (or a " &
-            "compatManifest, versionProbe, versionMacros, or identBase " &
-            "directive)", stmt)
+    # RFC 0011 S0a item 4: "bodyless proc = binding declaration; anything
+    # else passes through verbatim" — the general rule replacing the old
+    # blanket `stmt.kind != nnkProcDef` rejection (pre-item-4 wording:
+    # "dynlib body must contain only proc declarations..."). A `type`/
+    # `const` section, a proc WITH a body (e.g. a passed-through `==`/
+    # `hash` helper), a `var`/`let`/`template`/`when`, or a doc-comment
+    # statement (`nnkCommentStmt`) are all legal now; only a BODYLESS proc
+    # still means "resolve this symbol at runtime" — keeping every
+    # migration diff a per-proc pragma swap instead of a whole-file
+    # restructuring pass (binding modules routinely interleave narrative
+    # type/const/helper definitions with declarations).
+    #
+    # Narrower generic-error surface is the accepted trade-off: a
+    # misspelled directive (e.g. `identBas "X"`) no longer gets a
+    # softlink-authored error here — it falls through as ordinary user
+    # code and fails with Nim's own "undeclared identifier" at the call
+    # site, same trade-off `{.noverify.}` already made for symbols no
+    # header declares.
+    if stmt.kind != nnkProcDef or stmt.body.kind != nnkEmpty:
+      case stmt.kind
+      of nnkTypeSection, nnkConstSection:
+        # Hoisted ahead of every binding's pointer-var declaration (see the
+        # emission point below) so a binding's signature may reference a
+        # passed-through type declared EITHER before or after it in
+        # source (deliverable 2's "both directions" requirement). Ordinary
+        # Nim visibility already makes types/consts declaration-order-
+        # independent relative to each other, so hoisting changes nothing
+        # observable about the passed-through code itself — it only lets
+        # every binding see it regardless of source position.
+        hoisted.add(stmt)
+      else:
+        orderedItems.add(DynlibItem(kind: diPassthrough, stmt: stmt))
+      continue
 
     let procName = stmt[0]
     let nameStr = $procName
@@ -1099,22 +1152,42 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
                         prototype: facts.prototype, sinceVersion: facts.sinceVersion,
                         untilVersion: facts.untilVersion,
                         hasReturn: hasReturn))
+    orderedItems.add(DynlibItem(kind: diBinding, procIdx: procs.high))
 
-    # Build proc type for the var — C functions can't raise Nim exceptions
+  # RFC 0011 S0a item 4: hoisted type/const sections, emitted unconditionally
+  # here — regardless of where they appeared in `body` — so they are in
+  # scope for EVERY binding's pointer-var declaration just below, whether
+  # the binding using one appears before or after it in source (see the
+  # `hoisted.add` comment above for why hoisting is safe: types/consts have
+  # no forward-reference restriction to preserve, unlike procs).
+  for h in hoisted:
+    result.add(h)
+
+  # Pointer vars for every binding — batched here, ahead of the interleaved
+  # pass-through/wrapper emission further below. RFC-0001 §9/§C.1's
+  # original invariant ("pointer vars must precede the first wrapper") is
+  # generalized by item 4: pointer vars must also precede any passed-
+  # through statement that might call a wrapper, so batching them right
+  # after the hoisted section — rather than emitting each one at its own
+  # binding's source position, as slice C1a originally did inline above —
+  # is what makes "a helper can call any binding declared above it"
+  # (source position) hold uniformly, independent of how many other
+  # bindings or pass-through statements sit between them. Pointer vars are
+  # private (unexported) and order-independent relative to each other, so
+  # this reordering changes nothing observable about them.
+  for p in procs:
     var procTy = newNimNode(nnkProcTy)
-    procTy.add(formalParams.copy())
+    procTy.add(p.formalParams.copy())
     procTy.add(newNimNode(nnkPragma).add(
-      ident(facts.callConv),
+      ident(p.callConv),
       newNimNode(nnkExprColonExpr).add(
         ident("raises"),
         newNimNode(nnkBracket)
       )
     ))
-
-    # var fpXxx: proc(...) {.callConv.}
     result.add(newNimNode(nnkVarSection).add(
       newNimNode(nnkIdentDefs).add(
-        ptrName,
+        p.ptrName,
         procTy,
         newEmptyNode()
       )
@@ -1453,94 +1526,117 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # top level. Pure codegen reorder: no wrapper here references anything
   # loadXxx defines (temp syms, missing-seq, etc.), so this move is invisible
   # to every existing caller — loadXxx never calls a wrapper today.
-  for p in procs:
-    let nameStr = newStrLitNode(p.nameStr)
+  #
+  # RFC 0011 S0a item 4: walks `orderedItems` — the SAME source order `body`
+  # was written in — instead of batching every wrapper after a separate
+  # pass-through emission. This is the empirically-required fix for
+  # general statement pass-through: a passed-through helper calling a
+  # binding's wrapper is only a legal, ordinary Nim top-level forward
+  # reference when the wrapper is emitted at the binding's own source
+  # position (a helper may call any binding declared ABOVE it — the same
+  # rule that already governs two hand-written top-level procs; see
+  # tests/tfail_passthrough_forward_ref.nim for the direction that stays
+  # refused). Confirmed by direct experiment before implementing: two
+  # macro-spliced top-level procs, and separately two ordinary hand-written
+  # ones, both hit "undeclared identifier" for a forward call with no
+  # forward declaration — Nim grants macro output no special forward-
+  # reference tolerance beyond what hand-written code already gets, so
+  # batching (the pre-item-4 shape) would have made a passed-through
+  # helper's forward-reference behavior depend on codegen internals
+  # instead of the author's own source order.
+  for item in orderedItems:
+    case item.kind
+    of diPassthrough:
+      result.add(item.stmt)
+    of diBinding:
+      let p = procs[item.procIdx]
+      let nameStr = newStrLitNode(p.nameStr)
 
-    # Build arg list for forwarding call
-    var callNode = newCall(p.ptrName)
-    for i in 1 ..< p.formalParams.len:
-      let identDefs = p.formalParams[i]
-      for j in 0 ..< identDefs.len - 2:
-        callNode.add(identDefs[j].copy())
+      # Build arg list for forwarding call
+      var callNode = newCall(p.ptrName)
+      for i in 1 ..< p.formalParams.len:
+        let identDefs = p.formalParams[i]
+        for j in 0 ..< identDefs.len - 2:
+          callNode.add(identDefs[j].copy())
 
-    # nil check + call
-    var wrapperBody = newStmtList()
-    # RFC-0001 §C.3, slice C4b design guidance: for a symbol eligible for
-    # drift refusal (`p.nameStr in driftCandidateNames` — always false,
-    # hence a no-op addition, when this block has no such symbol), check
-    # `softlinkDriftStories<Base>` FIRST: a hit means this pointer was
-    # resolved once and then re-nilled for known drift, and the wrapper
-    # must raise the FULL drift story, not the generic "not loaded"
-    # message. A miss (never refused, or refused-but-not-THIS-symbol)
-    # falls through to the unchanged `raiseNotLoaded` call below.
-    var nilBranch = newStmtList()
-    if p.nameStr in driftCandidateNames:
-      let storySym = genSym(nskLet, "driftStory")
-      nilBranch.add(newLetStmt(storySym,
-        newCall(bindSym("findDriftStory"), driftStoriesName, nameStr)))
-      nilBranch.add(newIfStmt((
-        newNimNode(nnkInfix).add(ident(">"), newDotExpr(storySym, ident("len")), newIntLitNode(0)),
-        newStmtList(newCall(ident("raiseDriftRefused"), libPatternLit, nameStr, storySym))
+      # nil check + call
+      var wrapperBody = newStmtList()
+      # RFC-0001 §C.3, slice C4b design guidance: for a symbol eligible for
+      # drift refusal (`p.nameStr in driftCandidateNames` — always false,
+      # hence a no-op addition, when this block has no such symbol), check
+      # `softlinkDriftStories<Base>` FIRST: a hit means this pointer was
+      # resolved once and then re-nilled for known drift, and the wrapper
+      # must raise the FULL drift story, not the generic "not loaded"
+      # message. A miss (never refused, or refused-but-not-THIS-symbol)
+      # falls through to the unchanged `raiseNotLoaded` call below.
+      var nilBranch = newStmtList()
+      if p.nameStr in driftCandidateNames:
+        let storySym = genSym(nskLet, "driftStory")
+        nilBranch.add(newLetStmt(storySym,
+          newCall(bindSym("findDriftStory"), driftStoriesName, nameStr)))
+        nilBranch.add(newIfStmt((
+          newNimNode(nnkInfix).add(ident(">"), newDotExpr(storySym, ident("len")), newIntLitNode(0)),
+          newStmtList(newCall(ident("raiseDriftRefused"), libPatternLit, nameStr, storySym))
+        )))
+      nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
+      wrapperBody.add(newIfStmt((
+        newCall(ident("isNil"), p.ptrName),
+        nilBranch
       )))
-    nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, nameStr))
-    wrapperBody.add(newIfStmt((
-      newCall(ident("isNil"), p.ptrName),
-      nilBranch
-    )))
 
-    if p.hasReturn:
-      wrapperBody.add(newNimNode(nnkReturnStmt).add(callNode))
-    else:
-      wrapperBody.add(callNode)
+      if p.hasReturn:
+        wrapperBody.add(newNimNode(nnkReturnStmt).add(callNode))
+      else:
+        wrapperBody.add(callNode)
 
-    var params: seq[NimNode]
-    for i in 0 ..< p.formalParams.len:
-      params.add(p.formalParams[i].copy())
+      var params: seq[NimNode]
+      for i in 0 ..< p.formalParams.len:
+        params.add(p.formalParams[i].copy())
 
-    var wrapperProc = newProc(
-      name = postfix(p.name.copy(), "*"),
-      params = params,
-      body = wrapperBody,
-    )
-    wrapperProc.addPragma(newNimNode(nnkExprColonExpr).add(
-      ident("raises"),
-      newNimNode(nnkBracket).add(ident("SoftlinkError"))
-    ))
-    result.add(wrapperProc)
-
-    # xxxAvailable*(): bool for optional symbols
-    if p.isOptional:
-      let availName = ident(p.nameStr & "Available")
-      result.add(newProc(
-        name = postfix(availName, "*"),
-        params = [ident("bool")],
-        body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
-      ))
-
-    # xxxPtr*(): proc type — typed function pointer for C callback passing.
-    # Returns the dlsym'd pointer directly (nil if not loaded). No nil
-    # check — the load function is the single enforcement point.
-    # Return type matches the function pointer variable's type (cdecl + raises: [])
-    # so callers get type safety without the wrapper's SoftlinkError raises.
-    let ptrAccessorName = ident(p.nameStr & "Ptr")
-    var ptrReturnType = newNimNode(nnkProcTy)
-    ptrReturnType.add(p.formalParams.copy())
-    ptrReturnType.add(newNimNode(nnkPragma).add(
-      ident(p.callConv),
-      newNimNode(nnkExprColonExpr).add(
-        ident("raises"), newNimNode(nnkBracket)
+      var wrapperProc = newProc(
+        name = postfix(p.name.copy(), "*"),
+        params = params,
+        body = wrapperBody,
       )
-    ))
-    var ptrAccessorProc = newProc(
-      name = postfix(ptrAccessorName, "*"),
-      params = [ptrReturnType],
-      body = newStmtList(p.ptrName),
-    )
-    ptrAccessorProc.addPragma(newNimNode(nnkExprColonExpr).add(
-      ident("raises"),
-      newNimNode(nnkBracket)
-    ))
-    result.add(ptrAccessorProc)
+      wrapperProc.addPragma(newNimNode(nnkExprColonExpr).add(
+        ident("raises"),
+        newNimNode(nnkBracket).add(ident("SoftlinkError"))
+      ))
+      result.add(wrapperProc)
+
+      # xxxAvailable*(): bool for optional symbols
+      if p.isOptional:
+        let availName = ident(p.nameStr & "Available")
+        result.add(newProc(
+          name = postfix(availName, "*"),
+          params = [ident("bool")],
+          body = newStmtList(prefix(newCall(ident("isNil"), p.ptrName), "not")),
+        ))
+
+      # xxxPtr*(): proc type — typed function pointer for C callback passing.
+      # Returns the dlsym'd pointer directly (nil if not loaded). No nil
+      # check — the load function is the single enforcement point.
+      # Return type matches the function pointer variable's type (cdecl + raises: [])
+      # so callers get type safety without the wrapper's SoftlinkError raises.
+      let ptrAccessorName = ident(p.nameStr & "Ptr")
+      var ptrReturnType = newNimNode(nnkProcTy)
+      ptrReturnType.add(p.formalParams.copy())
+      ptrReturnType.add(newNimNode(nnkPragma).add(
+        ident(p.callConv),
+        newNimNode(nnkExprColonExpr).add(
+          ident("raises"), newNimNode(nnkBracket)
+        )
+      ))
+      var ptrAccessorProc = newProc(
+        name = postfix(ptrAccessorName, "*"),
+        params = [ptrReturnType],
+        body = newStmtList(p.ptrName),
+      )
+      ptrAccessorProc.addPragma(newNimNode(nnkExprColonExpr).add(
+        ident("raises"),
+        newNimNode(nnkBracket)
+      ))
+      result.add(ptrAccessorProc)
 
   # RFC-0001 §9/§C.1: a versionProbe body may legitimately call the block's
   # own `loadX`/`unloadX` (the reentrancy guard below must reject the
