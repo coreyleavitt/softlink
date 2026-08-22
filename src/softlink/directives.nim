@@ -421,6 +421,93 @@ proc scanIdentBase*(body: NimNode, macroName: string): IdentBaseDirective =
         result = d
 
 type
+  NoVerifyDirective* = object
+    ## RFC 0011 S0a item 6: one parsed block-level `noverify: "reason"`
+    ## directive — at most one per `dynlib` block, any position (mirrors
+    ## `CompatManifestDirective`/`VersionMacrosDirective`/`IdentBaseDirective`
+    ## above). UNLIKE `identBase`, this directive's effect (defaulting every
+    ## bodyless proc with no OTHER verification source into
+    ## `{.noverify: reason.}`) does not need to be known before anything
+    ## else is derived — `baseName` doesn't depend on it — so it is
+    ## recognized INSIDE the `dynlib` macro's ordinary per-statement body
+    ## loop, exactly like `compatManifest`/`versionProbe`/`versionMacros`,
+    ## and applied in a post-body-scan pass over the finalized `procs` list
+    ## (`softlink/pragmas.applyNoVerifyDefault`) — the same restructuring
+    ## `versionMacros`' gate synthesis (`synthesizeVersionGates`) already
+    ## uses, and for the identical reason: the directive is
+    ## position-independent and may appear anywhere in the block, including
+    ## after every proc it defaults for. `present == false` is the zero
+    ## value (no directive in this block — no proc is ever defaulted).
+    present*: bool
+    reason*: string  ## the validated, non-empty justification, as written
+    node*: NimNode    ## the directive call node, for diagnostic anchoring
+
+func isNoVerifyCall*(stmt: NimNode): bool =
+  ## True when `stmt` is a block-level `noverify: "reason"` directive
+  ## statement. The ONLY recognized shape is `nnkCall` whose sole argument
+  ## is an `nnkStmtList` — Nim's colon-block call sugar, exactly like
+  ## `isVersionProbeStmt` above (empirically confirmed: `noverify: "x"` at
+  ## statement level parses to `Call(Ident"noverify", StmtList(StrLit"x"))`,
+  ## never a bare `nnkCommand`/plain `nnkCall` with the string as a direct
+  ## argument, unlike `compatManifest`/`identBase`'s own recognizers).
+  ## Checked structurally against the bare identifier text, exactly like
+  ## every other directive recognizer in this file — the block's body is
+  ## `untyped`, so nothing has been resolved to an actual symbol yet.
+  ##
+  ## Deliberately narrower than `isCompatManifestCall`/`isIdentBaseCall`
+  ## (which also accept `nnkCommand`, space-separated call syntax):
+  ## `noverify` is ALSO a per-proc PRAGMA name recognized inside a
+  ## `{.pragma, list.}`, never as a bare top-level command call today, so
+  ## there is no existing `noverify "reason"` spelling to stay compatible
+  ## with — requiring the colon form keeps the block-level spelling
+  ## visually identical to the per-proc pragma's own
+  ## `{.noverify: "...".}`, one spelling for two positions (block body vs.
+  ## pragma list).
+  stmt.kind == nnkCall and stmt.len == 2 and stmt[0].kind == nnkIdent and
+    $stmt[0] == "noverify" and stmt[1].kind == nnkStmtList
+
+proc parseNoVerifyDirective*(stmt: NimNode, macroName: string): NoVerifyDirective =
+  ## RFC 0011 S0a item 6: parse one recognized block-level `noverify: ...`
+  ## directive statement. The only well-formed shape is a colon-block body
+  ## of EXACTLY one non-empty string literal — `noverify: "<justification>"`.
+  ## UNLIKE the per-proc `{.noverify.}` pragma (whose justification is
+  ## OPTIONAL — bare `{.noverify.}` is legal, see `parseNoVerifyReasonExpr`,
+  ## `softlink/pragmas`), the block-level form REQUIRES one: an empty/bare
+  ## block default would silently waive verification for every bodyless
+  ## proc in the block that carries no other verification source, a far
+  ## bigger blast radius than one proc's own opt-out, and deserves a real
+  ## reason on its face (RFC 0011 S0a item 6 design guidance). Any other
+  ## shape — an empty colon-block body, more than one statement in it, a
+  ## non-string-literal expression, or an empty string — is a
+  ## directive-specific macro error here, never the generic body-shape
+  ## error `dynlib` raises for an unrecognized statement.
+  result.present = true
+  result.node = stmt
+  let bodyStmts = stmt[1]
+  if bodyStmts.len != 1 or bodyStmts[0].kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+    error(macroName & ": block-level noverify requires exactly one string " &
+          "literal justification, e.g. noverify: \"private symbol, no " &
+          "public header at any version\" — unlike the per-proc " &
+          "{.noverify.} pragma, the block-level default cannot be bare: a " &
+          "whole-block opt-out needs a real reason", stmt)
+    return
+  let reason = bodyStmts[0].strVal
+  if reason.strip().len == 0:
+    error(macroName & ": block-level noverify's justification must be " &
+          "non-empty", bodyStmts[0])
+    return
+  result.reason = reason
+
+proc noVerifyDupError*(macroName: string, first, second: NoVerifyDirective): string =
+  ## RFC 0011 S0a item 6: "at most one block-level noverify per block, any
+  ## position" — voiced like `compatManifestDupError`/`versionMacrosDupError`/
+  ## `identBaseDupError` above.
+  "softlink: " & macroName & ": duplicate block-level noverify directive " &
+  "in one block ('" & first.reason & "' and '" & second.reason & "') — " &
+  "merge them into a single noverify: \"...\" directive; a dynlib block " &
+  "may declare a block-level noverify default at most once."
+
+type
   AppliedManifest* = object
     ## RFC-0001 §B.5/§9, slice B6b: `applyCompatManifest`'s return value.
     ## `attached` is the one bit `genVerifyBlock` has needed since B6a

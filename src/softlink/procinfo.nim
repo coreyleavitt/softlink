@@ -48,6 +48,17 @@ type
     isOptional*: bool
     noVerify*: bool
     noVerifyReason*: string  ## RFC-0001 §3 A.2: {.noverify: "why".} justification; "" if none given
+    noVerifyFromBlockDefault*: bool  ## RFC 0011 S0a item 6: true iff `noVerify`/
+      ## `noVerifyReason` above came from a block-level `noverify: "reason"`
+      ## default (`softlink/pragmas.applyNoVerifyDefault`) rather than the
+      ## proc's OWN `{.noverify.}` pragma. False for every proc whose
+      ## `noVerify` was set by `parseProcPragmas` itself (including a bare
+      ## `{.noverify.}` with no reason) — the zero value is therefore
+      ## correct for every pre-item-6 proc, unchanged. The sole consumer is
+      ## the `dynlib` macro's unverified-symbols audit hint, which collapses
+      ## every block-defaulted proc into ONE summary line instead of one
+      ## line each, while a proc's own explicit `{.noverify.}` keeps its
+      ## individual line exactly as before this slice.
     verifyWhen*: string  ## C preprocessor expr gating verification; "" = always
     prototype*: string   ## raw {.prototype: "...".} string; "" if absent
     sinceVersion*: string  ## RFC-0001 §B.5/§C.2: {.since: "x.y.z".} claim; "" if absent

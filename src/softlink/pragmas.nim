@@ -228,12 +228,20 @@ proc parseProcPragmas*(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pr
             "but noverify skips verification entirely, leaving nothing to " &
             "falsify the bound against. Use until alone once the symbol " &
             "has a header, or noverify alone if it will never have one", stmt)
-    if result.headerFile == "" and not result.noVerify and result.prototype.len == 0:
-      error("proc '" & nameStr &
-            "' must specify a header pragma (e.g., {.header: \"foo.h\".}), " &
-            "a prototype pragma (e.g., {.prototype: \"" & nameStr &
-            "(...)\".}), or {.noverify.} to skip compile-time header " &
-            "verification", stmt)
+    # RFC 0011 S0a item 6: the "must specify a header, a prototype, or
+    # {.noverify.}" check used to run RIGHT HERE, inline, per proc. It has
+    # moved to `checkVerificationSourceRequired` below — a post-body-scan
+    # pass over the FINALIZED `procs` seq, called after
+    # `applyNoVerifyDefault` has applied any block-level `noverify: "..."`
+    # default. A block-level directive is position-independent (like every
+    # other body directive) and may be declared AFTER the proc it defaults
+    # for; this inline, per-proc, first-pass check could never see one
+    # declared later in the same block. See `checkVerificationSourceRequired`'s
+    # own doc comment for the full rationale (it mirrors
+    # `synthesizeVersionGates`' identical restructuring). `ppmVerifyProcs`
+    # below is UNAFFECTED and keeps its own inline check: verifyProcs
+    # accepts no `noverify` at all (per-proc or block-level), so it can
+    # never depend on a later-declared directive and needs no deferral.
   else:
     if result.headerFile == "" and result.prototype.len == 0:
       error("proc '" & nameStr &
@@ -285,6 +293,97 @@ proc parseProcPragmas*(stmt: NimNode, nameStr: string, mode: ProcPragmaMode): Pr
         warning(msg, stmt)
       else:
         hint(msg, stmt)
+
+proc applyNoVerifyDefault*(procs: var seq[SoftlinkProc], noVerifyBlockPresent: bool,
+                            noVerifyBlockReason: string) =
+  ## RFC 0011 S0a item 6: the block-level `noverify: "reason"` directive's
+  ## effect — default every bodyless proc carrying NONE of its own
+  ## `{.header.}`/`{.prototype.}`/`{.noverify.}` into
+  ## `{.noverify: noVerifyBlockReason.}`, marking it `noVerifyFromBlockDefault`
+  ## so the audit hint (`dynlib`, near its own noverify-hint block) can
+  ## collapse every such proc into one summary line instead of one line
+  ## each. A no-op when `noVerifyBlockPresent` is false (the overwhelming
+  ## majority of blocks, which declare no block-level default at all) —
+  ## purely additive, byte-for-byte unchanged for every pre-item-6 block.
+  ##
+  ## Deliberately takes the directive's two facts as plain parameters
+  ## (`present`/`reason`) rather than `directives.NoVerifyDirective` itself
+  ## — the SAME reason `synthesizeVersionGates` above takes
+  ## `versionMacrosPresent`/`versionMacroNames` instead of
+  ## `directives.VersionMacrosDirective`: this module's own header doc
+  ## comment already establishes "neither this module nor
+  ## `softlink/directives` has to import the other" as an invariant, and a
+  ## plain-data parameter list preserves it instead of quietly
+  ## reintroducing the dependency.
+  ##
+  ## MUST run as a post-body-scan pass (`procs` fully collected), called
+  ## BEFORE `checkVerificationSourceRequired` below (so a defaulted proc's
+  ## `noVerify` is already true by the time that check inspects it) — for
+  ## the identical reason `synthesizeVersionGates` documents on itself: a
+  ## block directive is position-independent and may be declared AFTER the
+  ## proc(s) it affects, so nothing here can run inline during the
+  ## first-pass per-proc scan (`parseProcPragmas` above).
+  ##
+  ## Scope, pinned by RFC 0011 S0a item 6's design guidance: a proc
+  ## inherits the default iff it carries NONE of `{.header.}`,
+  ## `{.prototype.}`, its OWN `{.noverify.}`, `{.verifyWhen.}`, OR
+  ## `{.until.}` — not merely the first three. `{.verifyWhen.}` and
+  ## `{.until.}` are excluded deliberately, even though neither is itself a
+  ## verification SOURCE (a proc with only one of them and no header still
+  ## has nothing to verify against): inheriting the default onto such a
+  ## proc would set `noVerify = true` underneath a pragma the proc's AUTHOR
+  ## never paired it with, and immediately trip the "{.verifyWhen.}
+  ## contradicts {.noverify.}" / "{.until.} contradicts {.noverify.}"
+  ## contradiction errors just above — errors that would misattribute the
+  ## mistake to a `{.noverify.}` the author never wrote. Simpler and more
+  ## honest (this is the resolution RFC 0011 S0a item 6 itself lands on
+  ## after considering, and rejecting, "inherit and let the contradiction
+  ## fire anyway"): such a proc is left exactly as it was pre-item-6 — its
+  ## `noVerify` stays false, and `checkVerificationSourceRequired` below
+  ## still rejects it with the ordinary "must specify a header pragma..."
+  ## message, unaffected by whether a block-level default exists elsewhere
+  ## in the same block. See `tests/tfail_noverify_block_until_no_header.nim`/
+  ## `tests/tfail_noverify_block_verifywhen_no_header.nim` for the pin.
+  if not noVerifyBlockPresent: return
+  for i in 0 ..< procs.len:
+    if procs[i].headerFile.len == 0 and procs[i].prototype.len == 0 and
+       not procs[i].noVerify and procs[i].verifyWhen.len == 0 and
+       procs[i].untilVersion.len == 0:
+      procs[i].noVerify = true
+      procs[i].noVerifyReason = noVerifyBlockReason
+      procs[i].noVerifyFromBlockDefault = true
+
+proc checkVerificationSourceRequired*(procs: seq[SoftlinkProc]) =
+  ## RFC 0011 S0a item 6: dynlib's "every proc must specify a header, a
+  ## prototype, or {.noverify.}" invariant — DEFERRED to a post-body-scan
+  ## pass (mirrors `synthesizeVersionGates`' own restructuring rationale,
+  ## `softlink/pragmas` itself already precedents this pattern) because a
+  ## block-level `noverify: "reason"` directive (`applyNoVerifyDefault`
+  ## above, which MUST run immediately before this proc, in the same
+  ## relative order `synthesizeVersionGates`/`checkUntilRequiresGate` use)
+  ## can appear anywhere in the body, including after the proc it defaults
+  ## for — an inline check during the first-pass per-proc scan could never
+  ## see a directive declared later in the same block.
+  ##
+  ## Message text is UNCHANGED from the pre-item-6 inline check (word for
+  ## word) — every existing test pinning it stays green without
+  ## modification; only the TIMING of when it fires moved, not its wording
+  ## or its trigger condition (`headerFile == "" and not noVerify and
+  ## prototype.len == 0`, exactly as before — `noVerify` is simply now
+  ## possibly true via the block default rather than only ever via the
+  ## proc's own pragma).
+  ##
+  ## `verifyProcs` has NO counterpart of this deferral: its own inline
+  ## check (`parseProcPragmas`'s `ppmVerifyProcs` branch, just above)
+  ## accepts no `noverify` at all — per-proc or block-level — so it can
+  ## never depend on a later-declared directive.
+  for p in procs:
+    if p.headerFile.len == 0 and not p.noVerify and p.prototype.len == 0:
+      error("proc '" & p.nameStr &
+            "' must specify a header pragma (e.g., {.header: \"foo.h\".}), " &
+            "a prototype pragma (e.g., {.prototype: \"" & p.nameStr &
+            "(...)\".}), or {.noverify.} to skip compile-time header " &
+            "verification", p.name)
 
 proc checkUntilRequiresGate*(procs: seq[SoftlinkProc], macroName: string) =
   ## RFC-0002 §4.1/§5/§6, slice D1: `{.until.}` REQUIRES `{.verifyWhen.}` —

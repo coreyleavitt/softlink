@@ -827,6 +827,15 @@ task test, "Run tests":
   # form) are exercised in the same compile.
   const reasonHintCheck = "nim c --compileOnly --path:src tests/thint_noverify_reason.nim"
   const reasonWarnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify_reason.nim"
+  # RFC 0011 S0a item 6: the block-level noverify default collapses every
+  # symbol it covers into ONE summary line ("N symbols, block-level
+  # reason: ...") in the same hint/warning above, while a proc's OWN
+  # explicit {.noverify.} keeps its individual line — this fixture carries
+  # two block-defaulted procs and one with its own justification, so both
+  # renderings are exercised in the same compile, same convention as
+  # `reasonHintCheck`/`reasonWarnCheck` directly above.
+  const noverifyBlockHintCheck = "nim c --compileOnly --path:src tests/thint_noverify_block.nim"
+  const noverifyBlockWarnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify_block.nim"
   # RFC-0002 §4.1/§6, slice A3: a required (non-{.optional.}) proc carrying
   # {.until.} gets the same hint/warning treatment, precedent-named in the
   # RFC as "the per-block noverify hint" above. The fixture header-verifies
@@ -1810,6 +1819,43 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_passthrough_verifyprocs.nim",
       ["verifyProcs body must contain only proc declarations"])
 
+    # RFC 0011 S0a item 6: the block-level `noverify: "reason"` directive —
+    # parse/validation, duplicate-guard, and verifyProcs-rejection checks,
+    # mirroring the `identBase` group directly above. The two positive
+    # (position-independence) fixtures and the two contradiction-rule
+    # negative fixtures below are its behavioral pins.
+    expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_duplicate.nim",
+      ["duplicate block-level noverify directive"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_bad_type.nim",
+      ["block-level noverify requires exactly one string literal justification"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_empty.nim",
+      ["block-level noverify's justification must be non-empty"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_verifyprocs.nim",
+      ["verifyProcs body must contain only proc declarations"])
+
+    # Position independence (the RFC's own red test: a block directive
+    # placed AFTER the procs it defaults for must still work — the
+    # must-specify-a-verification-source check defers to a post-body-scan
+    # pass specifically so this compiles) plus the ordinary before-the-procs
+    # case, and override/coexistence with a proc's own header/noverify.
+    expectManifestCompileOk(mcBase & "tests/tcheck_noverify_block_before.nim", [], [])
+    expectManifestCompileOk(mcBase & "tests/tcheck_noverify_block_after.nim", [], [])
+    expectManifestCompileOk(mcBase & "tests/tcheck_noverify_block_override.nim", [], [])
+
+    # Contradiction-rule pin: a proc carrying {.until.}/{.verifyWhen.} (no
+    # header) inside a block with a block-level noverify default does NOT
+    # inherit it — it keeps today's ordinary "must specify a header pragma"
+    # error rather than a misattributed noverify contradiction. See
+    # `applyNoVerifyDefault`'s doc comment (softlink/pragmas.nim).
+    expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_until_no_header.nim",
+      ["must specify a header pragma"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_verifywhen_no_header.nim",
+      ["must specify a header pragma"])
+
     # RFC-0002 §5/§6, slice E2: gate-synthesis bound validation — both are
     # NIM macro-time errors (`error()`-raised inside `synthesizeVersionGates`
     # itself, from a `softlink/gates.GateResult` failure case), so
@@ -2196,6 +2242,12 @@ task test, "Run tests":
     "private symbol, no public header at any version", "Hint:", "(no justification)")
   expectDiag(reasonWarnCheck, "noverify reason warning (strict)",
     "private symbol, no public header at any version", "Warning:", "(no justification)")
+  expectDiag(noverifyBlockHintCheck, "block-level noverify collapsed hint",
+    "3 symbols not header-verified", "2 symbols, block-level reason: \"no public header for these\"",
+    "foo_own — \"its own, separate reason\"", "Hint:")
+  expectDiag(noverifyBlockWarnCheck, "block-level noverify collapsed warning (strict)",
+    "3 symbols not header-verified", "2 symbols, block-level reason: \"no public header for these\"",
+    "foo_own — \"its own, separate reason\"", "Warning:")
   expectDiag(untilRequiredHintCheck, "until required-symbol hint",
     "drifted-but-required", "did you mean {.optional.}?", "Hint:")
   expectDiag(untilRequiredWarnCheck, "until required-symbol warning (strict)",

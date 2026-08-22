@@ -1045,6 +1045,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var manifestDirective: CompatManifestDirective
   var versionProbeDirective: VersionProbeDirective
   var versionMacrosDirective: VersionMacrosDirective
+  var noVerifyDirective: NoVerifyDirective
 
   for stmt in body:
     # RFC-0001 §B.5, slice B6a: the `compatManifest` body directive — at
@@ -1084,6 +1085,23 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         error(versionMacrosDupError("dynlib", versionMacrosDirective, d), stmt)
       else:
         versionMacrosDirective = d
+      continue
+
+    # RFC 0011 S0a item 6: the block-level `noverify: "reason"` directive —
+    # at most one per block, any position, mirroring `compatManifest`/
+    # `versionProbe`/`versionMacros` above. Recognized and consumed HERE
+    # (unlike `identBase`, which must be fully resolved before `baseName`
+    # is derived above) — nothing before this point in the macro depends on
+    # it. Its actual EFFECT (defaulting every bodyless proc with no other
+    # verification source) is applied in a post-body-scan pass, once
+    # `procs` is fully collected — see `applyNoVerifyDefault`'s own doc
+    # comment for why that deferral is required.
+    if isNoVerifyCall(stmt):
+      let d = parseNoVerifyDirective(stmt, "dynlib")
+      if noVerifyDirective.present:
+        error(noVerifyDupError("dynlib", noVerifyDirective, d), stmt)
+      else:
+        noVerifyDirective = d
       continue
 
     # RFC 0011 S0a item 1: the `identBase` body directive — already fully
@@ -1153,6 +1171,18 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
                         untilVersion: facts.untilVersion,
                         hasReturn: hasReturn))
     orderedItems.add(DynlibItem(kind: diBinding, procIdx: procs.high))
+
+  # RFC 0011 S0a item 6: apply the block-level noverify default, then run
+  # the (now-deferred) "every proc needs a header, a prototype, or
+  # {.noverify.}" check — in that order, and as early as possible after
+  # `procs` is fully collected (fail fast, before any codegen below).
+  # `checkVerificationSourceRequired` replaces the inline check
+  # `parseProcPragmas` used to run per-proc, during the loop just above —
+  # see both procs' own doc comments (`softlink/pragmas`) for why the
+  # deferral is required: a block-level directive is position-independent
+  # and may appear after the proc(s) it defaults for.
+  applyNoVerifyDefault(procs, noVerifyDirective.present, noVerifyDirective.reason)
+  checkVerificationSourceRequired(procs)
 
   # RFC 0011 S0a item 4: hoisted type/const sections, emitted unconditionally
   # here — regardless of where they appeared in `body` — so they are in
@@ -1269,16 +1299,41 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
     # warning." Each entry renders as `name — "reason"` when a justification
     # was given, or `name — (no justification)` for bare {.noverify.} — bare
     # form stays legal (additive), per A.2.
+    #
+    # RFC 0011 S0a item 6: a proc whose `noVerify` came from the block-level
+    # default (`noVerifyFromBlockDefault`) does NOT get its own entry in
+    # `unverified` here — every such proc shares the SAME reason by
+    # construction (the one block-level justification), so listing each by
+    # name would be exactly the copy-paste-shaped noise item 6 exists to
+    # collapse. They are counted and folded into ONE summary entry below
+    # instead; a proc's OWN explicit `{.noverify.}` (with or without its own
+    # reason) is entirely unaffected and keeps its individual entry, exactly
+    # as before this slice. `totalUnverified` (not `unverified.len`) drives
+    # the header count precisely so the header always reflects the true
+    # number of unverified SYMBOLS, even though the block-defaulted ones
+    # collapse to a single LISTING entry.
     var unverified: seq[string]
+    var totalUnverified = 0
+    var blockDefaultCount = 0
+    var blockDefaultReason = ""
     for p in procs:
       if p.noVerify:
-        let reasonPart =
-          if p.noVerifyReason.len > 0: "\"" & p.noVerifyReason & "\""
-          else: "(no justification)"
-        unverified.add(p.nameStr & " — " & reasonPart)
-    if unverified.len > 0:
+        inc totalUnverified
+        if p.noVerifyFromBlockDefault:
+          inc blockDefaultCount
+          blockDefaultReason = p.noVerifyReason
+        else:
+          let reasonPart =
+            if p.noVerifyReason.len > 0: "\"" & p.noVerifyReason & "\""
+            else: "(no justification)"
+          unverified.add(p.nameStr & " — " & reasonPart)
+    if blockDefaultCount > 0:
+      unverified.add($blockDefaultCount &
+        (if blockDefaultCount == 1: " symbol" else: " symbols") &
+        ", block-level reason: \"" & blockDefaultReason & "\"")
+    if totalUnverified > 0:
       let msg = "softlink: dynlib \"" & libPattern & "\": " &
-        $unverified.len & (if unverified.len == 1: " symbol" else: " symbols") &
+        $totalUnverified & (if totalUnverified == 1: " symbol" else: " symbols") &
         " not header-verified ({.noverify.}): " & unverified.join(", ")
       when defined(softlinkStrictVerify):
         warning(msg, body)

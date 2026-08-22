@@ -42,6 +42,35 @@ own "undeclared identifier" instead. See the README's
 ["Statement pass-through: types, consts, and helpers alongside declarations"](README.md#statement-pass-through-types-consts-and-helpers-alongside-declarations)
 section.
 
+**Block-level `noverify` directive (RFC 0011 S0a item 6).** A standalone
+`noverify: "<justification>"` statement in a `dynlib` block body sets a
+block-level default: every bodyless proc carrying none of
+`header`/`prototype`/`noverify` inherits it, while a proc that specifies
+its own `header`, `prototype`, or `{.noverify.}` is unaffected — the
+default only fills the gap. Closes the copy-paste-justification-string
+problem a many-declaration, mostly-undocumented binding otherwise has
+(repeating the identical reason on every proc invites drift). Position-
+independent and at most one per block, like every other body directive; the
+justification is required and must be non-empty (unlike the per-proc
+pragma's optional reason — a bare block-level default would silently waive
+verification for every gapped proc at once). A proc carrying
+`{.verifyWhen.}` or `{.until.}` with no header/prototype does not inherit
+the default — it keeps the ordinary "must specify a header pragma..."
+error rather than a misattributed noverify contradiction. Not recognized in
+`verifyProcs` (falls into the same "body must contain only proc
+declarations" error `identBase` gets there — the per-proc pragma is already
+meaningless in `verifyProcs`, and a block-level version of it is the same
+mistake at a larger scale). The compile-time unverified-symbols audit hint
+collapses every block-defaulted proc into one summary line instead of one
+per proc, while an explicit per-proc `{.noverify.}` keeps its own line.
+Implementation note: the "every proc must specify a header, a prototype, or
+`{.noverify.}`" check moved from an inline per-proc check to a post-body-
+scan pass (mirroring the existing `versionMacros` gate-synthesis
+restructuring), since a block-level directive can appear after the proc it
+covers. See the README's
+["Block-level `noverify` default"](README.md#block-level-noverify-default)
+section.
+
 ### Changed
 
 **`libNameToIdent`'s leading-alternation normalization is now general

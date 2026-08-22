@@ -194,6 +194,30 @@ softlink: dynlib "libfoo.so(.2|.1|)": 1 symbol not header-verified ({.noverify.}
 
 The reason is optional — bare `{.noverify.}` still works and renders as `internal_dbg_hook — (no justification)` in the same hint. `{.verifyWhen.}` and `{.noverify.}` on the same proc is a compile-time error (contradictory: one asks for conditional verification, the other for none); so is `{.prototype.}` and `{.noverify.}` together (above).
 
+#### Block-level `noverify` default
+
+A binding for a library with dozens or hundreds of undocumented symbols repeating the identical `{.noverify: "..."}` justification on every proc is copy-paste noise that invites drift — the string starts diverging as procs are added or edited independently. A standalone `noverify: "<justification>"` statement, written directly in the `dynlib` block body (not as a proc pragma), sets a **block-level default**: every bodyless proc that carries none of `header`/`prototype`/`noverify` inherits it, while a proc that specifies its own source — its own `header`, its own `prototype`, or its own `{.noverify.}` (with or without a reason) — is left exactly as written; the block default only fills the gap.
+
+```nim
+dynlib "libfoo.so(.2|.1|)":
+  noverify: "internal API, no public header ships for any of these"
+
+  proc internal_dbg_hook(): cint {.cdecl, optional.}
+  proc internal_reset_state(): void {.cdecl.}
+  proc public_api_call(x: cint): cint {.cdecl, header: "foo_public.h".}  # unaffected: has its own header
+```
+
+Like every other body directive (`compatManifest`, `versionProbe`, `versionMacros`, `identBase`), `noverify: "..."` is position-independent — it may appear before or after the procs it covers — and at most one per block; a second one is a compile-time error naming both justifications and asking you to merge them. Its justification is **required and must be non-empty**: unlike the per-proc pragma's optional reason, a bare or empty block-level default would silently waive verification for every gapped proc in the block at once, which is a large enough blast radius to deserve a real reason on its face.
+
+The compile-time audit hint collapses accordingly — every block-defaulted proc folds into one summary entry instead of one line each, while a proc's own explicit `{.noverify.}` keeps its individual line:
+
+```
+softlink: dynlib "libfoo.so(.2|.1|)": 2 symbols not header-verified ({.noverify.}):
+  2 symbols, block-level reason: "internal API, no public header ships for any of these"
+```
+
+A proc that carries `{.verifyWhen.}` or `{.until.}` but no `header`/`prototype` does **not** inherit the block default, even though it otherwise has no verification source: those two pragmas already contradict `{.noverify.}` on a proc that writes it explicitly, and silently inheriting the default onto such a proc would trip that same contradiction error for a `{.noverify.}` the proc's author never wrote. Such a proc simply keeps the ordinary "must specify a header pragma..." error instead — a block-level default fills gaps, it never manufactures a contradiction. The directive is rejected outright in `verifyProcs` blocks (falling into the same "body must contain only proc declarations" error `identBase` gets there) — `verifyProcs` already rejects the per-proc pragma as meaningless, and a whole-block version of the same opt-out is the identical mistake at a larger scale.
+
 One `dynlib` block per library per module: a second block whose pattern derives the same identifier base (e.g. `dynlib "m"` twice, or `"libfoo.so"` plus `"foo"`) is rejected at compile time with an error telling you to merge the blocks. Use `{.optional.}`/`{.verifyWhen.}`/`{.prototype.}`/`{.noverify.}` within the single block instead of gating extra symbols behind a separate block — or, if you genuinely need more than one block over the same library (see [`identBase`](#identbase-overriding-the-derived-identifier-base) below), give each block a distinct override.
 
 ### Unload and reload
