@@ -1533,6 +1533,60 @@ suite "identBase (RFC 0011 S0a item 1) — override drives every generated name"
     check not testlibaltLoaded()
 
 
+# RFC 0011 S0b, work item (i): `trustedWrappers` — a THIRD block over the
+# same `TestLib` pattern, disambiguated via `identBase` (RFC 0011 S0a item
+# 1), same precedent as the symbol-rename and identBase blocks above. Every
+# wrapper generated here is `{.raises: [].}` instead of `{.raises:
+# [SoftlinkError].}` — proven below both by the effect system itself
+# (`compiles()` against a `{.raises: [].}` caller) and by an ordinary
+# successful load/dispatch cycle (item (h): `loadX`/`unloadX`/`LoadResult`/
+# the load surface are byte-identical in trusted mode).
+dynlib TestLib:
+  identBase "TrustedTestlib"
+  trustedWrappers: "test fixture — every symbol here is a real, always-present testlib export"
+  proc trusted_add(a: cint, b: cint): cint {.cdecl, symbol: "testlib_add", header: "tests/testlib.h".}
+  proc trusted_noop() {.cdecl, symbol: "testlib_noop", header: "tests/testlib.h".}
+  # RFC 0011 S0b, work item (h): `xxxAvailable*()`/`xxxPtr*()` are
+  # generated identically for a trusted wrapper too — neither accessor
+  # goes through the nil-check/fatal branch at all (`xxxAvailable` reads
+  # the pointer directly; `xxxPtr` returns it, nil or not, with "the load
+  # function is the single enforcement point" already the documented
+  # contract) — so `{.optional.}` composing with `trustedWrappers` needs
+  # no special case, proven here with a symbol that's always actually
+  # present at runtime (this fixture isn't testing optional-MISSING
+  # behavior, just that the accessors exist and work).
+  proc trusted_magic(): cint {.cdecl, optional, symbol: "testlib_magic", header: "tests/testlib.h".}
+
+suite "trustedWrappers (RFC 0011 S0b) — raises:[] wrappers, unaffected load surface":
+  test "loadX/unloadX/LoadResult/the load surface are byte-identical in trusted mode (h)":
+    check not trustedtestlibLoaded()
+    check loadTrustedTestlib().kind in {lrOk, lrOkPartial}
+    check trustedtestlibLoaded()
+    check trusted_add(10, 32) == 42
+    check trusted_magicAvailable()
+    check trusted_magicPtr() != nil
+    check trusted_magic() == 42
+    unloadTrustedTestlib()
+    check not trustedtestlibLoaded()
+    # Idempotent reload after unload — ordinary loadX/unloadX behavior,
+    # unaffected by trustedWrappers.
+    check loadTrustedTestlib().kind in {lrOk, lrOkPartial}
+
+  test "generated wrappers are genuinely {.raises: [].} — a raises:[] caller may call them directly (f)":
+    ## Must run AFTER a successful load (the suite above already loaded
+    ## and left the block loaded) — the point here is the EFFECT SIGNATURE
+    ## (the compiler accepts a raises:[] caller invoking a trusted wrapper
+    ## with zero cast, the spike's own proven shape), not the nil branch,
+    ## which has its own dedicated subprocess pin (story (g),
+    ## `tests/fatal_child_wrapper.nim`) precisely because it terminates the
+    ## process.
+    check trustedtestlibLoaded()
+    proc callerMayNotRaise(): cint {.raises: [].} =
+      trusted_noop()
+      trusted_add(2, 3)
+    check callerMayNotRaise() == 5
+
+
 # RFC-0001 slice B0: softlink/versions — comparator + pinned types.
 # Property-style unit tests only; no interval/manifest/JSON logic exists yet
 # (that's B1+), so nothing behavioral is tested for VersionInterval/

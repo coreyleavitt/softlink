@@ -31,6 +31,15 @@ import ./softlink/pragmas
 import ./softlink/directives
 import ./softlink/verify
 import ./softlink/loader
+import ./softlink/fatal
+# RFC 0011 S0b, work item (i): `softlinkFatal` (`softlink/fatal`) is the
+# trusted-wrapper mode's nil-branch diagnostic/termination proc — exported
+# here the SAME way `loader.loadLibPatternDetailed`/the `stdDynlib` re-exports
+# above are: a `trustedWrappers` block's generated wrapper code lives in the
+# CONSUMING module, which resolves `softlinkFatal` unqualified via `import
+# softlink` alone, with no separate `import softlink/fatal` of its own
+# required.
+export fatal.softlinkFatal
 # Exported because macro-generated code resolves these identifiers at the call site.
 export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
        stdDynlib.unloadLib
@@ -1087,6 +1096,7 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   var versionProbeDirective: VersionProbeDirective
   var versionMacrosDirective: VersionMacrosDirective
   var noVerifyDirective: NoVerifyDirective
+  var trustedWrappersDirective: TrustedWrappersDirective
 
   for stmt in body:
     # RFC-0001 §B.5, slice B6a: the `compatManifest` body directive — at
@@ -1143,6 +1153,23 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         error(noVerifyDupError("dynlib", noVerifyDirective, d), stmt)
       else:
         noVerifyDirective = d
+      continue
+
+    # RFC 0011 S0b, work item (i)(e): the block-level `trustedWrappers`
+    # directive — at most one per block, any position, mirroring
+    # `compatManifest`/`versionProbe`/`versionMacros`/`noverify` above.
+    # Recognized and consumed HERE (nothing before this point depends on
+    # it — unlike `identBase`). Its EFFECT (every wrapper in this block
+    # becomes `{.raises: [].}`, nil branch fatals instead of raising) is
+    # applied at wrapper-emission time below, and the versionProbe
+    # mutual-exclusion check (work item (i)(i)) fires once both directives
+    # are known, right after this loop.
+    if isTrustedWrappersCall(stmt):
+      let d = parseTrustedWrappersDirective(stmt, "dynlib")
+      if trustedWrappersDirective.present:
+        error(trustedWrappersDupError("dynlib"), stmt)
+      else:
+        trustedWrappersDirective = d
       continue
 
     # RFC 0011 S0a item 1: the `identBase` body directive — already fully
@@ -1225,6 +1252,32 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # and may appear after the proc(s) it defaults for.
   applyNoVerifyDefault(procs, noVerifyDirective.present, noVerifyDirective.reason)
   checkVerificationSourceRequired(procs)
+
+  # RFC 0011 S0b, work item (i)(i): `trustedWrappers` + `versionProbe` in
+  # one block is a compile-time error. The probe contract (`atProbeFailed`,
+  # `Attestation` above) converts a wrapper's raised `SoftlinkError` into a
+  # reported attestation state via try/except around the probe body's own
+  # wrapper calls (see the `versionProbe:` splice into `loadXxx` further
+  # below) — a `{.raises: [].}` trusted wrapper can never raise for that
+  # `except` to catch, so a probe that ever hits a not-loaded/drift-refused
+  # trusted wrapper would `_Exit` the whole process instead of the probe
+  # cleanly reporting `atProbeFailed`, silently defeating the very
+  # mechanism `versionProbe` exists to provide. Deliberately broader than
+  # the precise hazard (only a probe body that itself CALLS an
+  # `{.optional.}` — the only symbols that can be genuinely unresolved
+  # *while* the probe runs — is actually at risk): the RFC records the
+  # narrower relaxation as a deferred backlog item, since no shipped block
+  # needs it yet.
+  if trustedWrappersDirective.present and versionProbeDirective.present:
+    error("softlink: dynlib: trustedWrappers and versionProbe cannot both " &
+          "be declared in one block — the probe contract converts a " &
+          "wrapper's raised SoftlinkError into a reported atProbeFailed " &
+          "attestation via try/except around the probe body's own wrapper " &
+          "calls, but a trustedWrappers block's wrappers are {.raises: " &
+          "[].} and can never raise for that except to catch (a nil " &
+          "pointer there terminates the process instead). Split the " &
+          "trusted symbols into their own dynlib block with no " &
+          "versionProbe, or drop trustedWrappers from this one", body)
 
   # RFC 0011 S0a item 4: hoisted type/const sections, emitted unconditionally
   # here — regardless of where they appeared in `body` — so they are in
@@ -1381,6 +1434,31 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         warning(msg, body)
       else:
         hint(msg, body)
+
+  # RFC 0011 S0b, work item (i)(e): the `trustedWrappers` compile-time
+  # audit hint — same "trust points are visible" convention as the
+  # `{.noverify.}` hint directly above (a HIGHER-severity trust point than
+  # a bare noverify, since a trusted wrapper's failure mode is process
+  # termination, not a catchable exception), enumerated once per block
+  # (the directive is block-level, so every wrapper in the block is
+  # trusted uniformly — there is no per-proc list to enumerate the way the
+  # noverify hint's `unverified` seq has). Fires even when the block has
+  # zero procs (an empty `dynlib` block with a stray `trustedWrappers` is
+  # pathological but not itself an error) — `procs.len` is simply 0 then,
+  # and the hint says so plainly rather than being suppressed.
+  if trustedWrappersDirective.present:
+    let reasonPart =
+      if trustedWrappersDirective.reason.len > 0:
+        "\"" & trustedWrappersDirective.reason & "\""
+      else: "(no justification)"
+    let msg = "softlink: dynlib \"" & libPattern & "\": " & $procs.len &
+      (if procs.len == 1: " wrapper" else: " wrappers") &
+      " trusted (trustedWrappers), reason: " & reasonPart &
+      " — nil-pointer dispatch terminates the process instead of raising"
+    when defined(softlinkStrictVerify):
+      warning(msg, body)
+    else:
+      hint(msg, body)
 
   # RFC-0002 §4.1/§6, slice A3: another trust-point hint, same convention
   # as the {.noverify.} one directly above (precedent it explicitly names).
@@ -1670,19 +1748,48 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
       # hence a no-op addition, when this block has no such symbol), check
       # `softlinkDriftStories<Base>` FIRST: a hit means this pointer was
       # resolved once and then re-nilled for known drift, and the wrapper
-      # must raise the FULL drift story, not the generic "not loaded"
+      # must report the FULL drift story, not the generic "not loaded"
       # message. A miss (never refused, or refused-but-not-THIS-symbol)
-      # falls through to the unchanged `raiseNotLoaded` call below.
+      # falls through to the unchanged not-loaded diagnostic below.
+      #
+      # RFC 0011 S0b, work item (i): `trustedWrappersDirective.present`
+      # (captured from the outer macro scope, uniform for every wrapper in
+      # this block — `trustedWrappers` is a block-level directive, not a
+      # per-proc pragma) selects between the two diagnostic-DELIVERY
+      # mechanisms below; the diagnostic TEXT itself is identical either
+      # way (the same drift story, the same "<library>: library not
+      # loaded, cannot call: <symbol>" message `raiseNotLoaded` builds) —
+      # only whether it reaches the caller via a catchable `raise` or via
+      # `softlinkFatal`'s terminate-the-process sinks changes.
       var nilBranch = newStmtList()
       if p.cName in driftCandidateNames:
         let storySym = genSym(nskLet, "driftStory")
         nilBranch.add(newLetStmt(storySym,
           newCall(bindSym("findDriftStory"), driftStoriesName, cNameLit)))
+        let driftReportStmt =
+          if trustedWrappersDirective.present:
+            newCall(ident("softlinkFatal"), storySym)
+          else:
+            newCall(ident("raiseDriftRefused"), libPatternLit, cNameLit, storySym)
         nilBranch.add(newIfStmt((
           newNimNode(nnkInfix).add(ident(">"), newDotExpr(storySym, ident("len")), newIntLitNode(0)),
-          newStmtList(newCall(ident("raiseDriftRefused"), libPatternLit, cNameLit, storySym))
+          newStmtList(driftReportStmt)
         )))
-      nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, cNameLit))
+      if trustedWrappersDirective.present:
+        # Same message `raiseNotLoaded` (src/softlink.nim) builds at
+        # runtime from these two literals — spelled out here directly
+        # since `softlinkFatal` takes the already-formatted diagnostic
+        # string, not a (library, symbol) pair the way `raiseNotLoaded`
+        # does. Plain string `&` carries no exception effect Nim's checker
+        # tracks (only an unrecoverable Defect on allocation failure, which
+        # `{.raises: [].}` does not need to name), so building it inline
+        # here does not disturb the trusted wrapper's own `{.raises: [].}`
+        # pragma below.
+        nilBranch.add(newCall(ident("softlinkFatal"),
+          infix(infix(libPatternLit, "&", newStrLitNode(": library not loaded, cannot call: ")),
+                "&", cNameLit)))
+      else:
+        nilBranch.add(newCall(ident("raiseNotLoaded"), libPatternLit, cNameLit))
       wrapperBody.add(newIfStmt((
         newCall(ident("isNil"), p.ptrName),
         nilBranch
@@ -1702,9 +1809,18 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
         params = params,
         body = wrapperBody,
       )
+      # RFC 0011 S0b, work item (i)(f): a trusted wrapper is genuinely
+      # `{.raises: [].}` — checked by Nim's effect system at every call
+      # site, not merely documented — since its nil branch now calls
+      # `softlinkFatal` (itself `{.noreturn, raises: [].}`, `softlink/
+      # fatal.nim`) instead of raising `SoftlinkError`. Untrusted wrappers
+      # (the overwhelming majority, and every wrapper before this RFC)
+      # keep the unchanged `{.raises: [SoftlinkError].}`.
+      let wrapperRaisesBracket =
+        if trustedWrappersDirective.present: newNimNode(nnkBracket)
+        else: newNimNode(nnkBracket).add(ident("SoftlinkError"))
       wrapperProc.addPragma(newNimNode(nnkExprColonExpr).add(
-        ident("raises"),
-        newNimNode(nnkBracket).add(ident("SoftlinkError"))
+        ident("raises"), wrapperRaisesBracket
       ))
       result.add(wrapperProc)
 
@@ -2810,6 +2926,22 @@ proc collectVProcs(body: NimNode): tuple[procs: seq[SoftlinkProc], directive: Co
       # rejected in verifyProcs mode above ("meaningless... simply omit").
       error("versionProbe has no meaning in verifyProcs — it has no " &
             "runtime footprint (no loadX to run it inside); omit it", stmt)
+      continue
+    if isTrustedWrappersCall(stmt):
+      # RFC 0011 S0b, work item (i)(j), judgment call (not stated
+      # explicitly by the RFC): `verifyProcs` generates NO wrappers at all
+      # (RFC-0001 §B.5a's documented CEILING — "no library identity, no
+      # loadX, no pointers, no wrappers"), so `trustedWrappers`'
+      # entire effect (generated wrappers become `{.raises: [].}`) has
+      # nothing to apply to. Rejected outright, in every shape, exactly
+      # like `versionProbe` immediately above and `noverify` in
+      # `softlink/pragmas.parseProcPragmas`'s `ppmVerifyProcs` arm — same
+      # "meaningless here, simply omit" family, not a silent no-op hint:
+      # a silently-ignored directive would read as though it did
+      # something.
+      error("trustedWrappers has no meaning in verifyProcs — it generates " &
+            "no wrappers (verifyProcs emits signature verification only, " &
+            "never runtime dispatch); omit it", stmt)
       continue
     # RFC-0002 §4.7/§5/§6, slice E1: `versionMacros` IS accepted in
     # verifyProcs (unlike `versionProbe` above) — "gates are its live

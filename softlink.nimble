@@ -836,6 +836,14 @@ task test, "Run tests":
   # `reasonHintCheck`/`reasonWarnCheck` directly above.
   const noverifyBlockHintCheck = "nim c --compileOnly --path:src tests/thint_noverify_block.nim"
   const noverifyBlockWarnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_noverify_block.nim"
+  # RFC 0011 S0b, work item (i)(e): the `trustedWrappers` compile-time audit
+  # hint — same convention as the noverify hints directly above (a block-
+  # level directive, uniform per block, so ONE fixture with a real
+  # justification suffices; the bare-form "(no justification)" rendering is
+  # exercised separately via `tcheck_trustedwrappers_bare.nim` below).
+  const trustedWrappersHintCheck = "nim c --compileOnly --path:src tests/thint_trustedwrappers.nim"
+  const trustedWrappersWarnCheck = "nim c --compileOnly --path:src -d:softlinkStrictVerify tests/thint_trustedwrappers.nim"
+  const trustedWrappersBareHintCheck = "nim c --compileOnly --path:src tests/tcheck_trustedwrappers_bare.nim"
   # RFC-0002 §4.1/§6, slice A3: a required (non-{.optional.}) proc carrying
   # {.until.} gets the same hint/warning treatment, precedent-named in the
   # RFC as "the per-block noverify hint" above. The fixture header-verifies
@@ -1881,6 +1889,30 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_noverify_block_verifywhen_no_header.nim",
       ["must specify a header pragma"])
 
+    # RFC 0011 S0b, work item (i): `trustedWrappers(...)` directive parse +
+    # validation — mirrors the `noverify`/`identBase` groups directly
+    # above. The positive (bare-form) fixture and the raises:[]/load-surface
+    # behavioral pins live in `tests/test_softlink.nim` itself (they need a
+    # real load against `libtestlib.so`, which this `--compileOnly` group
+    # can't exercise); the nil-branch full-diagnostic-story pin (story (g))
+    # is its own subprocess fixture (`tests/fatal_child_wrapper.nim`),
+    # compiled and run by `tests/tfatal.nim` itself (see that file's own
+    # suite) — already exec'd by `task test` alongside the fatal
+    # subsystem's other subprocess legs.
+    expectManifestCompileFail(mcBase & "tests/tfail_trustedwrappers_unknown_arg.nim",
+      ["trustedWrappers accepts either bare trustedWrappers or"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_trustedwrappers_empty_reason.nim",
+      ["trustedWrappers's justification must be non-empty"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_trustedwrappers_duplicate.nim",
+      ["duplicate trustedWrappers directive"])
+
+    expectManifestCompileFail(mcBase & "tests/tfail_trustedwrappers_verifyprocs.nim",
+      ["trustedWrappers has no meaning in verifyProcs"])
+
+    expectManifestCompileOk(mcBase & "tests/tcheck_trustedwrappers_bare.nim", [], [])
+
     # RFC 0011 S0a item 3: the `symbol: "c_name"` rename pragma. The
     # positive path (a renamed proc loading/dispatching, two Nim procs
     # sharing one C symbol, `missing`/`lrSymbolNotFound.symbol` naming the
@@ -2125,6 +2157,12 @@ task test, "Run tests":
     expectManifestCompileFail(vpBase & "tests/tfail_versionprobe_verifyprocs.nim",
       ["versionProbe has no meaning in verifyProcs"])
 
+    # RFC 0011 S0b, work item (i)(i): `trustedWrappers` + `versionProbe` in
+    # one block is a compile-time error — see `tfail_trustedwrappers_
+    # versionprobe.nim`'s own doc comment for the probe-contract rationale.
+    expectManifestCompileFail(vpBase & "tests/tfail_trustedwrappers_versionprobe.nim",
+      ["trustedWrappers and versionProbe cannot both be declared"])
+
     expectManifestCompileOk(vpBase & "tests/tcheck_versionprobe_absent.nim", [], [])
 
     # Finding #19.3 (code-review coverage gap): pin the exact wording of the
@@ -2274,6 +2312,19 @@ task test, "Run tests":
   exec "nim c -r --path:src tests/tcov_classify_absence_multi_pair.nim"
   exec "nim c -r --path:src tests/tcov_harvest_cli_help_ordering.nim"
 
+  # RFC 0011 S0b, work item (ii): the trusted-wrapper mode's fatal
+  # subsystem (`softlink/fatal`), standalone. `-d:softlinkTesting` gates
+  # ONLY this file's own in-process CAS-guard suite (`softlink/fatal`'s
+  # `softlinkFatalTestEntry`/`resetFatalGuardForTest` seam, which does not
+  # exist without the define) — the subprocess suite it also drives
+  # compiles its two children (`tests/fatal_child_basic.nim`/
+  # `tests/fatal_child_race.nim`) WITHOUT the define, so those exercise
+  # genuine production `softlinkFatal`. `--threads:on`: both the in-process
+  # concurrent-CAS test and the race subprocess fixture spawn real OS
+  # threads. Needs no built testlib/libmagic/libvern (same rationale as the
+  # four fixtures directly above), so it runs once, unconditionally too.
+  exec "nim c -r -d:softlinkTesting --threads:on --path:src tests/tfatal.nim"
+
   # Portable-diagnostics migration (Windows CI fix): every check below this
   # point through `runVersionProbeChecks()` used to be TRIPLED, once per
   # `when defined(windows)`/`elif defined(macosx)`/`else` branch, purely so
@@ -2327,6 +2378,14 @@ task test, "Run tests":
   expectDiag(noverifyBlockWarnCheck, "block-level noverify collapsed warning (strict)",
     "3 symbols not header-verified", "2 symbols, block-level reason: \"no public header for these\"",
     "foo_own — \"its own, separate reason\"", "Warning:")
+  expectDiag(trustedWrappersHintCheck, "trustedWrappers audit hint",
+    "2 wrappers trusted (trustedWrappers)",
+    "every symbol here is a stable, always-present export", "Hint:")
+  expectDiag(trustedWrappersWarnCheck, "trustedWrappers audit warning (strict)",
+    "2 wrappers trusted (trustedWrappers)",
+    "every symbol here is a stable, always-present export", "Warning:")
+  expectDiag(trustedWrappersBareHintCheck, "trustedWrappers bare-form hint renders (no justification)",
+    "1 wrapper trusted (trustedWrappers)", "(no justification)", "Hint:")
   expectDiag(untilRequiredHintCheck, "until required-symbol hint",
     "drifted-but-required", "did you mean {.optional.}?", "Hint:")
   expectDiag(untilRequiredWarnCheck, "until required-symbol warning (strict)",
@@ -2639,6 +2698,61 @@ task testWindows, "RFC 0011 S0a item 5: Windows loader-error-detail measurement 
   ## `victim.dll`/`missing_dep.dll` and compiles `tloader_windows.exe` into
   ## a fresh temp directory under the OS temp root (`getTempDir()`), never
   ## into the repo tree itself, and runs the exe from there.
+  proc runWithTimeout(exePath: string, timeoutSec: int): tuple[output: string, exitCode: int, timedOut: bool] =
+    ## RFC 0011 S0b, post-wedge hardening: a plain `gorgeEx(exePath)` (this
+    ## file's usual subprocess-capture idiom) has NO timeout — if a fatal-
+    ## subsystem child's `MessageBoxW` gating ever regresses (exactly what
+    ## happened the first real run of this task, before
+    ## `winWindowStationIsVisible` — see `softlink/fatal.nim`'s own doc
+    ## comment on it), the child blocks forever inside a dialog nobody can
+    ## click, and `gorgeEx` blocks this ENTIRE task — and the container
+    ## running it — forever right along with it. Every fatal-subsystem
+    ## subprocess this task runs (below) goes through this wrapper instead:
+    ## `Start-Process -PassThru` + the .NET `Process.WaitForExit(ms)` method
+    ## — deliberately NOT the `Wait-Process` CMDLET, which was empirically
+    ## confirmed (direct measurement against this exact image) to report a
+    ## false-positive timeout for a `--app:gui` (GUI-subsystem) child even
+    ## when the process had already exited cleanly — a PowerShell quirk
+    ## around GUI-subsystem process "responsiveness" tracking, unrelated to
+    ## whether the process actually hung. `.WaitForExit(ms)` measures real
+    ## OS process termination directly and was confirmed accurate for the
+    ## same fixture. `$p.Handle` is read once, immediately after
+    ## `Start-Process`, before waiting — also empirically required: without
+    ## it, `$p.ExitCode` reads back `$null` even after a confirmed exit (a
+    ## known .NET `Process` lazy-initialization gotcha; touching `.Handle`
+    ## first forces eager tracking). Force-kills and reports a clear
+    ## timeout rather than hanging. `timeoutSec` should be generous relative
+    ## to how fast a CORRECTLY-behaving fatal path terminates (near-
+    ## instant) — this is a regression tripwire, not a normal-case budget.
+    let outFile = exePath & ".out.txt"
+    let errFile = exePath & ".err.txt"
+    if fileExists(outFile): rmFile(outFile)
+    if fileExists(errFile): rmFile(errFile)
+    let psCmd = "$p = Start-Process -FilePath '" & exePath &
+      "' -PassThru -NoNewWindow -RedirectStandardOutput '" & outFile &
+      "' -RedirectStandardError '" & errFile & "'; " &
+      "$h = $p.Handle; " &
+      "if ($p.WaitForExit(" & $(timeoutSec * 1000) &
+      ")) { Write-Output ('EXITCODE=' + $p.ExitCode) } " &
+      "else { Stop-Process -InputObject $p -Force -ErrorAction SilentlyContinue; Write-Output 'SOFTLINK_TIMEOUT' }"
+    let (psOutput, _) = gorgeEx("powershell -NoProfile -Command \"" & psCmd & "\"")
+    let capturedOut = if fileExists(outFile): readFile(outFile) else: ""
+    let capturedErr = if fileExists(errFile): readFile(errFile) else: ""
+    let combined = capturedOut & capturedErr
+    if "SOFTLINK_TIMEOUT" in psOutput:
+      return (combined, -1, true)
+    var code = -1
+    let marker = "EXITCODE="
+    let idx = psOutput.find(marker)
+    if idx >= 0:
+      let tail = psOutput[idx + marker.len .. ^1].strip()
+      var numEnd = 0
+      while numEnd < tail.len and (tail[numEnd].isDigit() or (numEnd == 0 and tail[numEnd] == '-')):
+        inc numEnd
+      if numEnd > 0:
+        code = parseInt(tail[0 ..< numEnd])
+    (combined, code, false)
+
   when defined(windows):
     # NimScript's `os`-shim has no `getTempDir`/`/` — build the path from
     # `%TEMP%` (falling back to the container workflow's own documented
@@ -2668,5 +2782,138 @@ task testWindows, "RFC 0011 S0a item 5: Windows loader-error-detail measurement 
     withDir workDir:
       exec exePath
     rmDir(workDir)
+
+    # RFC 0011 S0b, work item (ii)(d): the Windows legs of the fatal
+    # subsystem's own subprocess suite. `tests/tfatal.nim` itself is built
+    # into a fresh `%TEMP%` work dir (never the mounted repo tree — same
+    # PE-corruption rationale as `tloader_windows.exe` above), but is RUN
+    # with the repo root as its working directory (nimble's `exec` default
+    # cwd) so its own internal `tests/fatal_child_*.nim` relative paths
+    # keep resolving — its own child compiles already target `getTempDir()`
+    # internally (see `tests/tfatal.nim`'s `compileChild`), so nothing
+    # about ITS children touches the mount either.
+    let fatalWorkDir = tempRoot & r"\softlink_win_fatal_test"
+    if dirExists(fatalWorkDir): rmDir(fatalWorkDir)
+    mkDir(fatalWorkDir)
+    let tfatalExePath = fatalWorkDir & r"\tfatal.exe"
+    let tfatalNimcache = fatalWorkDir & r"\nc"
+    exec "nim c -o:" & tfatalExePath & " --nimcache:" & tfatalNimcache &
+         " -d:softlinkTesting --threads:on --path:src tests/tfatal.nim"
+    # `runWithTimeout`, not a bare `exec` (see that proc's own doc comment):
+    # `tfatal.exe`'s own children (none of which define
+    # `-d:softlinkNoFatalDialog`) are exactly the shape that wedged this
+    # task's first real run before `winWindowStationIsVisible` — a generous
+    # 120s budget (compiling three children internally, plus a handful of
+    # real subprocess round-trips, genuinely takes a little while; a
+    # correctly-behaving fatal path itself terminates near-instantly).
+    block:
+      let (tfatalOutput, tfatalExit, tfatalTimedOut) = runWithTimeout(tfatalExePath, 120)
+      if tfatalTimedOut:
+        quit("softlink: RFC 0011 S0b: tests/tfatal.nim (Windows leg) TIMED " &
+             "OUT — a fatal-subsystem child likely wedged inside MessageBoxW " &
+             "(the exact regression winWindowStationIsVisible exists to " &
+             "prevent); captured output before the forced kill:\n" & tfatalOutput)
+      if tfatalExit != 0:
+        quit("softlink: RFC 0011 S0b: tests/tfatal.nim (Windows leg) failed " &
+             "(exit " & $tfatalExit & "):\n" & tfatalOutput)
+      echo tfatalOutput
+    rmDir(fatalWorkDir)
+
+    # Work item (ii)(d), GUI-subsystem leg — ALSO the regression pin for the
+    # window-station wedge (see `softlink/fatal.nim`'s `winWindowStationIsVisible`
+    # doc comment): `--app:gui` (no auto-allocated console —
+    # `GetConsoleWindow()` returns NULL, the condition that used to route
+    # straight into `MessageBoxW`) compiled WITHOUT `-d:softlinkNoFatalDialog`
+    # on purpose — the `MessageBoxW` leg is fully compiled IN here, and the
+    # process must STILL terminate promptly, because the window station in
+    # this container is not visible. The build-wide override itself is
+    # pinned separately by the compile-time C-inspection check below (work
+    # item (ii)(c)). Pins what's mechanically pinnable: exit code and
+    # captured-stderr diagnostic content (standard-handle redirection works
+    # identically for a GUI-subsystem child launched with redirected stdio,
+    # regardless of subsystem — only auto-allocating a VISIBLE console
+    # differs). `OutputDebugString`'s own content is NOT mechanically
+    # assertable here without a debugger attached to the child while it
+    # runs — noted, not pinned, exactly as the RFC allows for this leg.
+    # `runWithTimeout`, not a bare `exec`/`gorgeEx` — this exact fixture is
+    # what wedged the container the first time; a regression here must fail
+    # loudly with a clear timeout, never hang the task/container again.
+    let guiWorkDir = tempRoot & r"\softlink_win_fatal_gui_test"
+    if dirExists(guiWorkDir): rmDir(guiWorkDir)
+    mkDir(guiWorkDir)
+    let guiExePath = guiWorkDir & r"\fatal_child_gui.exe"
+    let guiNimcache = guiWorkDir & r"\nc"
+    exec "nim c --app:gui -o:" & guiExePath &
+         " --nimcache:" & guiNimcache & " --path:src tests/fatal_child_gui.nim"
+    let (guiOutput, guiExitCode, guiTimedOut) = runWithTimeout(guiExePath, 30)
+    if guiTimedOut:
+      quit("softlink: RFC 0011 S0b work item (ii)(d): the GUI-subsystem " &
+           "fatal child TIMED OUT — this is the exact window-station " &
+           "wedge winWindowStationIsVisible (softlink/fatal.nim) exists " &
+           "to prevent; captured output before the forced kill:\n" & guiOutput)
+    if guiExitCode == 0:
+      quit("softlink: RFC 0011 S0b work item (ii)(d): expected the GUI-" &
+           "subsystem fatal child to exit with a NONZERO code, got 0: " &
+           guiOutput)
+    if "gui-subsystem fatal diagnostic" notin guiOutput:
+      quit("softlink: RFC 0011 S0b work item (ii)(d): expected the GUI-" &
+           "subsystem fatal child's diagnostic on its captured output, " &
+           "found none: " & guiOutput)
+    if "UNREACHABLE" in guiOutput:
+      quit("softlink: RFC 0011 S0b work item (ii)(d): the GUI-subsystem " &
+           "fatal child printed its post-fatal UNREACHABLE line — exit " &
+           "procs/continued execution should never run past softlinkFatal: " &
+           guiOutput)
+    echo "softlink: RFC 0011 S0b work item (ii)(d): GUI-subsystem leg OK " &
+         "(nonzero exit, diagnostic captured, did not hang)"
+    rmDir(guiWorkDir)
+
+    # Work item (ii)(c): `-d:softlinkNoFatalDialog` compiles the
+    # `MessageBoxW` leg OUT entirely — a direct C-inspection proof, mirroring
+    # this repo's existing `expectInGenC`/`expectAnchor` convention (`task
+    # test`, Linux/gcc leg): compile a trivial file that imports
+    # `softlink/fatal` twice, with and without the define, into separate
+    # `--nimcache` dirs, and assert the generated C names `MessageBoxW` in
+    # one and not the other.
+    let dialogSymDir = tempRoot & r"\softlink_win_fatal_dialogsym"
+    if dirExists(dialogSymDir): rmDir(dialogSymDir)
+    mkDir(dialogSymDir)
+    let dialogSymbolFixture = dialogSymDir & r"\dialogsym_fixture.nim"
+    # `paramCount() > 999999` is a RUNTIME condition (real argv-dependent,
+    # not a compile-time-foldable literal like `if false:`), so Nim cannot
+    # constant-fold the branch away — the call, and therefore
+    # `softlinkFatal`'s full body (down to the `winMessageBoxW` call this
+    # check greps for), is genuinely compiled and emitted into the
+    # generated C, even though this fixture is never actually RUN (only
+    # `--compileOnly`'d) and the branch would never fire if it were.
+    writeFile(dialogSymbolFixture, "import std/os\n" &
+      "import softlink/fatal\n" &
+      "if paramCount() > 999999:\n" &
+      "  softlinkFatal(\"never reached\")\n")
+    let dialogWithDir = tempRoot & r"\softlink_win_fatal_dialogsym_with"
+    let dialogWithoutDir = tempRoot & r"\softlink_win_fatal_dialogsym_without"
+    if dirExists(dialogWithDir): rmDir(dialogWithDir)
+    if dirExists(dialogWithoutDir): rmDir(dialogWithoutDir)
+    exec "nim c --compileOnly --nimcache:" & dialogWithDir &
+         " --path:src " & dialogSymbolFixture
+    exec "nim c --compileOnly -d:softlinkNoFatalDialog --nimcache:" &
+         dialogWithoutDir & " --path:src " & dialogSymbolFixture
+    var sawWith, sawWithout = false
+    for f in walkGenSources(dialogWithDir):
+      if "MessageBoxW" in readFile(f): sawWith = true
+    for f in walkGenSources(dialogWithoutDir):
+      if "MessageBoxW" in readFile(f): sawWithout = true
+    if not sawWith:
+      quit("softlink: RFC 0011 S0b work item (ii)(c): expected 'MessageBoxW' " &
+           "in the generated C WITHOUT -d:softlinkNoFatalDialog, found none")
+    if sawWithout:
+      quit("softlink: RFC 0011 S0b work item (ii)(c): expected NO " &
+           "'MessageBoxW' in the generated C WITH -d:softlinkNoFatalDialog, " &
+           "but found one")
+    echo "softlink: RFC 0011 S0b work item (ii)(c): -d:softlinkNoFatalDialog " &
+         "compiles the MessageBoxW leg out — confirmed via generated C"
+    rmDir(dialogWithDir)
+    rmDir(dialogWithoutDir)
+    rmDir(dialogSymDir)
   else:
     echo "testWindows: no-op on this target (RFC 0011 S0a item 5 stories f/g are Windows-only)"

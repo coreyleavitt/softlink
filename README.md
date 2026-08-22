@@ -281,6 +281,30 @@ A proc that carries `{.verifyWhen.}` or `{.until.}` but no `header`/`prototype` 
 
 One `dynlib` block per library per module: a second block whose pattern derives the same identifier base (e.g. `dynlib "m"` twice, or `"libfoo.so"` plus `"foo"`) is rejected at compile time with an error telling you to merge the blocks. Use `{.optional.}`/`{.verifyWhen.}`/`{.prototype.}`/`{.noverify.}` within the single block instead of gating extra symbols behind a separate block — or, if you genuinely need more than one block over the same library (see [`identBase`](#identbase-overriding-the-derived-identifier-base) below), give each block a distinct override.
 
+### `trustedWrappers`: raises:[] wrappers, fatal on nil dispatch
+
+Every wrapper `dynlib` generates raises `SoftlinkError` when its function pointer is nil — the ordinary, catchable failure mode. A `trustedWrappers` body directive switches an entire block to the opposite contract: every wrapper it generates is genuinely `{.raises: [].}` (checked by Nim's effect system, not merely documented), and a nil-pointer dispatch **terminates the process immediately** instead of raising.
+
+This exists for callers embedded inside a foreign library's own call stack — a GTK signal handler, a C callback, anywhere a Nim exception cannot safely cross back out through frames softlink doesn't control. `loadXxx`/`unloadXxx`/`LoadResult`/`xxxAvailable`/`xxxPtr` are completely unaffected: load time remains the catchable, reportable surface it always was; only a *dispatch* through an unloaded pointer changes from "raise" to "terminate."
+
+```nim
+dynlib "libgtk-4.so(|.1)":
+  trustedWrappers: "called only from GTK signal trampolines; a raise there would cross an FFI boundary GTK doesn't expect"
+  proc gtk_widget_show(widget: pointer) {.cdecl, header: "gtk/gtk.h".}
+```
+
+Bare `trustedWrappers` (no justification) is also accepted, mirroring the per-proc `{.noverify.}` pragma's own optional-reason shape — unlike the block-level `noverify: "reason"` directive above, whose justification is required. Either way, the block gets its own compile-time audit hint, so trusted blocks stay visible in an audit the same way `{.noverify.}` symbols do:
+
+```
+softlink: dynlib "libgtk-4.so(|.1)": 1 wrapper trusted (trustedWrappers), reason:
+  "called only from GTK signal trampolines; a raise there would cross an FFI boundary GTK doesn't expect"
+  — nil-pointer dispatch terminates the process instead of raising
+```
+
+Termination goes through a dedicated fatal path (`softlink/fatal`), not `quit()`: it writes the same diagnostic an untrusted wrapper's `SoftlinkError.msg` would have carried (the not-loaded message naming the symbol and library, or the full drift story where one was recorded) to stderr, and on Windows additionally to `OutputDebugString`. The `MessageBoxW` dialog leg fires only when **all three** hold: `-d:softlinkNoFatalDialog` was not defined at build time, the process has no attached console (`GetConsoleWindow() == NULL`), and the process's window station is genuinely interactive (`GetProcessWindowStation()` + `GetUserObjectInformationW(..., UOI_FLAGS, ...)` reports `WSF_VISIBLE`). That third condition exists because `GetConsoleWindow() == NULL` alone is not "this is a GUI app with a human watching" — it is *also* true for a plain console-subsystem process running with no interactive window station at all (a Windows service, a container, a session-0 process), where `MessageBoxW` has no desktop to paint on and **never returns**, wedging the process forever — the opposite of what a fatal-termination path is for. Any one of the three conditions failing skips the dialog and the process still terminates immediately via the stderr/`OutputDebugString` sinks alone. `-d:softlinkNoFatalDialog` remains the build-wide opt-out on top of the runtime checks, for a headless Windows service that wants the dialog compiled out entirely regardless of window-station detection. Termination itself is `_Exit`, deliberately **without** running Nim's registered exit procedures (`std/exitprocs.addExitProc`) — the fatal can fire from inside a foreign C frame, where running arbitrary Nim exit-proc code that might re-enter that same library would be a second hazard. An atomic guard ensures a second, concurrent, or reentrant fatal (e.g. a modal dialog's own nested message loop dispatching back into a live GTK trampoline) never produces a second dialog or repeats the diagnostic work — it blocks until the first fatal's own termination tears the whole process down.
+
+`trustedWrappers` and `versionProbe` cannot coexist in one block: the probe contract converts a wrapper's raised `SoftlinkError` into a reported `atProbeFailed` attestation via `try`/`except` around the probe body's own wrapper calls, and a `{.raises: [].}` trusted wrapper can never raise for that `except` to catch. Not recognized in `verifyProcs` (which generates no wrappers at all, so the directive has nothing to apply to).
+
 ### Unload and reload
 
 ```nim

@@ -508,6 +508,93 @@ proc noVerifyDupError*(macroName: string, first, second: NoVerifyDirective): str
   "may declare a block-level noverify default at most once."
 
 type
+  TrustedWrappersDirective* = object
+    ## RFC 0011 S0b, work item (i): one parsed block-level `trustedWrappers`
+    ## directive — at most one per `dynlib` block, any position (mirrors
+    ## `NoVerifyDirective`/`CompatManifestDirective`/`VersionMacrosDirective`
+    ## above). `present == false` is the zero value (no directive in this
+    ## block — every wrapper in it keeps raising `SoftlinkError`, unchanged).
+    ##
+    ## UNLIKE the block-level `noverify: "reason"` directive (whose
+    ## justification is REQUIRED — see `NoVerifyDirective`'s own doc
+    ## comment for why), `trustedWrappers`'s justification is OPTIONAL: bare
+    ## `trustedWrappers` and `trustedWrappers: "justification"` are BOTH
+    ## accepted, per the RFC's own spelling ("a `noverify`-style optional
+    ## justification"). This mirrors the PER-PROC `{.noverify.}` pragma's
+    ## own optional-reason shape (`parseNoVerifyReasonExpr`, `softlink/
+    ## pragmas`) rather than the block-level `noverify` directive's
+    ## required one — the two block-level directives differ in blast
+    ## radius in opposite ways: a bare block-level `noverify` would
+    ## silently waive verification for every gapped proc with no signal at
+    ## all, which is why THAT directive demands a reason; `trustedWrappers`
+    ## already gets its own unconditional compile-time audit hint below
+    ## (every trusted block is visible regardless of whether a reason was
+    ## given), so a bare form loses nothing a reason would have added to
+    ## that visibility — it only loses the free-text WHY, same trade a bare
+    ## per-proc `{.noverify.}` already makes today.
+    present*: bool
+    reason*: string  ## "" means no justification was given (bare form)
+    node*: NimNode    ## the directive call node, for diagnostic anchoring
+
+func isTrustedWrappersCall*(stmt: NimNode): bool =
+  ## True when `stmt` is a `trustedWrappers` directive statement in ANY
+  ## shape: bare `trustedWrappers` (parses as a plain `nnkIdent`, exactly
+  ## like bare `versionProbe` — see `isVersionProbeStmt` above) or a call
+  ## shape (`nnkCall`, whether well-formed colon-block sugar or not —
+  ## `parseTrustedWrappersDirective` below sorts well-formed from
+  ## malformed). Checked structurally against the bare identifier text,
+  ## exactly like every other directive recognizer in this file — the
+  ## block's body is `untyped`, so nothing has been resolved to an actual
+  ## symbol yet.
+  (stmt.kind == nnkIdent and $stmt == "trustedWrappers") or
+  (stmt.kind == nnkCall and stmt.len >= 1 and stmt[0].kind == nnkIdent and
+   $stmt[0] == "trustedWrappers")
+
+proc parseTrustedWrappersDirective*(stmt: NimNode, macroName: string): TrustedWrappersDirective =
+  ## RFC 0011 S0b, work item (i)(e): parse one recognized `trustedWrappers`
+  ## directive statement. Two well-formed shapes:
+  ##   - bare `trustedWrappers` (`stmt.kind == nnkIdent`) — no justification.
+  ##   - `trustedWrappers: "<justification>"` (`nnkCall` whose sole argument
+  ##     is an `nnkStmtList` holding exactly one non-empty string literal —
+  ##     the SAME colon-block shape the block-level `noverify: "..."`
+  ##     directive uses, see `isNoVerifyCall`'s own doc comment for why
+  ##     that's the one recognized spelling rather than `nnkCommand`).
+  ## Any other shape reaching here — `trustedWrappers()`, `trustedWrappers(
+  ## "x")` (positional-argument call sugar, not colon-block), `trustedWrappers:
+  ## 5` (non-string), an empty or multi-statement colon-block, or an empty
+  ## string — is a directive-specific macro error, never the generic
+  ## body-shape error `dynlib` raises for an unrecognized statement.
+  result.present = true
+  result.node = stmt
+  if stmt.kind == nnkIdent:
+    return
+  if stmt.len == 2 and stmt[1].kind == nnkStmtList and stmt[1].len == 1 and
+     stmt[1][0].kind in {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+    let reason = stmt[1][0].strVal
+    if reason.strip().len == 0:
+      error(macroName & ": trustedWrappers's justification must be " &
+            "non-empty — omit the value entirely for bare " &
+            "trustedWrappers with no justification", stmt[1][0])
+      return
+    result.reason = reason
+    return
+  error(macroName & ": trustedWrappers accepts either bare " &
+        "trustedWrappers or trustedWrappers: \"<justification>\" — e.g. " &
+        "trustedWrappers: \"post-init() presence is invariant; RFC 0011 " &
+        "§4.3\" — got an unrecognized argument shape", stmt)
+
+proc trustedWrappersDupError*(macroName: string): string =
+  ## RFC 0011 S0b: "at most one trustedWrappers per block, any position" —
+  ## voiced like `noVerifyDupError`/`compatManifestDupError`/
+  ## `versionMacrosDupError`/`identBaseDupError` above. Unlike those,
+  ## neither occurrence carries data worth naming in the message (a bare
+  ## directive has no reason, and two DIFFERING reasons would not be any
+  ## clearer to merge-by-name than two identical ones) — the message
+  ## simply tells the author what to do.
+  "softlink: " & macroName & ": duplicate trustedWrappers directive in " &
+  "one block — a dynlib block may declare trustedWrappers at most once."
+
+type
   AppliedManifest* = object
     ## RFC-0001 §B.5/§9, slice B6b: `applyCompatManifest`'s return value.
     ## `attached` is the one bit `genVerifyBlock` has needed since B6a

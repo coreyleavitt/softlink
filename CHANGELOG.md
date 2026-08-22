@@ -130,6 +130,67 @@ README's
 ["Loader-error detail on `lrLibNotFound`"](README.md#loader-error-detail-on-lrlibnotfound)
 section.
 
+**Trusted-wrapper mode: `trustedWrappers` body directive (RFC 0011 S0b).**
+A block-level `trustedWrappers` (bare, or `trustedWrappers: "justification"`
+— justification optional, unlike the required-justification block-level
+`noverify` above) switches an entire `dynlib` block's generated wrappers
+from the ordinary "raise `SoftlinkError` on nil dispatch" contract to a
+genuinely `{.raises: [].}` one, checked by Nim's effect system: a nil
+function pointer now terminates the process instead of raising. For
+callers embedded inside a foreign library's own call stack (a GTK signal
+trampoline, a C callback) where a Nim exception cannot safely cross back
+out through frames softlink doesn't control. `loadX`/`unloadX`/
+`LoadResult`/`xxxAvailable`/`xxxPtr`/the compat-report surface are
+completely unaffected — load time remains the catchable/reportable
+surface; only dispatch through an unloaded pointer changes. Termination
+runs through a new `softlink/fatal` module (softlink's first
+Windows-runtime FFI): writes the same diagnostic an untrusted wrapper's
+`SoftlinkError.msg` would have carried (not-loaded message, or the full
+drift story where one was recorded) to stderr via raw C I/O (never Nim's
+exception-typed `system.stderr`, which would poison the trusted wrapper's
+own `{.raises: [].}`), plus `OutputDebugString` on Windows always, and a
+`MessageBoxW` dialog only when **all three** hold: `-d:softlinkNoFatalDialog`
+was not defined at build time (the new build-wide opt-out, same switch
+family as `-d:softlinkNoDriftRefusal`), the process has no attached console
+(`GetConsoleWindow() == NULL`), and the process's window station is
+genuinely interactive/visible (`GetProcessWindowStation()` +
+`GetUserObjectInformationW(..., UOI_FLAGS, ...)`'s `WSF_VISIBLE` bit).
+**The third condition was added after the first real Windows test run
+wedged a container indefinitely:** `GetConsoleWindow() == NULL` alone is
+*also* true for an ordinary console-subsystem process with no interactive
+window station at all (a Windows service, a container, a session-0
+process) — there, `MessageBoxW` has no desktop to paint on and never
+returns, hanging the process forever, exactly backwards for a
+fatal-termination path whose entire job is guaranteed prompt termination.
+Any one of the three conditions failing skips the dialog; the stderr/
+`OutputDebugString` sinks and `_Exit` termination are unaffected either
+way. Terminates via `_Exit`,
+deliberately bypassing Nim's registered exit procedures
+(`std/exitprocs.addExitProc`) — the fatal can fire from inside a foreign C
+frame, where running arbitrary Nim exit-proc code that might re-enter that
+same library would be a second hazard. An atomic (compare-and-swap)
+reentrancy guard ensures a second, concurrent, or reentrant fatal (e.g. a
+modal dialog's own nested message loop dispatching back into a live
+foreign trampoline) never repeats the diagnostic work or opens a second
+dialog — every loser blocks until the first fatal's own termination tears
+the whole process down, rather than racing it to `_Exit` independently
+(which could otherwise kill the process before the winner's diagnostic
+ever reached stderr). The block gets its own compile-time audit hint ("N
+wrappers trusted (trustedWrappers), reason: ..."), same "trust points are
+visible" convention as the `{.noverify.}` hint. `trustedWrappers` and
+`versionProbe` cannot coexist in one block (compile-time error): the probe
+contract converts a wrapper's raised `SoftlinkError` into a reported
+`atProbeFailed` attestation via `try`/`except`, and a `{.raises: [].}`
+trusted wrapper can never raise for that `except` to catch. **Deferred:**
+the RFC records a narrower relaxation of that restriction (error only when
+the probe body itself calls an `{.optional.}` symbol, the only genuinely
+at-risk shape) as a backlog item — no shipped block needs it yet, and the
+current restriction is deliberately broader than the precise hazard. Not
+recognized in `verifyProcs` (generates no wrappers at all, so the
+directive has nothing to apply to). See the README's
+["`trustedWrappers`: raises:[] wrappers, fatal on nil dispatch"](README.md#trustedwrappers-raises-wrappers-fatal-on-nil-dispatch)
+section.
+
 ### Changed
 
 **`libNameToIdent`'s leading-alternation normalization is now general
