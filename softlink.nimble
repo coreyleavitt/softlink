@@ -1680,7 +1680,7 @@ task test, "Run tests":
     "testlib_overlap", "testlib_gap", "testlib_since", "testlib_vp_subset",
     "testlib_vp_since", "testlib_abi_mismatch", "testlib_until",
     "testlib_until_unknown", "testlib_until_unknown_stamped",
-    "testlib_until_covered"]
+    "testlib_until_covered", "testlib_shared_symbol_mismatch"]
 
   proc runManifestChecks() =
     const mdir = "tests/manifests/"
@@ -1871,6 +1871,12 @@ task test, "Run tests":
     expectManifestCompileFail(mcBase & "tests/tfail_when_nested_bodyless_proc.nim",
       ["conditional binding declarations are not supported inside a dynlib block"])
 
+    # Code-review finding L9: the same hazard one level deeper — a
+    # bodyless proc inside a `block:` nested within a `when` branch (a pure
+    # statement-grouping construct, not another `when`) must be found too.
+    expectManifestCompileFail(mcBase & "tests/tfail_when_block_bodyless_proc.nim",
+      ["conditional binding declarations are not supported inside a dynlib block"])
+
     expectManifestCompileOk(mcBase & "tests/tcheck_when_passthrough_ok.nim", [], [])
 
     expectManifestCompileFail(mcBase & "tests/tfail_when_bodyless_proc_verifyprocs.nim",
@@ -2056,6 +2062,18 @@ task test, "Run tests":
       echo mixedOutput
       quit("softlink: partition proof: the HINT line named the uncovered " &
            "symbol 'testlib_noop' — it must name only the covered one")
+
+    # Code-review finding M7: two Nim procs sharing one C symbol via
+    # `{.symbol:.}` must not double-count that symbol in Check 7's mismatch
+    # warning — `tests/tcheck_manifest_shared_symbol_mismatch_dedup.nim`
+    # declares two procs both naming `testlib_add`, against a manifest that
+    # records exactly one `mismatch` interval for it. The count must read
+    # "1 symbol", naming `testlib_add` exactly once, never "2 symbols" with
+    # the name repeated.
+    expectManifestCompileOk(
+      mcBase & "tests/tcheck_manifest_shared_symbol_mismatch_dedup.nim",
+      ["1 symbol recorded a 'mismatch' interval: testlib_add"],
+      ["2 symbols recorded a 'mismatch' interval", "testlib_add, testlib_add"])
 
     # RFC-0001 §9/§C.1/§C.4b: the version-probe static drift-call scan —
     # a probe directly calling a wrapper whose symbol carries any

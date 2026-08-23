@@ -2,6 +2,52 @@
 
 All notable changes to softlink are documented here.
 
+## [0.12.3] - 2026-08-23
+
+### Security
+
+**Windows library-existence preflight no longer maps the target as an
+executable image.** The `ERROR_MOD_NOT_FOUND` preflight in `softlink/loader`
+— which separates a present-but-broken library (missing transitive
+dependency) from a genuinely absent one — previously opened the candidate
+with `LoadLibraryEx(..., DONT_RESOLVE_DLL_REFERENCES)`. That flag still
+creates an executable image mapping and runs the target's TLS callbacks, so
+a crafted DLL planted at a candidate name on the search path could execute
+code during the probe. It now opens the candidate with
+`LOAD_LIBRARY_AS_DATAFILE`, which maps the file as inert data (no DllMain,
+no TLS) and is the documented existence-probe flag; it still answers
+present-vs-absent correctly because the preflight runs only after a real
+load already failed and needs only whether the file itself opens.
+
+### Added
+
+**`DependencyLikelyMissingHint` exported.** The exact substring appended to
+a failed candidate's `osError` for the present-but-broken-dependency case is
+now an exported const (re-exported from the package root), so a consumer can
+match against it instead of hard-coding the free text.
+
+### Fixed
+
+- **`compatManifest` corpus membership no longer double-counts a shared C
+  symbol.** When two Nim procs bind one C symbol via `{.symbol: "c_name".}`
+  (the fixed-arity-views-of-one-variadic pattern), the not-in-manifest and
+  mismatch checks reported that symbol once per proc, inflating the count.
+  Trackable symbols are now deduped by C name.
+- **The conditional-binding `when` diagnostic recurses into nested blocks.**
+  A bodyless proc inside a `block:` or statement list within a `when` branch
+  is now recognized and reported with softlink's own diagnostic, rather than
+  falling through to Nim's bare "implementation expected" error.
+
+### Documentation
+
+- The `-d:softlink.pattern.<Base>` override key is the block's bare
+  `identBase` and is global across the whole compilation: two blocks that
+  share an identBase (even in unrelated packages) share one override knob.
+  Distinct `identBase`s keep them independent.
+- `softlinkFatal` is documented as designed for a foreign-call-frame fault
+  point, not for use inside an OS signal handler — its `fputs`/`fflush` sink
+  is not async-signal-safe.
+
 ## [0.12.2] - 2026-08-22
 
 ### Added

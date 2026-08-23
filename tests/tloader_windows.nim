@@ -10,11 +10,16 @@
 ##      DLL and for a truly-absent DLL — Windows' documented "does not name
 ##      the missing dependency" ambiguity (dlerror() on Linux does not have
 ##      this problem — see `tests/tloader_detail.nim` story (c)).
-##   2. Whether a `LoadLibraryExA(path, 0, DONT_RESOLVE_DLL_REFERENCES)`
-##      preflight on the SAME path cheaply separates the two cases (it
-##      skips import resolution, so it should succeed for a present target
-##      regardless of its dependencies, and fail only when the target
-##      itself is absent).
+##   2. Whether a `LoadLibraryExA(path, 0, LOAD_LIBRARY_AS_DATAFILE)`
+##      preflight on the SAME path cheaply separates the two cases (it maps
+##      the file as plain data — no image activation, so it should succeed
+##      for a present target regardless of its dependencies, and fail only
+##      when the target itself is absent — without ever running code from
+##      the candidate path, unlike the `DONT_RESOLVE_DLL_REFERENCES` flag
+##      this preflight used before code-review finding H1: that flag still
+##      creates an executable image mapping and runs TLS-callback code,
+##      which Microsoft's own docs call unsafe outside a narrow testing
+##      context).
 ##
 ## Both are ALSO measured as unit-level facts via `softlink/loader`'s own
 ## public `loadLibPatternDetailed` (the production code path), pinning that
@@ -44,7 +49,7 @@ else:
     {.importc: "GetLastError", header: "<windows.h>", stdcall.}
 
   const
-    kDontResolveDllReferences = 0x00000001'u32
+    kLoadLibraryAsDatafile = 0x00000002'u32
     kErrorModNotFound = 126'u32
 
   suite "Windows measurement (story f): LoadLibrary error-code ambiguity":
@@ -67,21 +72,22 @@ else:
       check absentCode == kErrorModNotFound
       check victimCode == absentCode
 
-  suite "Windows measurement (story f): DONT_RESOLVE_DLL_REFERENCES preflight":
+  suite "Windows measurement (story f): LOAD_LIBRARY_AS_DATAFILE preflight":
     test "the preflight succeeds for the present target and fails for the truly-absent one":
-      let hVictimPreflight = winLoadLibraryExA("victim.dll", nil, kDontResolveDllReferences)
+      let hVictimPreflight = winLoadLibraryExA("victim.dll", nil, kLoadLibraryAsDatafile)
       let victimPreflightOk = not hVictimPreflight.isNil
       if victimPreflightOk: discard winFreeLibrary(hVictimPreflight)
 
-      let hAbsentPreflight = winLoadLibraryExA("totally_absent_xyz.dll", nil, kDontResolveDllReferences)
+      let hAbsentPreflight = winLoadLibraryExA("totally_absent_xyz.dll", nil, kLoadLibraryAsDatafile)
       let absentPreflightOk = not hAbsentPreflight.isNil
       if absentPreflightOk: discard winFreeLibrary(hAbsentPreflight)
 
-      echo "MEASURED: victim.dll DONT_RESOLVE_DLL_REFERENCES preflight succeeds=", victimPreflightOk
-      echo "MEASURED: totally_absent_xyz.dll DONT_RESOLVE_DLL_REFERENCES preflight succeeds=", absentPreflightOk
+      echo "MEASURED: victim.dll LOAD_LIBRARY_AS_DATAFILE preflight succeeds=", victimPreflightOk
+      echo "MEASURED: totally_absent_xyz.dll LOAD_LIBRARY_AS_DATAFILE preflight succeeds=", absentPreflightOk
       # This is the finding that justifies wiring the preflight into
       # softlink/loader.nim's Windows failure path: it separates the two
-      # cases the plain error code (story above) cannot.
+      # cases the plain error code (story above) cannot — without running
+      # any code from the candidate path (code-review finding H1).
       check victimPreflightOk
       check not absentPreflightOk
 
@@ -91,10 +97,10 @@ else:
       check hVictim.isNil
       check victimAttempts.len == 1
       check victimAttempts[0].osErrorCode == kErrorModNotFound.int
-      check "dependency is likely missing" in victimAttempts[0].osError
+      check DependencyLikelyMissingHint in victimAttempts[0].osError
 
       let (hAbsent, absentAttempts) = loadLibPatternDetailed("totally_absent_xyz.dll")
       check hAbsent.isNil
       check absentAttempts.len == 1
       check absentAttempts[0].osErrorCode == kErrorModNotFound.int
-      check "dependency is likely missing" notin absentAttempts[0].osError
+      check DependencyLikelyMissingHint notin absentAttempts[0].osError

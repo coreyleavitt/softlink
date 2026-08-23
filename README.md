@@ -133,9 +133,13 @@ a truly-absent library says so, but a *present* library with a missing
 transitive dependency names the missing dependency by its own filename,
 not the library you asked for. On Windows, plain `LoadLibrary` collapses
 both into the identical `ERROR_MOD_NOT_FOUND`; softlink runs a
-`LoadLibraryEx(..., DONT_RESOLVE_DLL_REFERENCES)` preflight (which skips
-import resolution) automatically on that specific error and annotates
-`osError` when it reveals the target file itself does exist. `attempts` is
+`LoadLibraryEx(..., LOAD_LIBRARY_AS_DATAFILE)` preflight (which maps the
+candidate as plain data, running no code from it, and still succeeds
+regardless of whether its own imports resolve) automatically on that
+specific error and annotates `osError` when it reveals the target file
+itself does exist. Match `softlink/loader.DependencyLikelyMissingHint`
+against `osError`/`osLoaderDetail` to detect this case programmatically,
+rather than hard-coding a copy of the annotation text. `attempts` is
 empty on every other `LoadResultKind`, including a success where an
 earlier candidate in the pattern failed before a later one loaded — once
 the load succeeds, an earlier failure carries no information worth
@@ -400,6 +404,8 @@ Built with the define above, `loadGtk4()` searches for `libgtk4-totally-absent.s
 The override string is a full softlink pattern in its own right, not a plain filename: it goes through the identical alternation/version-suffix expansion (`libCandidates`) a hand-written pattern would, so `LoadResult.attempts`/`osLoaderDetail` on a failed load name the OVERRIDE's own candidates — which is what makes a redirected-to-absent test build actually informative about what was searched for, not just that something failed.
 
 Rules: the override is looked up under the key `softlink.pattern.<Base>`, where `<Base>` is the block's effective identBase (its `identBase` directive if present, otherwise the same derived base `libNameToIdent` computes from the pattern) — two blocks sharing one declared pattern text but distinct `identBase`s (the `identBase` directive's own second motivating case, above) get two independently-settable overrides, never one shared knob. An empty override (the default — nothing was defined) means "no override": the block's declared pattern is used exactly as before this feature existed, and every existing binding is unaffected by upgrading to a softlink version that has it. Not available in `verifyProcs`: that macro has no library identity at all (no pattern argument, no `loadX`), so there is nothing for a pattern override to redirect.
+
+**Collision warning:** the override key is the bare `identBase` string, and `-d:softlink.pattern.<Base>=...` is a **global, compile-wide** define — it is not scoped to a module, a package, or a single `dynlib` block. If two *unrelated* `dynlib` blocks — even in different modules, even in different packages entirely — happen to derive or pin the SAME `identBase`, they share ONE override knob: setting the define to redirect one package's block (e.g. to force its "library absent" path in a test build) silently redirects the other block too, with no compile-time diagnostic, since Nim's module namespacing gives softlink no way to see across module boundaries at macro-expansion time. This is inherent to how `-d:` defines work, not a bug to be guarded against — if you rely on the pattern-override seam (for testing or for build-time redirection), give each block a distinct, explicit `identBase` so its override key can never collide with another block's.
 
 ### Statement pass-through: types, consts, and helpers alongside declarations
 

@@ -65,6 +65,16 @@
 ## general-purpose, and a headless Windows service that opts into trusted-
 ## wrapper mode must not inherit a blocking modal dialog on a background
 ## thread with nobody to click it.
+##
+## Code-review finding L10 (doc caveat, no code change): `softlinkFatal` is
+## designed for a foreign-call-frame fault point — a trusted wrapper's
+## nil-pointer branch, reached from ordinary (if unexpected) call-stack
+## unwinding through a foreign C frame — NOT for use inside an OS signal
+## handler (`SIGSEGV`/`SIGABRT`). Its stderr sink (`fputs`/`fflush` against
+## the C stream, above) is not on the POSIX async-signal-safe list; reached
+## from an actual signal handler, it could deadlock on stdio's own internal
+## lock (e.g. a `SIGSEGV` delivered while some other thread already holds
+## that lock for an unrelated, in-progress write).
 
 import std/atomics
 
@@ -316,6 +326,11 @@ proc softlinkFatal*(diagnostic: string) {.noreturn, raises: [].} =
   ## instead of raising `SoftlinkError` — see this module's own top-of-file
   ## doc comment for the full rationale (foreign-C-frame safety, sink list,
   ## termination semantics, and the CAS reentrancy guard).
+  ##
+  ## Designed for a foreign-call-frame fault point, NOT for use inside an
+  ## OS signal handler (`SIGSEGV`/`SIGABRT`) — see the module doc comment's
+  ## finding L10 note: the stderr sink's `fputs`/`fflush` are not
+  ## async-signal-safe and could deadlock if reached from a signal context.
   ##
   ## `diagnostic` is the SAME text `raiseNotLoaded`/`raiseDriftRefused`
   ## (`src/softlink.nim`) would have put in a raised `SoftlinkError.msg` —

@@ -51,7 +51,7 @@ export stdDynlib.LibHandle, stdDynlib.loadLibPattern, stdDynlib.symAddr,
 # itself stays exported too: it's still part of softlink's public surface
 # for callers who want the plain stdlib behavior directly, even though
 # `dynlib`'s own codegen no longer calls it.
-export loader.CandidateAttempt, loader.loadLibPatternDetailed
+export loader.CandidateAttempt, loader.loadLibPatternDetailed, loader.DependencyLikelyMissingHint
 # NOTE: `compatManifest`/`versionProbe` (the RFC-0001 §B.5/§9 "erroring
 # stub" proc/template) stay declared directly below in THIS file, rather
 # than moving to `softlink/pragmas` with the rest of the directive-parsing
@@ -821,6 +821,48 @@ proc scanProbeBodyForDriftCalls(stmts: NimNode, mismatchCNames: HashSet[string])
       return true
   false
 
+# Forward-declared: `collectBodylessProcDeclsInStmts` below and
+# `collectBodylessProcDeclsInWhen` further below recurse into each other (a
+# nested `when` inside a `block:`, or a nested `block:` inside a `when`
+# branch), so one of the two needs a signature visible before the other's
+# body. See `collectBodylessProcDeclsInWhen`'s own doc comment, further
+# below, for the full rationale both procs share.
+proc collectBodylessProcDeclsInWhen(whenStmt: NimNode): seq[NimNode]
+
+proc collectBodylessProcDeclsInStmts(stmts: NimNode): seq[NimNode] =
+  ## Code-review finding L9: the statement-list scan shared by
+  ## `collectBodylessProcDeclsInWhen` below (a `when` branch's own
+  ## statement list) AND by its own recursion into nested PURE
+  ## statement-grouping constructs — `block:` (`nnkBlockStmt`) and a
+  ## directly nested `nnkStmtList` — so a bodyless proc hidden inside one
+  ## of those, at any nesting depth, is still recognized as a conditional
+  ## binding attempt instead of silently falling through as ordinary
+  ## pass-through code (see `collectBodylessProcDeclsInWhen`'s own doc
+  ## comment for what happens when that recognition is missed). Kept
+  ## deliberately conservative: it recurses ONLY into node kinds whose
+  ## entire job is grouping statements, never into another proc, type, or
+  ## template body — those have their own, unrelated meaning, and a
+  ## bodyless proc nested inside one of THOSE is not this diagnostic's
+  ## concern.
+  for s in stmts:
+    case s.kind
+    of nnkProcDef:
+      if s.body.kind == nnkEmpty:
+        result.add(s)
+    of nnkWhenStmt:
+      result.add(collectBodylessProcDeclsInWhen(s))
+    of nnkBlockStmt, nnkStmtList:
+      # `nnkBlockStmt` is `[optional label, body stmtList]` — its body is
+      # always the LAST child, whether or not a label is present.
+      # `nnkStmtList` nested directly inside another statement list is
+      # rarer in practice but requires no special-casing: it already IS
+      # its own body.
+      let body = if s.kind == nnkStmtList: s else: s[s.len - 1]
+      if body.kind == nnkStmtList:
+        result.add(collectBodylessProcDeclsInStmts(body))
+    else:
+      discard
+
 proc collectBodylessProcDeclsInWhen(whenStmt: NimNode): seq[NimNode] =
   ## RFC 0011 (softlink-authored diagnostic for conditional binding
   ## declarations): recursively walks a top-level `when` statement's
@@ -840,17 +882,18 @@ proc collectBodylessProcDeclsInWhen(whenStmt: NimNode): seq[NimNode] =
   ## none, meaning the `when` is legitimate pass-through and must be left
   ## untouched); the caller turns a non-empty result into ONE softlink
   ## error naming the first offender.
+  ##
+  ## Code-review finding L9: a bodyless proc nested inside a `block:` (or a
+  ## directly nested `nnkStmtList`) within a branch is also found — see
+  ## `collectBodylessProcDeclsInStmts` above, which does the actual
+  ## per-branch walk and its own conservative recursion.
   for branch in whenStmt:
     # `nnkElifBranch`/`nnkElifExpr` have 2 children (cond, stmts); a
     # trailing `nnkElse`/`nnkElseExpr` has 1 (stmts) — the branch's
     # statement list is always its LAST child either way.
     let stmts = branch[branch.len - 1]
     if stmts.kind != nnkStmtList: continue
-    for s in stmts:
-      if s.kind == nnkProcDef and s.body.kind == nnkEmpty:
-        result.add(s)
-      elif s.kind == nnkWhenStmt:
-        result.add(collectBodylessProcDeclsInWhen(s))
+    result.add(collectBodylessProcDeclsInStmts(stmts))
 
 const conditionalBindingErrorMsg =
   "softlink: dynlib: conditional binding declarations are not supported " &
@@ -1143,6 +1186,18 @@ macro dynlib*(libPattern: static[string], body: untyped): untyped =
   # that macro has no library identity at all (no `libPattern` parameter, no
   # `loadX`), so there is no pattern to override in the first place — see
   # the README section for the explicit non-applicability note.
+  #
+  # Code-review finding M6: the strdefine key below is `baseName` ALONE —
+  # it carries no module or package qualifier. `-d:softlink.pattern.<Base>`
+  # is therefore a GLOBAL, compile-wide knob: two UNRELATED `dynlib` blocks
+  # (even in different modules, even in different packages) that derive or
+  # pin the same `identBase` share exactly one override, with no compile-
+  # time diagnostic — Nim's module namespacing gives this macro no way to
+  # see across module boundaries at expansion time, so a cross-module
+  # collision cannot be detected here. This is not a bug in the emission
+  # below; it is documented, global `-d:` behavior (see the README's
+  # "Pattern override" section's own collision warning) — the mitigation is
+  # picking a distinct, explicit `identBase` per block, not a compile guard.
   let patternOverrideName = ident(baseNameLower & "PatternOverride")
   result.add(newNimNode(nnkConstSection).add(
     newNimNode(nnkConstDef).add(

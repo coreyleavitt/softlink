@@ -27,7 +27,7 @@
 ## incomplete. Both this module and `softlink/pragmas` import `procinfo`
 ## for it instead; neither imports the other.
 
-import std/[macros, os, strutils]
+import std/[macros, os, sets, strutils]
 import ./manifest
 import ./procinfo
 # R3-3: `abiTag` and `isCorpusTrackable` (both used below) are genuinely
@@ -735,9 +735,27 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   # harvester.nim`'s `harvest` uses to decide what it records: excludes
   # `noverify` (nothing to probe) and prototype-only procs (corpus-
   # invariant, never in a manifest by design). Shared by checks 7 and 8.
+  #
+  # Code-review finding M7: deduplicated by `cName`, preserving first-seen
+  # order, via `seenTrackable` below. Two Nim procs may share one C symbol through
+  # `{.symbol: "c_name".}` (RFC 0011 S0a item 3's headline use case —
+  # multiple fixed-arity Nim views of one variadic C function) — without
+  # the dedupe, `trackable` carried one entry PER PROC, so `mismatchedSymbols`/
+  # `notInManifest` below (softlink/manifest) reported that one underlying
+  # C symbol once per Nim proc that names it, inflating the count text
+  # (e.g. "2 symbols not in manifest: g_object_set, g_object_set" for a
+  # single actually-missing symbol). Check 6 (`checkSince`) and Check 6b
+  # (`checkUntil`) directly above intentionally stay per-Nim-proc — a
+  # `since`/`until` claim is a property of the individual Nim declaration,
+  # not of the underlying corpus membership question checks 7/8 ask — so
+  # this dedupe is scoped to `trackable` alone, after those two loops.
   var trackable: seq[string] = @[]
+  var seenTrackable: HashSet[string] = initHashSet[string]()
   for p in procs:
-    if isCorpusTrackable(p.noVerify, p.headerFile.len > 0): trackable.add p.cName
+    if isCorpusTrackable(p.noVerify, p.headerFile.len > 0) and
+       p.cName notin seenTrackable:
+      seenTrackable.incl p.cName
+      trackable.add p.cName
 
   # Check 7: mismatch warning. Partitioned per the nim-z3 report
   # (softlink-mismatch-warning-issue.md) / CHECK7-WARNING.handoff.md: a

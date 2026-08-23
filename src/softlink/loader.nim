@@ -37,6 +37,23 @@ type
       ## `GetLastError()` value on Windows; always 0 on POSIX (`dlerror()`
       ## carries no stable numeric code).
 
+const DependencyLikelyMissingHint* = "a dependency is likely missing"
+  ## Code-review finding M2: the exact, stable substring the Windows
+  ## `ERROR_MOD_NOT_FOUND` preflight below appends to `CandidateAttempt.
+  ## osError` when it distinguishes "present but a transitive dependency
+  ## is missing" from "genuinely absent" (see the Windows branch of
+  ## `loadOneDetailed`). Exported so a consumer can match on this constant
+  ## — via `import softlink/loader` — instead of hard-coding a private copy
+  ## of the substring, which can silently drift from the text this module
+  ## actually emits. Consumers may match this substring in a
+  ## `CandidateAttempt.osError` / rendered `osLoaderDetail` string to
+  ## detect the present-but-broken-dependency case. Declared unconditionally
+  ## (not inside the `when defined(windows)` branch below) so it is a
+  ## stable, always-importable symbol regardless of target platform; the
+  ## text itself is only ever appended on Windows — POSIX's `dlerror()`
+  ## already names the missing dependency directly (see the module doc
+  ## comment), so this substring never appears in a POSIX `osError`.
+
 when defined(posix) and not defined(nintendoswitch):
   import std/posix
 
@@ -77,14 +94,30 @@ elif defined(windows):
     # plain `LoadLibraryA` returns `ERROR_MOD_NOT_FOUND` (126) BOTH for a
     # truly-absent target and for a present target whose transitive
     # dependency is missing — Windows does not distinguish the two in the
-    # ordinary failure path. Loading the SAME path with
-    # `LoadLibraryExA(path, 0, DONT_RESOLVE_DLL_REFERENCES)` skips import
-    # resolution entirely: measured to SUCCEED for the present-target
-    # case and FAIL for the truly-absent case, so it cheaply separates
-    # them. `dlerror()` on Linux already names the missing dependency
-    # directly (see the POSIX branch above) — this preflight is the
-    # Windows-only compensation for the asymmetry the RFC calls out.
-    kDontResolveDllReferences = 0x00000001'u32
+    # ordinary failure path. `dlerror()` on Linux already names the missing
+    # dependency directly (see the POSIX branch above) — this preflight is
+    # the Windows-only compensation for the asymmetry the RFC calls out.
+    #
+    # Code-review finding H1 (HIGH, security): the preflight probes the SAME
+    # path with `LoadLibraryExA(path, 0, LOAD_LIBRARY_AS_DATAFILE)`, not
+    # `DONT_RESOLVE_DLL_REFERENCES` (the flag this preflight originally
+    # shipped with). `DONT_RESOLVE_DLL_REFERENCES` still creates an
+    # EXECUTABLE image mapping — Microsoft's own docs call it unsafe outside
+    # a narrow testing context, since it still runs TLS-callback code during
+    # the mapping — and this preflight's candidate path is exactly the kind
+    # of attacker-plantable name (a "library not found" search location)
+    # where that matters. `LOAD_LIBRARY_AS_DATAFILE` maps the file as plain
+    # data instead: no image activation, no `DllMain`, no TLS callbacks —
+    # the documented safe way to ask "does this file exist and open as a
+    # module", which is all this preflight ever needed. Its success/failure
+    # behavior for the question this preflight asks (present-and-mappable
+    # vs. genuinely absent) is standard, DOCUMENTED Win32 semantics, not
+    # something re-measured here — unlike the `ERROR_MOD_NOT_FOUND`
+    # ambiguity above, which genuinely was measured. Handles returned by
+    # `LOAD_LIBRARY_AS_DATAFILE` still require a matching `FreeLibrary`
+    # (see the proc below); this preflight already did that before the flag
+    # change and continues to.
+    kLoadLibraryAsDatafile = 0x00000002'u32
     kErrorModNotFound = 126'u32
       ## The MEASURED code both the truly-absent and the
       ## present-but-missing-dependency cases produce — the only code the
@@ -108,14 +141,16 @@ elif defined(windows):
         buf.setLen(buf.len - 1)
       buf
 
-  proc dontResolveDllReferencesPreflightSaysTargetExists(path: string): bool =
-    ## Runs the `DONT_RESOLVE_DLL_REFERENCES` preflight described above and
+  proc asDatafilePreflightSaysTargetExists(path: string): bool =
+    ## Runs the `LOAD_LIBRARY_AS_DATAFILE` preflight described above and
     ## immediately releases the handle — this call never keeps the library
-    ## mapped; it only answers "does the target file itself resolve,
-    ## independent of its imports?". A handle from this flag combination
-    ## must never be treated as a normal, fully-loaded library (per the
-    ## Win32 docs), so it is freed here rather than returned to any caller.
-    let h = winLoadLibraryExA(path.cstring, nil, kDontResolveDllReferences)
+    ## mapped; it only answers "does the target file itself exist and open
+    ## as a module, independent of its imports?", by mapping it as plain
+    ## data — no image activation, so no code from `path` ever runs. A
+    ## handle from this flag combination must never be treated as a normal,
+    ## fully-loaded library (per the Win32 docs), so it is freed here
+    ## rather than returned to any caller.
+    let h = winLoadLibraryExA(path.cstring, nil, kLoadLibraryAsDatafile)
     result = not h.isNil
     if result: discard winFreeLibrary(h)
 
@@ -135,9 +170,9 @@ elif defined(windows):
       # us anything the plain error didn't already: a failure code other
       # than the one MEASURED to be ambiguous, or a preflight failure that
       # merely reproduces the original one.
-      if code == kErrorModNotFound and dontResolveDllReferencesPreflightSaysTargetExists(path):
+      if code == kErrorModNotFound and asDatafilePreflightSaysTargetExists(path):
         msg.add(" (the file exists and opens independently of its imports " &
-                "— a dependency is likely missing, not the library itself)")
+                "— " & DependencyLikelyMissingHint & ", not the library itself)")
       (LibHandle(nil), msg, code.int)
     else:
       (LibHandle(h), "", 0)
