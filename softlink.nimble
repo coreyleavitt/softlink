@@ -1,5 +1,5 @@
 # Package
-version       = "0.12.1"
+version       = "0.12.2"
 author        = "Corey Leavitt"
 description   = "Type-safe optional dynamic library bindings for Nim"
 license       = "Apache-2.0"

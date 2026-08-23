@@ -395,7 +395,7 @@ func isCorpusTrackable*(noVerify: bool, hasHeader: bool): bool =
   ## apart independently ever again.
   not noVerify and hasHeader
 
-const softlinkVersion* = "0.12.1"
+const softlinkVersion* = "0.12.2"
   ## RFC-0003 SS2/SS7 slice C1: the CORE `softlink` package's own
   ## version-of-record -- `HarvestMeta.harvesterVersion`'s (tools/harvest/
   ## harvester.nim) source of truth, stamping which softlink release
