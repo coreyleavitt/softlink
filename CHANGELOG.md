@@ -2,7 +2,23 @@
 
 All notable changes to softlink are documented here.
 
-## [Unreleased]
+## [0.12.2] - 2026-08-22
+
+### Added
+
+**`requireSoftlink`: compile-time floor check at the point of use.**
+`requireSoftlink "0.12.2"` at a consumer's module top level fails the
+build whenever the softlink copy the compiler actually resolved reports a
+`softlink/versions.softlinkVersion` below the bound (B0 order,
+`cmpVersion`), with a message naming both versions and the likely cause.
+The failure mode it exists for: a stale copy earlier on the module search
+path silently shadowing the intended one — e.g. a checkout baked into a
+toolchain image via a global `path=` entry in the image's own nim.cfg
+outranking a mounted checkout. A `.nimble` `requires` floor cannot catch
+that (it constrains installation, not resolution). An unparseable bound
+(no digit or letter runs) is a compile error too, never a silent pass.
+
+## [0.12.1] - 2026-08-22
 
 ### Added
 

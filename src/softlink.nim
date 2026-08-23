@@ -12,7 +12,7 @@
 when defined(js):
   {.error: "softlink requires a native backend (C, C++, or Objective-C). The JavaScript backend does not support dynamic library loading.".}
 
-import std/[macros, sets, strutils, os, json]
+import std/[macros, sets, strutils, os, json, options]
 import std/dynlib as stdDynlib
 import ./softlink/manifest
 import ./softlink/versions
@@ -66,6 +66,42 @@ export loader.CandidateAttempt, loader.loadLibPatternDetailed
 # `SymbolFacts`/`VersionInterval`/`FactKind` unqualified via `import softlink`
 # alone, with no separate `import softlink/versions` of its own required.
 export versions.SymbolFacts, versions.VersionInterval, versions.FactKind
+
+proc requireSoftlinkImpl(minVersion: string) {.compileTime.} =
+  ## `requireSoftlink`'s engine (see the template below for the public
+  ## face and the full story). Split out so the template body is a single
+  ## early-bound call — templates bind symbols resolvable at definition
+  ## scope, so this proc needs no export of its own.
+  if parseVersion(minVersion).isNone:
+    error("requireSoftlink: unparseable version bound \"" & minVersion &
+          "\" (no digit or letter runs — see softlink/versions.parseVersion)")
+  if cmpVersion(softlinkVersion, minVersion) < 0:
+    error("this project requires softlink >= " & minVersion &
+      ", but the softlink on the search path is " & softlinkVersion & ". " &
+      "If a newer checkout should be in use, a stale copy is probably " &
+      "shadowing it earlier on the module search path (e.g. a copy baked " &
+      "into a toolchain image via a global path= entry in its nim.cfg).")
+
+template requireSoftlink*(minVersion: string) =
+  ## Post-RFC-0011 hardening: a compile-time floor check on the softlink
+  ## ACTUALLY being compiled against — `requireSoftlink "0.12.2"` at a
+  ## consumer's module top level fails the build, with a message naming
+  ## both versions and the likely cause, whenever the resolved
+  ## `softlink/versions.softlinkVersion` sorts below `minVersion` under
+  ## the B0 order (`cmpVersion`; plain release tags compare as expected —
+  ## the alpha-suffix caveat documented on `cmpVersion` only matters for
+  ## pre-release-style bounds, which floor pins do not use).
+  ##
+  ## The failure mode this exists for: a stale softlink copy earlier on
+  ## the module search path silently shadowing the intended one — e.g. a
+  ## copy baked into a toolchain image via a global `path=` entry in the
+  ## image's own nim.cfg outranking a mounted checkout. Without a floor
+  ## check that mistake compiles clean and tests the wrong code; with it,
+  ## the build stops at the first module that states its requirement.
+  ##
+  ## A template (not a bare `{.compileTime.}` proc) so the call site
+  ## needs no `static:` wrapper of its own.
+  static: requireSoftlinkImpl(minVersion)
 
 type
   SoftlinkError* = ref object of CatchableError

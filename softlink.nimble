@@ -2358,6 +2358,25 @@ task test, "Run tests":
        "-d:softlink.pattern.Patoverridebarexyz=libpatoverride_override_target_c.so " &
        "tests/tpattern_override.nim"
 
+  # `requireSoftlink` (post-RFC-0011 hardening): the consumer-facing
+  # compile-time floor check. Pure compile-time, no dynlib block, no
+  # built artifact — so, like the tpattern_override group directly above,
+  # these three run once, unconditionally, identically on every OS leg.
+  # The current-version needle is built from `softlinkVersion` (in scope
+  # via this file's own header import) so a release bump cannot stale it.
+  expectManifestCompileOk(
+    "nim c --compileOnly --path:src tests/tcheck_require_softlink_ok.nim",
+    [], [])
+  expectManifestCompileFail(
+    "nim c --compileOnly --path:src tests/tfail_require_softlink.nim",
+    ["requires softlink >= 9999.0",
+     "the softlink on the search path is " & softlinkVersion,
+     "shadowing"])
+  expectManifestCompileFail(
+    "nim c --compileOnly --path:src " &
+    "tests/tfail_require_softlink_unparseable.nim",
+    ["requireSoftlink: unparseable version bound \"...\""])
+
   exec "nim c -r --path:src tests/tcov_manifest_bytecap.nim"
   exec "nim c -r --path:src tests/tcov_manifest_shape_guards.nim"
   exec "nim c -r --path:src tests/tcov_classify_absence_multi_pair.nim"

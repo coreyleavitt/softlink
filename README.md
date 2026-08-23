@@ -20,6 +20,25 @@ Or add to your `.nimble` file:
 requires "softlink >= 0.2.0"
 ```
 
+A `.nimble` floor only constrains what nimble *installs* — it says nothing
+about which softlink copy the compiler actually *resolves* when a global
+search path is in play (a common setup bakes a softlink checkout into a
+toolchain image via a `path=` entry in the image's own nim.cfg, where a
+stale baked copy can silently shadow the one you meant to build against).
+To pin the floor at the point of use, state it in code:
+
+```nim
+import softlink
+
+requireSoftlink "0.12.2"
+```
+
+This is a compile-time check against the resolved copy's own
+version-of-record (`softlink/versions.softlinkVersion`): if it sorts below
+the bound, the build fails immediately with a message naming both versions
+and the likely shadowing cause. An unparseable bound is a compile error
+too, never a silent pass.
+
 ## The Problem
 
 Nim gives you two ways to bind to C libraries, and both have tradeoffs:
