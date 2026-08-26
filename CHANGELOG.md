@@ -2,6 +2,26 @@
 
 All notable changes to softlink are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+**`compatManifest` now resolves its manifest path under cross-compilation.**
+The manifest path was joined with `os.`/`` and read from
+`lineInfoObj.filename`, both of which speak the *target* OS's directory
+separator at compile time — cross-compiling a consumer for `--os:windows`
+on a POSIX host (e.g. a mingw cross-check build) produced a `\`-separated
+path the *host* filesystem could not resolve, failing the compile with
+"manifest file not found" even though the file was right there. Since
+compile-time code cannot ask which OS the build host is (`defined(...)`
+reflects the target), the path is now resolved by probing: the joined path
+is tried as given first, then with each separator flavor, and the host's
+own `fileExists` decides — so a POSIX path legitimately containing a
+literal backslash still resolves as-is, and both cross directions
+(POSIX→Windows, Windows→POSIX) work. No behavior change for native
+builds. (Found by nelli's Windows cross-compile check, RFC-fuzzer-nextgen
+slice Eci.)
+
 ## [0.12.3] - 2026-08-23
 
 ### Security
