@@ -366,7 +366,26 @@ proc applyCompatManifest*(mode: ProcPragmaMode, libNameForIdentity: string,
   # Path resolution: relative to the MODULE containing this block (the
   # directive call node's own line info), never the compiler's cwd — a
   # binding package ships its manifest alongside its module.
-  let absPath = directive.node.lineInfoObj.filename.parentDir / directive.pathLit
+  #
+  # Host-vs-target separators: this path is consulted on the BUILD HOST
+  # (fileExists/staticRead run at compile time), but under a cross-compile
+  # the compiler hands out `lineInfoObj.filename` with the TARGET's DirSep
+  # (e.g. '\'-separated on --os:windows even when the build host is POSIX),
+  # and compile-time code cannot ask which OS the host is (`defined(...)`
+  # reflects the target). So resolve by PROBING: try the joined path as
+  # given, then each separator flavor, and let the host's own fileExists
+  # decide — the flavor swap is a fallback only, so a POSIX path that
+  # legitimately contains a literal backslash still resolves as-is first.
+  let moduleDir = directive.node.lineInfoObj.filename.parentDir
+  let joined =
+    if moduleDir.len == 0: directive.pathLit
+    else: moduleDir & "/" & directive.pathLit
+  var absPath = joined
+  if not fileExists(absPath):
+    let fwd = joined.replace('\\', '/')
+    let bck = joined.replace('/', '\\')
+    if fileExists(fwd): absPath = fwd
+    elif fileExists(bck): absPath = bck
   if not fileExists(absPath):
     error("softlink: " & macroName & ": compatManifest: manifest file not " &
           "found: " & absPath, directive.node)
